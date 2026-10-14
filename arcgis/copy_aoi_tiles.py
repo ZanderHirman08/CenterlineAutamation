@@ -49,6 +49,12 @@ def footprint(path):
 
 
 def copy_aoi_tiles(state_tiles, aoi, buffer, out_tiles, dry_run=False):
+    # Originals are only read, never moved or changed. The output must not be inside
+    # the statewide folder, or later runs would pick the copies up as source tiles.
+    src = os.path.normcase(os.path.abspath(state_tiles))
+    dst = os.path.normcase(os.path.abspath(out_tiles))
+    if dst == src or dst.startswith(src + os.sep):
+        raise ValueError("OUT_TILES must be outside STATE_TILES; pick a separate folder")
     shapes, sr = aoi_shapes(aoi, buffer)
     if not dry_run:
         os.makedirs(out_tiles, exist_ok=True)

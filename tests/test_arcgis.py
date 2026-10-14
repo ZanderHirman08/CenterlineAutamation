@@ -176,6 +176,12 @@ def test_copy_aoi_tiles(monkeypatch, tiled_scene, tmp_path):
     assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out2)) == 2
     assert {p.name for p in out2.iterdir()} >= {"tile_0.tif", "tile_3.tif"}
 
+    # originals untouched, and the output can't be inside the source folder
+    assert sorted(p.name for p in tiled_scene["tiles"].iterdir()) == sorted(
+        [f"tile_{i}.tif" for i in range(4)] + [f"tile_{i}.tif.aux.xml" for i in range(4)])
+    with pytest.raises(ValueError, match="outside STATE_TILES"):
+        copy(str(tiled_scene["tiles"]), str(grids), 50, str(tiled_scene["tiles"] / "sub"))
+
     # a 250 ft buffer crosses the tile edge at y0 - 500: the first squares pull in
     # the tile below them (tile_2), the third the tile above it (tile_1)
     out3 = tmp_path / "c"
