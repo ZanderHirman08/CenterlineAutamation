@@ -53,7 +53,7 @@ def strip(src: str) -> str:
         if line.startswith("from __future__"):
             continue
         if re.match(r"from \.[\w.]* import", line) or line.startswith("from . import"):
-            skipping = line.rstrip().endswith("(")
+            skipping = "(" in line and ")" not in line
             continue
         out.append(line)
     return "\n".join(out).strip() + "\n"

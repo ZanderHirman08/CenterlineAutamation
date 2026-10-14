@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import geopandas as gpd
+import numpy as np
 import pytest
 import rasterio
 from rasterio.windows import Window
@@ -108,6 +109,26 @@ def test_toolbox_aligns_roads(toolbox, tiled_scene, tmp_path):
     assert out.REVIEW.sum() == 0
     assert any("NIR: yes" in m for m in fake_arcpy.messages)
     assert any("Classifier trained" in m for m in fake_arcpy.messages)  # engine logs reach Pro
+    assert any("Alignment check" in m for m in fake_arcpy.messages)
+    assert not fake_arcpy.warnings, fake_arcpy.warnings
+
+    # diagnostic rasters: the chip the tool read lines up with the source imagery
+    diag = tmp_path / "work" / "diagnostics"
+    with rasterio.open(diag / "chip_1.tif") as c, rasterio.open(tiled_scene["imagery"]) as src:
+        assert c.crs == src.crs
+        win = rasterio.windows.from_bounds(*c.bounds, transform=src.transform)
+        expect = src.read(window=win.round_offsets().round_lengths(), boundless=True)
+        got = c.read()
+        assert got.shape == expect.shape
+        assert np.array_equal(got, expect)
+    with rasterio.open(diag / "labels_1.tif") as lab, \
+            rasterio.open(tiled_scene["imagery"]) as src:
+        labels = lab.read(1)
+        win = rasterio.windows.from_bounds(*lab.bounds, transform=src.transform)
+        blue = src.read(3, window=win.round_offsets().round_lengths(), boundless=True)
+        # road-labelled pixels are mostly pavement (blue ~120), not grass (~44)
+        assert np.median(blue[labels == 1]) > 90
+        assert np.median(blue[labels == 2]) < 70
 
     # a second run reuses the saved grids and classifier
     fake_arcpy.messages.clear()
@@ -135,6 +156,14 @@ def test_toolbox_matches_cli(toolbox, tiled_scene, tmp_path):
     assert len(a) == len(c)
     d = [ga.hausdorff_distance(gc) for ga, gc in zip(a.geometry, c.geometry)]
     assert max(d) < 0.05, d
+
+
+def test_toolbox_probability_rasters(toolbox, tiled_scene, tmp_path):
+    run_tool(toolbox, tiled_scene, tmp_path, diagnostics=True)
+    probs = sorted((tmp_path / "work" / "diagnostics").glob("road_prob_*.tif"))
+    assert [p.name for p in probs] == ["road_prob_G1.tif", "road_prob_G2.tif"]
+    with rasterio.open(probs[0]) as r:
+        assert r.crs is not None and r.read(1).max() > 200
 
 
 def test_toolbox_no_nir_and_bad_band(toolbox, tiled_scene, tmp_path):

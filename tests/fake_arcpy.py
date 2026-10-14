@@ -272,3 +272,32 @@ class Parameter:
     @property
     def valueAsText(self):
         return None if self.value is None else str(self.value)
+
+
+# ----------------------------------------------------------------------- numpy rasters
+
+class _NumpyRaster:
+    def __init__(self, arr, ll, xres, yres):
+        self.arr, self.ll, self.xres, self.yres = arr, ll, xres, yres
+
+    def save(self, path):
+        arr = self.arr[None] if self.arr.ndim == 2 else self.arr
+        b, h, w = arr.shape
+        from rasterio.transform import from_origin
+        tr = from_origin(self.ll.X, self.ll.Y + h * self.yres, self.xres, self.yres)
+        with rasterio.open(path, "w", driver="GTiff", width=w, height=h, count=b,
+                           dtype=arr.dtype, transform=tr) as dst:
+            dst.write(arr)
+
+
+def NumPyArrayToRaster(in_array, lower_left_corner=None, x_cell_size=None, y_cell_size=None,
+                       value_to_nodata=None):
+    return _NumpyRaster(in_array, lower_left_corner, x_cell_size, y_cell_size)
+
+
+def _define_projection(path, sr):
+    with rasterio.open(path, "r+") as dst:
+        dst.crs = sr._crs
+
+
+_Management.DefineProjection = staticmethod(_define_projection)

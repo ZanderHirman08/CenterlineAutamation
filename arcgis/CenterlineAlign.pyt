@@ -298,17 +298,20 @@ def pixel_features(scaled: np.ndarray, has_nir: bool) -> np.ndarray:
 
     Returns (n_features, H, W) float32, in the order of ``pixel_feature_names``.
     """
-    r, g, b = scaled[0], scaled[1], scaled[2]
+    # Clip and lift away from zero so ratios stay bounded in shadows and at the
+    # ends of the stretch (dividing by ~0 would give huge, fit-breaking values).
+    s = np.clip(scaled, 0.0, 1.5) + 0.05
+    r, g, b = s[0], s[1], s[2]
     rgb_max = np.maximum(np.maximum(r, g), b)
     rgb_min = np.minimum(np.minimum(r, g), b)
     bright = (r + g + b) / 3.0
-    sat = (rgb_max - rgb_min) / (np.abs(rgb_max) + EPS)  # pavement is grey: low saturation
-    exg = 2.0 * g - r - b                               # excess green: vegetation without NIR
+    sat = (rgb_max - rgb_min) / rgb_max          # pavement is grey: low saturation, 0-1
+    exg = 2.0 * g - r - b                        # excess green: vegetation without NIR
 
     feats = [r, g, b]
     if has_nir:
-        nir = scaled[3]
-        ndvi = (nir - r) / (np.abs(nir + r) + EPS)
+        nir = s[3]
+        ndvi = (nir - r) / (nir + r)             # -1 to 1
         feats.append(nir)
     feats += [bright, sat, exg]
     if has_nir:
@@ -993,12 +996,56 @@ def pick_spread(items: list, n: int) -> list:
     return [items[i] for i in idx]
 
 
+def alignment_check(chip, lines, has_nir: bool, max_shift: float = 60.0,
+                    blur: float = 8.0):
+    """How far the road lines sit from grey, non-vegetated pixels in a chip.
+
+    Cross-correlates the road centrelines with a crude pavement index (low
+    colour saturation, low NDVI), blurred by ``blur`` so the match peaks at the
+    middle of the pavement rather than anywhere inside it, over shifts up to
+    ``max_shift``. Returns
+    (dx, dy, best_score, unshifted_score): moving the lines by (dx, dy) gives the
+    best match. A large, consistent shift means roads and imagery are offset
+    from each other; it is a hint, not a measurement.
+    """
+    if not chip.valid.any():
+        return None
+    mask = (distance_to_roads(chip, lines) <= chip.res).astype(np.float64)
+    if mask.sum() < 50:
+        return None
+    v = chip.data[:, chip.valid]
+    lo, hi = np.percentile(v, 2, axis=1), np.percentile(v, 98, axis=1)
+    feats = pixel_features(scale_bands(chip.data, lo, hi), has_nir)
+    names = pixel_feature_names(has_nir)
+    idx = -feats[names.index("sat")]
+    if has_nir:
+        idx = idx - feats[names.index("ndvi")]
+    idx = np.where(chip.valid, idx, np.nan)
+    idx = (idx - np.nanmean(idx)) / (np.nanstd(idx) + 1e-9)
+    idx = ndimage.gaussian_filter(np.clip(np.nan_to_num(idx), -3, 3), blur / chip.res)
+    h, w = mask.shape
+    # corr[s] = sum_x mask[x] * idx[x + s]  (zero-padded, so no wrap-around)
+    F = np.fft.rfft2
+    pm = np.zeros((2 * h, 2 * w))
+    pi = np.zeros((2 * h, 2 * w))
+    pm[:h, :w], pi[:h, :w] = mask, idx
+    corr = np.fft.irfft2(np.conj(F(pm)) * F(pi), s=pm.shape) / mask.sum()
+    k = int(max_shift / chip.res)
+    rows = np.r_[np.arange(0, k + 1), np.arange(-k, 0)]
+    cols = np.r_[np.arange(0, k + 1), np.arange(-k, 0)]
+    sub = corr[np.ix_(rows % (2 * h), cols % (2 * w))]
+    i, j = np.unravel_index(np.argmax(sub), sub.shape)
+    dr, dc = rows[i], cols[j]
+    return float(dc * chip.res), float(-dr * chip.res), float(sub[i, j]), float(corr[0, 0])
+
+
 def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
-                     seed: int = 0) -> RoadClassifier:
+                     seed: int = 0, on_chip=None) -> RoadClassifier:
     """Train from tiles centred on random road points in each training cell.
 
     cells: for each training grid, the road coords inside it.
     lines_near(bounds) -> road coords intersecting ``bounds`` (for labelling).
+    on_chip(k, chip, lines) is called for every training tile (for diagnostics).
     """
     rng = np.random.default_rng(seed)
     tile = ccfg.embedding_tile if embedder is not None else 1024
@@ -1033,12 +1080,17 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
 
     # Pass 2: labelled samples.
     per_tile = max(50, ccfg.samples_per_class // len(centres))
-    pix_s, emb_s, lab_s = [], [], []
-    for c in centres:
+    pix_s, emb_s, lab_s, shifts = [], [], [], []
+    for k, c in enumerate(centres):
         chip = read_at(c)
         bx0, by0, bx1, by1 = chip.bounds
         m = ccfg.negative_max_dist
         near = lines_near((bx0 - m, by0 - m, bx1 + m, by1 + m))
+        if on_chip is not None:
+            on_chip(k, chip, near)
+        a = alignment_check(chip, near, reader.has_nir)
+        if a is not None:
+            shifts.append(a)
         rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile)
         if len(labels) == 0:
             continue
@@ -1049,10 +1101,42 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
             emb_s.append(emb)
     if not lab_s:
         raise ValueError("No training pixels found; check imagery coverage")
-    return fit(np.concatenate(pix_s), np.concatenate(emb_s) if emb_s else None,
-               np.concatenate(lab_s), feature_mode=ccfg.features, has_nir=reader.has_nir,
-               band_lo=lo, band_hi=hi,
-               embedding_model=ccfg.embedding_model if embedder is not None else None)
+    _report_alignment(shifts)
+    pix, labels = np.concatenate(pix_s), np.concatenate(lab_s)
+    nb = 4 if reader.has_nir else 3
+    names = ["R", "G", "B", "NIR"][:nb]
+    for lab, what in ((1, "road"), (0, "not-road")):
+        means = pix[labels == lab, :nb].mean(axis=0)
+        log.info("Average %s training pixel (0-1 scale): %s", what,
+                 ", ".join(f"{n} {m:.2f}" for n, m in zip(names, means)))
+    clf = fit(pix, np.concatenate(emb_s) if emb_s else None, labels,
+              feature_mode=ccfg.features, has_nir=reader.has_nir, band_lo=lo, band_hi=hi,
+              embedding_model=ccfg.embedding_model if embedder is not None else None)
+    if clf.train_accuracy is not None and clf.train_accuracy < 0.75:
+        log.warning(
+            "Training accuracy is only %.2f: the classifier can barely tell road from not-road "
+            "pixels. Results will be poor. Most likely the road lines and the imagery don't line "
+            "up (see the alignment check above), or the band numbers are wrong.",
+            clf.train_accuracy)
+    return clf
+
+
+def _report_alignment(shifts):
+    if not shifts:
+        return
+    a = np.array(shifts)
+    dx, dy = np.median(a[:, 0]), np.median(a[:, 1])
+    dist = np.hypot(a[:, 0], a[:, 1])
+    log.info("Alignment check on %d training tiles: roads best match grey, non-vegetated "
+             "pixels if moved by a median of %+.0f ft east, %+.0f ft north (per tile: %s)",
+             len(a), dx, dy, "; ".join(f"{x:+.0f},{y:+.0f}" for x, y in a[:, :2]))
+    if np.median(dist) > 15:
+        log.warning(
+            "The road lines look about %.0f ft away from the pavement in most training tiles. "
+            "If that shift is similar everywhere, the roads and imagery are probably in "
+            "different places: check both layers' coordinate systems, and that the tool read "
+            "the right imagery (compare the diagnostic rasters with the original tiles).",
+            float(np.median(dist)))
 
 
 def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):
@@ -1279,7 +1363,8 @@ def _safe(value) -> str:
 
 
 def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-        out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False):
+        out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False,
+        diagnostics=False):
     msg = arcpy.AddMessage
     handler = _ArcHandler(arcpy)
     root = logging.getLogger("centerline_align")
@@ -1287,13 +1372,13 @@ def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, wor
     root.setLevel(logging.INFO)
     try:
         return _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field,
-                    work_folder, out_fc, bands, refine, classifier, fresh)
+                    work_folder, out_fc, bands, refine, classifier, fresh, diagnostics)
     finally:
         root.removeHandler(handler)
 
 
 def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-         out_fc, bands, rcfg, ccfg, fresh):
+         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False):
     os.makedirs(work_folder, exist_ok=True)
     grid_dir = os.path.join(work_folder, "grids")
     os.makedirs(grid_dir, exist_ok=True)
@@ -1331,7 +1416,16 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
         def lines_near(b):
             return [c for _, _, parts, e in roads if _overlaps(e, b) for c in parts]
 
-        clf = train_classifier(reader, cells, lines_near, ccfg, None)
+        diag_dir = os.path.join(work_folder, "diagnostics")
+
+        def on_chip(k, chip, lines):
+            # first training tile of each of the first two grids
+            if k % 4 == 0 and k < 8:
+                os.makedirs(diag_dir, exist_ok=True)
+                _save_training_diag(arcpy, diag_dir, k // 4 + 1, chip, lines, ccfg, sr)
+
+        clf = train_classifier(reader, cells, lines_near, ccfg, None, on_chip=on_chip)
+        msg(f"Diagnostic rasters for the first training tiles: {diag_dir}")
         clf.save(model_path)
         msg(f"Classifier saved to {model_path} (training accuracy {clf.train_accuracy:.3f})")
 
@@ -1352,6 +1446,12 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
             if pieces:
                 pmap = region_probability(reader, clf, None, cext, [c for _, c in pieces],
                                           rcfg, ccfg)
+                if diagnostics:
+                    prob_dir = os.path.join(work_folder, "diagnostics")
+                    os.makedirs(prob_dir, exist_ok=True)
+                    h = pmap.prob.shape[0]
+                    _save_raster(arcpy, pmap.prob, pmap.x0, pmap.y0 - h * pmap.res, pmap.res,
+                                 os.path.join(prob_dir, f"road_prob_{_safe(gid)}.tif"), sr)
                 records, _ = refine_pieces(pmap, pieces, rcfg, reader.res)
             for r in records:
                 r["grid_id"] = gid
@@ -1378,6 +1478,35 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     n_rev = sum(r["review"] for r in records)
     msg(f"Wrote {len(records)} lines to {out_fc}; {n_rev} flagged for review (REVIEW = 1).")
     return {"lines": len(records), "review": n_rev}
+
+
+def _save_raster(arcpy, arr, x_ll, y_ll, res, path, sr):
+    """Write a (rows, cols) or (bands, rows, cols) uint8 array as a GeoTIFF."""
+    if arcpy.Exists(path):
+        arcpy.management.Delete(path)
+    ras = arcpy.NumPyArrayToRaster(np.ascontiguousarray(arr), arcpy.Point(x_ll, y_ll), res, res)
+    ras.save(path)
+    arcpy.management.DefineProjection(path, sr)
+
+
+def _save_training_diag(arcpy, folder, n, chip, lines, ccfg, sr):
+    """The imagery block the tool read, and where it put its training labels.
+
+    labels_N.tif: 1 = labelled road (near a road line), 2 = labelled not-road,
+    0 = not used. Lay both over the original tiles and your roads: if the
+    image doesn't match the tiles underneath, the tool misread the imagery; if
+    the 1-zone isn't on pavement, the roads and imagery don't line up.
+    """
+    h = chip.shape[0]
+    x_ll, y_ll = chip.x0, chip.y0 - h * chip.res
+    img = np.clip(chip.data, 0, 255).astype(np.uint8)
+    _save_raster(arcpy, img, x_ll, y_ll, chip.res, os.path.join(folder, f"chip_{n}.tif"), sr)
+    dist = distance_to_roads(chip, lines)
+    lab = np.zeros(chip.shape, np.uint8)
+    lab[dist <= ccfg.positive_half_width] = 1
+    lab[(dist > ccfg.negative_min_dist) & (dist <= ccfg.negative_max_dist)] = 2
+    lab[~chip.valid] = 0
+    _save_raster(arcpy, lab, x_ll, y_ll, chip.res, os.path.join(folder, f"labels_{n}.tif"), sr)
 
 
 def _json_default(o):
@@ -1496,6 +1625,9 @@ class AlignCenterlines:
                              category="Advanced", value=8))
         params.append(_param("fresh", "Start over (discard saved progress and classifier)",
                              "GPBoolean", required=False, category="Advanced", value=False))
+        params.append(_param("diagnostics",
+                             "Save road-probability rasters per grid (large; for test runs)",
+                             "GPBoolean", required=False, category="Advanced", value=False))
         return params
 
     def isLicensed(self):
@@ -1524,7 +1656,8 @@ class AlignCenterlines:
             work_folder=p["work_folder"].valueAsText,
             out_fc=p["out_fc"].valueAsText,
             bands=bands, refine=rcfg, classifier=ccfg,
-            fresh=bool(p["fresh"].value))
+            fresh=bool(p["fresh"].value),
+            diagnostics=bool(p["diagnostics"].value))
 
     def postExecute(self, parameters):
         return

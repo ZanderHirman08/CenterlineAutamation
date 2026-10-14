@@ -15,7 +15,7 @@ import time
 import numpy as np
 
 from .chip import Chip
-from .classifier import RoadClassifier
+from .classifier import RoadClassifier, distance_to_roads
 from .config import ClassifierConfig, RefineConfig
 from .engine import pick_spread, reconnect, refine_pieces, region_probability, train_classifier
 from .geom import cumlen, interpolate
@@ -187,7 +187,8 @@ def _safe(value) -> str:
 
 
 def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-        out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False):
+        out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False,
+        diagnostics=False):
     msg = arcpy.AddMessage
     handler = _ArcHandler(arcpy)
     root = logging.getLogger("centerline_align")
@@ -195,13 +196,13 @@ def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, wor
     root.setLevel(logging.INFO)
     try:
         return _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field,
-                    work_folder, out_fc, bands, refine, classifier, fresh)
+                    work_folder, out_fc, bands, refine, classifier, fresh, diagnostics)
     finally:
         root.removeHandler(handler)
 
 
 def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-         out_fc, bands, rcfg, ccfg, fresh):
+         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False):
     os.makedirs(work_folder, exist_ok=True)
     grid_dir = os.path.join(work_folder, "grids")
     os.makedirs(grid_dir, exist_ok=True)
@@ -239,7 +240,16 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
         def lines_near(b):
             return [c for _, _, parts, e in roads if _overlaps(e, b) for c in parts]
 
-        clf = train_classifier(reader, cells, lines_near, ccfg, None)
+        diag_dir = os.path.join(work_folder, "diagnostics")
+
+        def on_chip(k, chip, lines):
+            # first training tile of each of the first two grids
+            if k % 4 == 0 and k < 8:
+                os.makedirs(diag_dir, exist_ok=True)
+                _save_training_diag(arcpy, diag_dir, k // 4 + 1, chip, lines, ccfg, sr)
+
+        clf = train_classifier(reader, cells, lines_near, ccfg, None, on_chip=on_chip)
+        msg(f"Diagnostic rasters for the first training tiles: {diag_dir}")
         clf.save(model_path)
         msg(f"Classifier saved to {model_path} (training accuracy {clf.train_accuracy:.3f})")
 
@@ -260,6 +270,12 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
             if pieces:
                 pmap = region_probability(reader, clf, None, cext, [c for _, c in pieces],
                                           rcfg, ccfg)
+                if diagnostics:
+                    prob_dir = os.path.join(work_folder, "diagnostics")
+                    os.makedirs(prob_dir, exist_ok=True)
+                    h = pmap.prob.shape[0]
+                    _save_raster(arcpy, pmap.prob, pmap.x0, pmap.y0 - h * pmap.res, pmap.res,
+                                 os.path.join(prob_dir, f"road_prob_{_safe(gid)}.tif"), sr)
                 records, _ = refine_pieces(pmap, pieces, rcfg, reader.res)
             for r in records:
                 r["grid_id"] = gid
@@ -286,6 +302,35 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     n_rev = sum(r["review"] for r in records)
     msg(f"Wrote {len(records)} lines to {out_fc}; {n_rev} flagged for review (REVIEW = 1).")
     return {"lines": len(records), "review": n_rev}
+
+
+def _save_raster(arcpy, arr, x_ll, y_ll, res, path, sr):
+    """Write a (rows, cols) or (bands, rows, cols) uint8 array as a GeoTIFF."""
+    if arcpy.Exists(path):
+        arcpy.management.Delete(path)
+    ras = arcpy.NumPyArrayToRaster(np.ascontiguousarray(arr), arcpy.Point(x_ll, y_ll), res, res)
+    ras.save(path)
+    arcpy.management.DefineProjection(path, sr)
+
+
+def _save_training_diag(arcpy, folder, n, chip, lines, ccfg, sr):
+    """The imagery block the tool read, and where it put its training labels.
+
+    labels_N.tif: 1 = labelled road (near a road line), 2 = labelled not-road,
+    0 = not used. Lay both over the original tiles and your roads: if the
+    image doesn't match the tiles underneath, the tool misread the imagery; if
+    the 1-zone isn't on pavement, the roads and imagery don't line up.
+    """
+    h = chip.shape[0]
+    x_ll, y_ll = chip.x0, chip.y0 - h * chip.res
+    img = np.clip(chip.data, 0, 255).astype(np.uint8)
+    _save_raster(arcpy, img, x_ll, y_ll, chip.res, os.path.join(folder, f"chip_{n}.tif"), sr)
+    dist = distance_to_roads(chip, lines)
+    lab = np.zeros(chip.shape, np.uint8)
+    lab[dist <= ccfg.positive_half_width] = 1
+    lab[(dist > ccfg.negative_min_dist) & (dist <= ccfg.negative_max_dist)] = 2
+    lab[~chip.valid] = 0
+    _save_raster(arcpy, lab, x_ll, y_ll, chip.res, os.path.join(folder, f"labels_{n}.tif"), sr)
 
 
 def _json_default(o):

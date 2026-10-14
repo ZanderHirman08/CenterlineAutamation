@@ -16,7 +16,9 @@ import numpy as np
 from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from .classifier import RoadClassifier, extract_samples, fit, sample_training_pixels
+from .classifier import (RoadClassifier, distance_to_roads, extract_samples, fit,
+                         sample_training_pixels)
+from .features import pixel_feature_names, pixel_features, scale_bands
 from .geom import as_coords, cumlen, densify, interpolate
 from .refine import refine_line
 from .topology import snap_nodes
@@ -93,12 +95,56 @@ def pick_spread(items: list, n: int) -> list:
     return [items[i] for i in idx]
 
 
+def alignment_check(chip, lines, has_nir: bool, max_shift: float = 60.0,
+                    blur: float = 8.0):
+    """How far the road lines sit from grey, non-vegetated pixels in a chip.
+
+    Cross-correlates the road centrelines with a crude pavement index (low
+    colour saturation, low NDVI), blurred by ``blur`` so the match peaks at the
+    middle of the pavement rather than anywhere inside it, over shifts up to
+    ``max_shift``. Returns
+    (dx, dy, best_score, unshifted_score): moving the lines by (dx, dy) gives the
+    best match. A large, consistent shift means roads and imagery are offset
+    from each other; it is a hint, not a measurement.
+    """
+    if not chip.valid.any():
+        return None
+    mask = (distance_to_roads(chip, lines) <= chip.res).astype(np.float64)
+    if mask.sum() < 50:
+        return None
+    v = chip.data[:, chip.valid]
+    lo, hi = np.percentile(v, 2, axis=1), np.percentile(v, 98, axis=1)
+    feats = pixel_features(scale_bands(chip.data, lo, hi), has_nir)
+    names = pixel_feature_names(has_nir)
+    idx = -feats[names.index("sat")]
+    if has_nir:
+        idx = idx - feats[names.index("ndvi")]
+    idx = np.where(chip.valid, idx, np.nan)
+    idx = (idx - np.nanmean(idx)) / (np.nanstd(idx) + 1e-9)
+    idx = ndimage.gaussian_filter(np.clip(np.nan_to_num(idx), -3, 3), blur / chip.res)
+    h, w = mask.shape
+    # corr[s] = sum_x mask[x] * idx[x + s]  (zero-padded, so no wrap-around)
+    F = np.fft.rfft2
+    pm = np.zeros((2 * h, 2 * w))
+    pi = np.zeros((2 * h, 2 * w))
+    pm[:h, :w], pi[:h, :w] = mask, idx
+    corr = np.fft.irfft2(np.conj(F(pm)) * F(pi), s=pm.shape) / mask.sum()
+    k = int(max_shift / chip.res)
+    rows = np.r_[np.arange(0, k + 1), np.arange(-k, 0)]
+    cols = np.r_[np.arange(0, k + 1), np.arange(-k, 0)]
+    sub = corr[np.ix_(rows % (2 * h), cols % (2 * w))]
+    i, j = np.unravel_index(np.argmax(sub), sub.shape)
+    dr, dc = rows[i], cols[j]
+    return float(dc * chip.res), float(-dr * chip.res), float(sub[i, j]), float(corr[0, 0])
+
+
 def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
-                     seed: int = 0) -> RoadClassifier:
+                     seed: int = 0, on_chip=None) -> RoadClassifier:
     """Train from tiles centred on random road points in each training cell.
 
     cells: for each training grid, the road coords inside it.
     lines_near(bounds) -> road coords intersecting ``bounds`` (for labelling).
+    on_chip(k, chip, lines) is called for every training tile (for diagnostics).
     """
     rng = np.random.default_rng(seed)
     tile = ccfg.embedding_tile if embedder is not None else 1024
@@ -133,12 +179,17 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
 
     # Pass 2: labelled samples.
     per_tile = max(50, ccfg.samples_per_class // len(centres))
-    pix_s, emb_s, lab_s = [], [], []
-    for c in centres:
+    pix_s, emb_s, lab_s, shifts = [], [], [], []
+    for k, c in enumerate(centres):
         chip = read_at(c)
         bx0, by0, bx1, by1 = chip.bounds
         m = ccfg.negative_max_dist
         near = lines_near((bx0 - m, by0 - m, bx1 + m, by1 + m))
+        if on_chip is not None:
+            on_chip(k, chip, near)
+        a = alignment_check(chip, near, reader.has_nir)
+        if a is not None:
+            shifts.append(a)
         rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile)
         if len(labels) == 0:
             continue
@@ -149,10 +200,42 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
             emb_s.append(emb)
     if not lab_s:
         raise ValueError("No training pixels found; check imagery coverage")
-    return fit(np.concatenate(pix_s), np.concatenate(emb_s) if emb_s else None,
-               np.concatenate(lab_s), feature_mode=ccfg.features, has_nir=reader.has_nir,
-               band_lo=lo, band_hi=hi,
-               embedding_model=ccfg.embedding_model if embedder is not None else None)
+    _report_alignment(shifts)
+    pix, labels = np.concatenate(pix_s), np.concatenate(lab_s)
+    nb = 4 if reader.has_nir else 3
+    names = ["R", "G", "B", "NIR"][:nb]
+    for lab, what in ((1, "road"), (0, "not-road")):
+        means = pix[labels == lab, :nb].mean(axis=0)
+        log.info("Average %s training pixel (0-1 scale): %s", what,
+                 ", ".join(f"{n} {m:.2f}" for n, m in zip(names, means)))
+    clf = fit(pix, np.concatenate(emb_s) if emb_s else None, labels,
+              feature_mode=ccfg.features, has_nir=reader.has_nir, band_lo=lo, band_hi=hi,
+              embedding_model=ccfg.embedding_model if embedder is not None else None)
+    if clf.train_accuracy is not None and clf.train_accuracy < 0.75:
+        log.warning(
+            "Training accuracy is only %.2f: the classifier can barely tell road from not-road "
+            "pixels. Results will be poor. Most likely the road lines and the imagery don't line "
+            "up (see the alignment check above), or the band numbers are wrong.",
+            clf.train_accuracy)
+    return clf
+
+
+def _report_alignment(shifts):
+    if not shifts:
+        return
+    a = np.array(shifts)
+    dx, dy = np.median(a[:, 0]), np.median(a[:, 1])
+    dist = np.hypot(a[:, 0], a[:, 1])
+    log.info("Alignment check on %d training tiles: roads best match grey, non-vegetated "
+             "pixels if moved by a median of %+.0f ft east, %+.0f ft north (per tile: %s)",
+             len(a), dx, dy, "; ".join(f"{x:+.0f},{y:+.0f}" for x, y in a[:, :2]))
+    if np.median(dist) > 15:
+        log.warning(
+            "The road lines look about %.0f ft away from the pavement in most training tiles. "
+            "If that shift is similar everywhere, the roads and imagery are probably in "
+            "different places: check both layers' coordinate systems, and that the tool read "
+            "the right imagery (compare the diagnostic rasters with the original tiles).",
+            float(np.median(dist)))
 
 
 def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):

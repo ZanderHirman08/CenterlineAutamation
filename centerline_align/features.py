@@ -43,17 +43,20 @@ def pixel_features(scaled: np.ndarray, has_nir: bool) -> np.ndarray:
 
     Returns (n_features, H, W) float32, in the order of ``pixel_feature_names``.
     """
-    r, g, b = scaled[0], scaled[1], scaled[2]
+    # Clip and lift away from zero so ratios stay bounded in shadows and at the
+    # ends of the stretch (dividing by ~0 would give huge, fit-breaking values).
+    s = np.clip(scaled, 0.0, 1.5) + 0.05
+    r, g, b = s[0], s[1], s[2]
     rgb_max = np.maximum(np.maximum(r, g), b)
     rgb_min = np.minimum(np.minimum(r, g), b)
     bright = (r + g + b) / 3.0
-    sat = (rgb_max - rgb_min) / (np.abs(rgb_max) + EPS)  # pavement is grey: low saturation
-    exg = 2.0 * g - r - b                               # excess green: vegetation without NIR
+    sat = (rgb_max - rgb_min) / rgb_max          # pavement is grey: low saturation, 0-1
+    exg = 2.0 * g - r - b                        # excess green: vegetation without NIR
 
     feats = [r, g, b]
     if has_nir:
-        nir = scaled[3]
-        ndvi = (nir - r) / (np.abs(nir + r) + EPS)
+        nir = s[3]
+        ndvi = (nir - r) / (nir + r)             # -1 to 1
         feats.append(nir)
     feats += [bright, sat, exg]
     if has_nir:

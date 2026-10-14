@@ -68,6 +68,9 @@ class AlignCenterlines:
                              category="Advanced", value=8))
         params.append(_param("fresh", "Start over (discard saved progress and classifier)",
                              "GPBoolean", required=False, category="Advanced", value=False))
+        params.append(_param("diagnostics",
+                             "Save road-probability rasters per grid (large; for test runs)",
+                             "GPBoolean", required=False, category="Advanced", value=False))
         return params
 
     def isLicensed(self):
@@ -96,7 +99,8 @@ class AlignCenterlines:
             work_folder=p["work_folder"].valueAsText,
             out_fc=p["out_fc"].valueAsText,
             bands=bands, refine=rcfg, classifier=ccfg,
-            fresh=bool(p["fresh"].value))
+            fresh=bool(p["fresh"].value),
+            diagnostics=bool(p["diagnostics"].value))
 
     def postExecute(self, parameters):
         return
