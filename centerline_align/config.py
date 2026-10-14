@@ -59,7 +59,7 @@ class RefineConfig:
     simplify_tolerance: float = 0.5
     node_snap_tolerance: float = 1.0  # input endpoints closer than this are one node
     node_taper: float = 50.0          # distance over which an end's move into its node fades out
-    review_min_confidence: float = 0.6
+    review_min_confidence: float = 0.2
     review_max_shift: float = 15.0
 
 

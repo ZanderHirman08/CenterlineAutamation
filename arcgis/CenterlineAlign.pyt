@@ -83,7 +83,7 @@ class RefineConfig:
     simplify_tolerance: float = 0.5
     node_snap_tolerance: float = 1.0  # input endpoints closer than this are one node
     node_taper: float = 50.0          # distance over which an end's move into its node fades out
-    review_min_confidence: float = 0.6
+    review_min_confidence: float = 0.2
     review_max_shift: float = 15.0
 
 
@@ -1609,7 +1609,7 @@ ADVANCED = [
     ("min_road_width", "Minimum pavement width", 10.0),
     ("max_road_width", "Maximum pavement width", 60.0),
     ("review_max_shift", "Flag lines moved more than", 15.0),
-    ("review_min_confidence", "Flag lines with confidence below (0-1)", 0.6),
+    ("review_min_confidence", "Flag lines with confidence below (0-1)", 0.2),
 ]
 
 

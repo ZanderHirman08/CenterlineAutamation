@@ -32,7 +32,7 @@ refine:
   max_shift: 30           # never move a line more than this
   min_road_width: 10
   max_road_width: 60
-  review_min_confidence: 0.6
+  review_min_confidence: 0.2
   review_max_shift: 15    # flag anything moved more than this for review
 
 output:

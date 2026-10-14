@@ -29,7 +29,7 @@ ADVANCED = [
     ("min_road_width", "Minimum pavement width", 10.0),
     ("max_road_width", "Maximum pavement width", 60.0),
     ("review_max_shift", "Flag lines moved more than", 15.0),
-    ("review_min_confidence", "Flag lines with confidence below (0-1)", 0.6),
+    ("review_min_confidence", "Flag lines with confidence below (0-1)", 0.2),
 ]
 
 
