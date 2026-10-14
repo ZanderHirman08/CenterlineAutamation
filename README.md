@@ -49,8 +49,8 @@ machine with any licence level (Basic is fine).
    * *Work folder*: any empty folder; progress and the trained classifier go here
    * *Output*: a shapefile or geodatabase feature class
    * *Bands*: defaults are R=1, G=2, B=3, NIR=4; clear NIR for 3-band imagery
-   Step-by-step for a county (folders, cutting the county out of the state
-   imagery): [docs/county_setup.md](docs/county_setup.md).
+   Step-by-step setup (folders, copying the imagery for your grids out of the
+   state set): [docs/county_setup.md](docs/county_setup.md).
 4. **Start small.** Select 2–3 grids in the map first; the tool only processes
    selected grids (and selected roads, if any are selected). Clear the selection for the full run.
 

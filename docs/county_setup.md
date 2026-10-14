@@ -1,4 +1,4 @@
-# Setting up a county run
+# Setting up a run
 
 ## 1. Folder structure
 
@@ -9,15 +9,15 @@ lot of imagery) with a short path and no spaces:
 D:\Centerline\
 ├── toolbox\
 │   ├── CenterlineAlign.pyt          the toolbox (add it in Pro)
-│   └── copy_county_tiles.py         helper for step 2
+│   └── copy_aoi_tiles.py            helper for step 2
 ├── imagery\
 │   └── 2024\
-│       └── tiles\                   the county's .tif tiles + their .aux.xml / .ovr / .tfw
+│       └── tiles\                   tiles covering your grids + their .aux.xml / .ovr / .tfw
 ├── data\
-│   └── Inputs.gdb                   County, Local_Roads, Grids_1mi (copies, not the originals)
+│   └── Inputs.gdb                   Local_Roads, Grids_1mi (copies, not the originals)
 ├── work\
 │   ├── 2024_test\                   work folder for the 2-3 grid test
-│   └── 2024_run1\                   work folder for the full county: start it empty
+│   └── 2024_run1\                   work folder for the full run: start it empty
 ├── output\
 │   └── Results.gdb                  aligned_centerlines (and the dissolved version later)
 └── Centerline.aprx                  your Pro project
@@ -30,53 +30,61 @@ Rules of thumb:
   (`2024_run2`) or tick *Start over*; otherwise finished grids are skipped.
 * **Work on copies.** Export the local roads and grids into `Inputs.gdb`
   (right-click → Data → Export Features) so the originals are never touched.
-* **Check disk space first.** Each of your tiles is ~380 MB uncompressed.
-  A tile covers 5,000 × 5,000 ft (~0.9 sq mi), so a 400 sq mi county is
-  ~450-500 tiles = **~180-190 GB**. If you don't have the room, skip the copy
-  and point the tool straight at the statewide tile folder: it only reads the
-  tiles it needs, but it checks every tile when it starts, which is slow for
-  a whole state.
+* **Check disk space first.** Each of your tiles is ~380 MB uncompressed and
+  covers 5,000 × 5,000 ft (~0.9 sq mi), so expect roughly 1.2-1.5 tiles per
+  1-mile grid once edges are counted: 400 grids is ~500-600 tiles,
+  **~190-230 GB**. The copy script's dry run gives the exact figure. If you
+  don't have the room, skip the copy and point the tool straight at the
+  statewide tile folder: it only reads the tiles it needs, but it checks every
+  tile when it starts, which is slow for a whole state.
 
-## 2. Cutting the county out of the state imagery
+## 2. Getting the imagery for your grids
 
-First, how is the state imagery stored? Look at it in the Catalog pane:
+Your 1-mile grids are the area of interest (AOI), so cut the imagery to the
+grids, not the county line. First, how is the state imagery stored? Look at it
+in the Catalog pane:
 
 * **A folder of `.tif` tiles** (what you described): use **A**. No clipping;
-  the tiles touching the county are copied as they are.
+  the tiles touching your grids are copied as they are.
 * **A mosaic dataset** (inside a `.gdb`) or an **image service** (a URL): use **B**.
 
-### A. Copy the tiles that touch the county (recommended)
+### A. Copy the tiles that touch your grids (recommended)
 
 Copying whole tiles is exact (no resampling, no new NoData edges) and quick.
 
-1. Open `toolbox\copy_county_tiles.py` in Notepad and set the four settings
-   at the top:
+1. Open `toolbox\copy_aoi_tiles.py` in Notepad and set the settings at the top:
    ```python
    STATE_TILES = r"D:\Imagery\State_2024\tiles"         # statewide tile folder
-   BOUNDARY = r"D:\Centerline\data\Inputs.gdb\County"   # your county boundary
-   BUFFER = 500                                         # in the boundary's units (feet for State Plane ft)
+   AOI = r"D:\Centerline\data\Inputs.gdb\Grids_1mi"     # your work grids
+   BUFFER = 500                                         # in the grids' units (feet for State Plane ft)
    OUT_TILES = r"D:\Centerline\imagery\2024\tiles"
+   DRY_RUN = True                                       # count first, copy second
    ```
-   The 500 ft buffer keeps imagery just past the county line, so roads on the
-   line can still be measured (the tool looks ~70 ft past each road).
+   The tool reads about 100 ft past each grid edge (search distance + maximum
+   shift + a little context), so 500 ft is a comfortable margin. Lower it to
+   ~150 if disk space is tight.
 2. In Pro: **Analysis** tab → **Python** → *Python Window*. Paste the whole
-   file and press Enter. It reports progress and how many tiles it copied.
-3. Check: add the `tiles` folder to a map. The tiles should cover the county
-   with a margin and no gaps.
+   file and press Enter. With `DRY_RUN = True` it only reports how many
+   tiles touch your grids and how many GB they are, so you can check disk space.
+3. Set `DRY_RUN = False`, paste again, and press Enter to copy.
+4. Check: add the `tiles` folder to a map with the grids. Every grid should be
+   covered, with a margin and no gaps.
 
-It copies each tile's sidecar files too (`.aux.xml` often holds the
-projection, `.ovr` the pyramids). Keep them together.
+If `AOI` is a layer in your map with grids selected, only the selected grids
+are used. That's handy for a quick test area. It copies each tile's sidecar
+files too (`.aux.xml` often holds the projection, `.ovr` the pyramids); keep
+them together.
 
 ### B. Clip a mosaic dataset or image service
 
-1. **Buffer the county:** *Pairwise Buffer*, input = County, distance = 500 Feet,
-   dissolve = *Dissolve all*. Save as `Inputs.gdb\County_buf500`.
+1. **Buffer the grids:** *Pairwise Buffer*, input = Grids_1mi, distance = 500 Feet,
+   dissolve = *Dissolve all*. Save as `Inputs.gdb\Grids_buf500`.
 2. **Clip Raster** (Data Management → Raster → Raster Processing):
    * Input raster: the state mosaic dataset / image service layer
-   * Output extent: `County_buf500`
+   * Output extent: `Grids_buf500`
    * **Leave *Use input features for clipping geometry* unchecked**. This keeps
      a plain rectangle and avoids NoData inside the margin.
-   * Output raster: `D:\Centerline\imagery\2024\County_2024.crf` (Cloud Raster
+   * Output raster: `D:\Centerline\imagery\2024\AOI_2024.crf` (Cloud Raster
      Format: tiled and compressed, and much smaller than a single giant .tif)
    * NoData value: leave empty, or `0`
    * Environments: don't change the cell size or the projection
@@ -107,7 +115,7 @@ comes out at a lower resolution, ask the state for the tiles instead.
    use them), which bands it used, and progress per grid.
 5. Look at the output over the imagery. Symbolise `REVIEW` (1 = check) and
    look at a few unflagged lines too.
-6. Happy with it? Clear the grid selection and run the whole county with a
+6. Happy with it? Clear the grid selection and run all the grids with a
    **new** work folder (`work\2024_run1`) and output
    (`Results.gdb\aligned_centerlines`). The classifier is trained on the
    first run in a work folder, from grids spread across whatever is

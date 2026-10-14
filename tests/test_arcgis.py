@@ -145,25 +145,38 @@ def test_toolbox_no_nir_and_bad_band(toolbox, tiled_scene, tmp_path):
         run_tool(toolbox, tiled_scene, tmp_path / "b", nir=5)
 
 
-def test_copy_county_tiles(monkeypatch, tiled_scene, tmp_path):
-    """Only tiles touching the buffered boundary are copied, with their sidecars."""
+def test_copy_aoi_tiles(monkeypatch, tiled_scene, tmp_path):
+    """Only tiles touching the buffered AOI polygons are copied, with their sidecars."""
     from shapely.geometry import box
 
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
-    src = (ROOT / "arcgis" / "copy_county_tiles.py").read_text()
-    call = "copy_county_tiles(STATE_TILES, BOUNDARY, BUFFER, OUT_TILES)"
+    src = (ROOT / "arcgis" / "copy_aoi_tiles.py").read_text()
+    call = "copy_aoi_tiles(STATE_TILES, AOI, BUFFER, OUT_TILES, DRY_RUN)"
     assert src.rstrip().endswith(call)
-    ns = {"__name__": "copy_county_tiles"}
-    exec(compile(src.rstrip()[: -len(call)], "copy_county_tiles.py", "exec"), ns)
+    ns = {"__name__": "copy_aoi_tiles"}
+    exec(compile(src.rstrip()[: -len(call)], "copy_aoi_tiles.py", "exec"), ns)
+    copy = ns["copy_aoi_tiles"]
 
-    # "county" = a small box inside the top-left tile, 100 ft from its right edge
+    # tiles: 800 x 500 ft each; tile_0 top-left, tile_1 top-right, tile_2/3 below
     x0, y0 = synthetic.X0, synthetic.Y0
-    county = tmp_path / "county.shp"
-    gpd.GeoDataFrame({"NAME": ["Test"]}, geometry=[box(x0 + 100, y0 - 300, x0 + 700, y0 - 100)],
-                     crs=synthetic.CRS).to_file(county)
-    out = tmp_path / "county_tiles"
-    assert ns["copy_county_tiles"](str(tiled_scene["tiles"]), str(county), 50, str(out)) == 1
+    grids = tmp_path / "grids.shp"
+    cells = [box(x0 + 100, y0 - 300, x0 + 300, y0 - 100),     # inside tile_0
+             box(x0 + 100, y0 - 250, x0 + 300, y0 - 50)]      # also tile_0
+    gpd.GeoDataFrame({"G": [1, 2]}, geometry=cells, crs=synthetic.CRS).to_file(grids)
+    out = tmp_path / "a"
+    assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out), dry_run=True) == 1
+    assert not out.exists()  # dry run copies nothing
+    assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out)) == 1
     assert sorted(p.name for p in out.iterdir()) == ["tile_0.tif", "tile_0.tif.aux.xml"]
-    # a buffer reaching past the tile edge (800 ft) picks up the neighbour too
-    out2 = tmp_path / "county_tiles2"
-    assert ns["copy_county_tiles"](str(tiled_scene["tiles"]), str(county), 150, str(out2)) == 2
+
+    # a second, separate grid square in the bottom-right tile adds only that tile
+    cells.append(box(x0 + 1200, y0 - 900, x0 + 1400, y0 - 700))
+    gpd.GeoDataFrame({"G": [1, 2, 3]}, geometry=cells, crs=synthetic.CRS).to_file(grids)
+    out2 = tmp_path / "b"
+    assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out2)) == 2
+    assert {p.name for p in out2.iterdir()} >= {"tile_0.tif", "tile_3.tif"}
+
+    # a 250 ft buffer crosses the tile edge at y0 - 500: the first squares pull in
+    # the tile below them (tile_2), the third the tile above it (tile_1)
+    out3 = tmp_path / "c"
+    assert copy(str(tiled_scene["tiles"]), str(grids), 250, str(out3)) == 4
