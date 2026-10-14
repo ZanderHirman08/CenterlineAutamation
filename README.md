@@ -56,7 +56,22 @@ For GPU embeddings, also install PyTorch for your CUDA version
   GeoTIFF copies if they cover the same area, or convert in ArcGIS Pro with
   **Copy Raster** (output `.tif`) and point the tool at the result.
 * **4-band (with near-infrared)?** Set `bands.nir: 4`. Separating vegetation
-  from pavement is much easier with it.
+  from pavement is much easier with it. `check` prints sample band values and
+  a reminder to confirm band 4 in a 4-1-2 false-colour view.
+* **Pyramids** (`.ovr` / `.rrd` next to the tiles): keep them; they speed up
+  the coarse reads used during training.
+* **No NoData value set:** fine. Gaps between tiles are treated as no data;
+  real pixels of exactly 0 in band 1 would be too, but 8-bit orthos rarely
+  have them.
+
+### How long it takes
+
+On a full-size test (0.5 ft, 4-band, 10,000 × 10,000 px tiles, a city-style
+street grid) one 1-mile grid took about **1 minute on CPU** in pixel mode, plus
+about 1 minute per training grid once at the start. A county of a few hundred
+grids is an overnight run; dense urban grids take longer than rural ones.
+`resolution: 1.0` roughly quarters the time if you can accept a coarser
+measurement.
 
 ## Running
 

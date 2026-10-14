@@ -2,7 +2,7 @@
 # (State Plane US feet in most cases). On Windows use forward slashes in paths.
 
 inputs:
-  imagery: D:/Imagery/2024_Ortho/tiles     # folder of .tif tiles, one .tif, or a .vrt (not .sid)
+  imagery: D:/Imagery/2024_Ortho/tiles     # folder of .tif tiles (+ .aux.xml), one .tif, or a .vrt (not .sid)
   roads: D:/Data/County_Roads.shp          # local centerlines used as the starting position
   grids: D:/Data/Mile_Grids.shp            # 1-mile work grids
   road_id_field: OBJECTID                  # unique road id, copied to the output as SRC_ID
@@ -12,11 +12,11 @@ inputs:
 # resolution: 0.5         # work at a coarser pixel size than the ortho to go faster
 # grid_ids: [G101, G102]  # only process these grids (also: --grids on the command line)
 
-bands:                    # 1-based band numbers
+bands:                    # 1-based band numbers (4-band 8-bit county ortho: R, G, B, NIR)
   red: 1
   green: 2
   blue: 3
-  nir: null               # set to 4 if the ortho has near-infrared - it helps a lot
+  nir: 4                  # set to null for 3-band (RGB) imagery
 
 classifier:
   features: pixel         # "pixel" (no GPU) or "embedding" (GPU + foundation model)

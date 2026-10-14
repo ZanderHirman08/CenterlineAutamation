@@ -55,9 +55,13 @@ def _check(cfg: Config) -> int:
     reader = ImageryReader(cfg)
     try:
         roads, grids = load_vectors(cfg, reader.crs)
-        print(f"Imagery: {cfg.inputs.imagery}")
-        print(f"  CRS {reader.crs.to_string()}, pixel size {reader.res:.3g}, "
+        print(f"Imagery: {cfg.inputs.imagery}" +
+              (f" -> {reader.path}" if reader.path != cfg.inputs.imagery else ""))
+        units = reader.crs.linear_units or "CRS units"
+        print(f"  CRS {reader.crs.to_string()} ({units}), pixel size {reader.res:.3g}, "
               f"bands {reader.band_indexes} (NIR: {'yes' if reader.has_nir else 'no'})")
+        print(f"  All distances in the config are in {units}.")
+        _band_report(reader, grids)
         print(f"Roads: {len(roads)} line pieces, total length {roads.length.sum():,.0f}")
         print(f"Grids: {len(grids)}")
         ib = reader.bounds
@@ -70,6 +74,32 @@ def _check(cfg: Config) -> int:
     finally:
         reader.close()
     return 0
+
+
+def _band_report(reader, grids):
+    """Coarse look at band values in one grid, to sanity-check the band setup."""
+    import numpy as np
+
+    minx, miny, maxx, maxy = grids.total_bounds if len(grids) else reader.bounds
+    cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
+    half = min(2640.0, (maxx - minx) / 2)   # about one 1-mile grid around the centre
+    res = max(reader.res, 2 * half / 512)
+    n = int(2 * half / res)
+    chip = reader.read(cx - half, cy + half, n, n, res=res)
+    if not chip.valid.any():
+        print("  (no imagery at the centre of the grids to sample)")
+        return
+    v = chip.data[:, chip.valid]
+    names = ["red", "green", "blue", "nir"][: len(v)]
+    print("  Sample band means: " + ", ".join(f"{k} {m:.0f}" for k, m in zip(names, v.mean(1))))
+    if reader.has_nir:
+        brighter = float((v[3] > v[0]).mean())
+        print(f"  NIR brighter than red on {brighter:.0%} of pixels.")
+        if brighter < 0.25:
+            print("  NOTE: band 4 is mostly darker than red. In 8-bit orthos each band is often\n"
+                  "  stretched separately, so this alone doesn't mean band 4 isn't NIR. Check a\n"
+                  "  4-1-2 false-colour view in Pro (vegetation should look red). The classifier\n"
+                  "  learns how much to rely on band 4 either way.")
 
 
 if __name__ == "__main__":
