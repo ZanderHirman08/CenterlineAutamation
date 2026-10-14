@@ -30,11 +30,40 @@ deliverable road layer. Everything runs on your own machine; no data leaves it.
 Grids are saved as they finish, so a county run can be stopped and restarted
 (`run` skips finished grids).
 
-## Setup (Windows, one time)
+## Option A: ArcGIS Pro toolbox (no installs)
 
-ArcGIS Pro's built-in Python lacks rasterio/geopandas, so use a separate
-environment. Install [Miniforge](https://github.com/conda-forge/miniforge), then
-in the Miniforge Prompt:
+Everything needed ships with ArcGIS Pro, so this works on a locked-down
+machine with any licence level (Basic is fine).
+
+1. **Get the file.** Open
+   [`arcgis/CenterlineAlign.pyt`](arcgis/CenterlineAlign.pyt) on GitHub and use
+   *Download raw file*. If downloads are blocked, click **Raw**, select all
+   (Ctrl+A), copy, paste into Notepad, and save as `CenterlineAlign.pyt`
+   (*Save as type: All files*, encoding UTF-8).
+2. **Add it to Pro.** Catalog pane → Toolboxes → right-click → *Add Toolbox* →
+   pick the file. Open **Align Centerlines to Imagery**.
+3. **Fill in the tool:**
+   * *Imagery*: the folder of `.tif` tiles (or a raster / mosaic dataset)
+   * *Local road centerlines* + *Road ID field*
+   * *Work grids* + *Grid ID field*
+   * *Work folder*: any empty folder; progress and the trained classifier go here
+   * *Output*: a shapefile or geodatabase feature class
+   * *Bands*: defaults are R=1, G=2, B=3, NIR=4; clear NIR for 3-band imagery
+4. **Start small.** Select 2–3 grids in the map first; the tool only processes
+   selected grids (and selected roads, if any are selected). Clear the selection for the full run.
+
+Re-running with the same work folder skips grids that are already done. Tick
+*Start over* (Advanced) after changing settings. The messages window shows
+the imagery's units; all distance settings use them.
+
+The toolbox uses the colour/texture classifier. GPU embeddings need PyTorch,
+which is an install, so they're only in Option B.
+
+## Option B: command line (needs a Python environment)
+
+ArcGIS Pro's built-in Python lacks rasterio/geopandas, so this needs a
+separate environment (ask IT if installs are restricted). With
+[Miniforge](https://github.com/conda-forge/miniforge), in the Miniforge Prompt:
 
 ```bat
 conda create -n centerline -c conda-forge python=3.11 geopandas rasterio scikit-learn scipy pyyaml pytest
@@ -48,10 +77,10 @@ For GPU embeddings, also install PyTorch for your CUDA version
 
 ## Your imagery
 
-* **GeoTIFF tiles (`.tif` + `.tif.aux.xml`)**: point `inputs.imagery` at the
-  folder. Tiles are stitched into a virtual mosaic automatically
-  (`output/imagery_mosaic.vrt`). Keep each `.aux.xml` next to its `.tif`; it
-  can hold the projection and NoData value.
+* **GeoTIFF tiles (`.tif` + `.tif.aux.xml`)**: point the tool at the folder.
+  Tiles are read as one image (the command line builds
+  `output/imagery_mosaic.vrt`; the toolbox reads tiles directly). Keep each
+  `.aux.xml` next to its `.tif`; it can hold the projection and NoData value.
 * **MrSID (`.sid`)**: not readable by the standard GDAL build. Use the
   GeoTIFF copies if they cover the same area, or convert in ArcGIS Pro with
   **Copy Raster** (output `.tif`) and point the tool at the result.
@@ -73,7 +102,7 @@ grids is an overnight run; dense urban grids take longer than rural ones.
 `resolution: 1.0` roughly quarters the time if you can accept a coarser
 measurement.
 
-## Running
+## Running (command line)
 
 ```bat
 copy config.example.yaml config.yaml      &:: then edit the paths and fields
@@ -88,7 +117,11 @@ python -m centerline_align run config.yaml            &:: the whole county
 No data handy? `python scripts/make_demo_data.py` writes a synthetic scene and
 config to `demo/`.
 
-## Outputs (`output/`)
+## Outputs
+
+The toolbox writes the output feature class you choose (same fields as below)
+and keeps per-grid progress in the work folder. The command line writes to
+`output/`:
 
 | File | What it is |
 |---|---|
@@ -162,3 +195,13 @@ exactly what each cross-section measured.
 * Embedding mode was tested for plumbing with a tiny random model; the real
   DINOv2/DINOv3 weights download from Hugging Face on first use (DINOv3 is
   gated: accept its licence there first).
+* The ArcGIS toolbox is tested here against a stand-in for `arcpy`
+  (`tests/fake_arcpy.py`) that follows the documented arcpy behaviour. It
+  hasn't run inside real ArcGIS Pro yet; if a message in the geoprocessing
+  window looks wrong, copy it into an issue.
+
+## Development
+
+`arcgis/CenterlineAlign.pyt` is generated from the `centerline_align` package.
+After changing the package, rebuild it with `python scripts/build_pyt.py`; a
+test fails if the committed `.pyt` is out of date.

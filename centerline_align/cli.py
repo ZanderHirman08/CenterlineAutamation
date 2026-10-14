@@ -78,8 +78,6 @@ def _check(cfg: Config) -> int:
 
 def _band_report(reader, grids):
     """Coarse look at band values in one grid, to sanity-check the band setup."""
-    import numpy as np
-
     minx, miny, maxx, maxy = grids.total_bounds if len(grids) else reader.bounds
     cx, cy = (minx + maxx) / 2, (miny + maxy) / 2
     half = min(2640.0, (maxx - minx) / 2)   # about one 1-mile grid around the centre

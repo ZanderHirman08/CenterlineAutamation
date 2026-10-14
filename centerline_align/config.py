@@ -8,8 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-import yaml
-
 
 @dataclass
 class InputConfig:
@@ -88,6 +86,8 @@ class Config:
 
     @classmethod
     def load(cls, path: str | Path) -> "Config":
+        import yaml
+
         with open(path) as f:
             raw = yaml.safe_load(f) or {}
         return cls.from_dict(raw)

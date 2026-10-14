@@ -15,9 +15,9 @@ from typing import Callable
 
 import numpy as np
 from scipy import ndimage
-from shapely.geometry import LineString
 
 from .config import RefineConfig
+from .geom import as_coords, cumlen, interpolate, simplify
 
 # Sampler: (x array, y array) -> probability array of the same shape, 0-1.
 Sampler = Callable[[np.ndarray, np.ndarray], np.ndarray]
@@ -25,7 +25,7 @@ Sampler = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 @dataclass
 class RefineResult:
-    geometry: LineString
+    coords: np.ndarray                # (N, 2) refined line
     shift_avg: float
     shift_max: float
     confidence: float
@@ -39,13 +39,12 @@ class RefineResult:
         return bool(self.reasons)
 
 
-def station_distances(line: LineString, spacing: float) -> np.ndarray:
-    """Regular stations plus every original vertex, so corners are kept."""
-    length = line.length
+def station_distances(s: np.ndarray, spacing: float) -> np.ndarray:
+    """Regular stations plus every original vertex (``s`` = vertex distances), so
+    corners are kept."""
+    length = s[-1]
     n = max(2, int(np.ceil(length / spacing)) + 1)
-    regular = np.linspace(0.0, length, n)
-    vertex_d = np.array([line.project(_pt(c)) for c in line.coords])
-    d = np.unique(np.concatenate([regular, vertex_d]))
+    d = np.unique(np.concatenate([np.linspace(0.0, length, n), s]))
     # drop stations that crowd a vertex
     keep = np.ones(len(d), bool)
     min_gap = spacing * 0.25
@@ -55,16 +54,8 @@ def station_distances(line: LineString, spacing: float) -> np.ndarray:
     return d[keep]
 
 
-def _pt(c):
-    from shapely.geometry import Point
-    return Point(c[0], c[1])
-
-
-def _tangents(line: LineString, d: np.ndarray, h: float) -> np.ndarray:
-    length = line.length
-    a = np.array([line.interpolate(max(0.0, x - h)).coords[0] for x in d])
-    b = np.array([line.interpolate(min(length, x + h)).coords[0] for x in d])
-    t = b - a
+def _tangents(c: np.ndarray, s: np.ndarray, d: np.ndarray, h: float) -> np.ndarray:
+    t = interpolate(c, d + h, s) - interpolate(c, d - h, s)
     norm = np.linalg.norm(t, axis=1, keepdims=True)
     norm[norm == 0] = 1.0
     return t / norm
@@ -117,12 +108,15 @@ def _crossing(x, p, i, j, thr):
     return x[i] + t * (x[j] - x[i])
 
 
-def refine_line(line: LineString, sample: Sampler, cfg: RefineConfig, step: float,
+def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
                 valid: Sampler | None = None, keep_stations: bool = False) -> RefineResult:
-    """Refine one LineString. ``step`` is the cross-section sample spacing (pixel size)."""
-    d = station_distances(line, cfg.station_spacing)
-    pts = np.array([line.interpolate(x).coords[0][:2] for x in d])
-    tan = _tangents(line, d, max(cfg.station_spacing * 0.5, step))
+    """Refine one line given as (N, 2) coords. ``step`` is the cross-section sample
+    spacing (normally the pixel size)."""
+    c = as_coords(coords)
+    s = cumlen(c)
+    d = station_distances(s, cfg.station_spacing)
+    pts = interpolate(c, d, s)
+    tan = _tangents(c, s, d, max(cfg.station_spacing * 0.5, step))
     normal = np.column_stack([-tan[:, 1], tan[:, 0]])
 
     offs = np.arange(-cfg.search_half_width, cfg.search_half_width + step * 0.5, step)
@@ -151,12 +145,7 @@ def refine_line(line: LineString, sample: Sampler, cfg: RefineConfig, step: floa
     final, used = _clean_offsets(d, raw, cfg)
     final = np.clip(final, -cfg.max_shift, cfg.max_shift)
 
-    new_pts = pts + normal * final[:, None]
-    new_line = LineString(new_pts)
-    if cfg.simplify_tolerance > 0:
-        simplified = new_line.simplify(cfg.simplify_tolerance, preserve_topology=True)
-        if not simplified.is_empty and len(simplified.coords) >= 2:
-            new_line = simplified
+    new_line = simplify(pts + normal * final[:, None], cfg.simplify_tolerance)
 
     pct_valid = float(used.mean())
     mean_conf = float(conf[used].mean() * pct_valid) if used.any() else 0.0
@@ -175,7 +164,7 @@ def refine_line(line: LineString, sample: Sampler, cfg: RefineConfig, step: floa
         stations = dict(x=pts[:, 0], y=pts[:, 1], raw=raw, final=final, conf=conf,
                         width=width, used=used)
     return RefineResult(
-        geometry=new_line,
+        coords=new_line,
         shift_avg=float(shift_abs.mean()),
         shift_max=float(shift_abs.max()),
         confidence=round(mean_conf, 3),

@@ -13,18 +13,20 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.spatial import cKDTree
-from shapely.geometry import LineString
+
+from .geom import cumlen
 
 
-def snap_nodes(orig_ends: np.ndarray, new_lines: list[LineString], weights: np.ndarray,
-               tolerance: float, taper: float = 50.0) -> list[LineString]:
-    """orig_ends: (n, 2, 2) original start/end xy per piece. Returns adjusted lines."""
+def snap_nodes(orig_ends: np.ndarray, new_lines: list[np.ndarray], weights: np.ndarray,
+               tolerance: float, taper: float = 50.0) -> list[np.ndarray]:
+    """orig_ends: (n, 2, 2) original start/end xy per piece; new_lines: (N, 2) coords
+    per piece. Returns adjusted coords."""
     n = len(new_lines)
     if n == 0:
         return []
     pts = orig_ends.reshape(-1, 2)
     groups = _components(len(pts), cKDTree(pts).query_pairs(tolerance))
-    ends = np.array([[ln.coords[0][:2], ln.coords[-1][:2]] for ln in new_lines]).reshape(-1, 2)
+    ends = np.array([[ln[0, :2], ln[-1, :2]] for ln in new_lines]).reshape(-1, 2)
     dirs = np.array([[_end_dir(ln, 0), _end_dir(ln, -1)] for ln in new_lines]).reshape(-1, 2)
     w = np.repeat(np.asarray(weights, float), 2) + 1e-3
 
@@ -51,20 +53,19 @@ def _node(p: np.ndarray, d: np.ndarray, w: np.ndarray, pull: float = 0.05) -> np
     return np.linalg.solve(A, b)
 
 
-def _end_dir(ln: LineString, which: int) -> np.ndarray:
-    c = np.asarray(ln.coords)[:, :2]
+def _end_dir(ln: np.ndarray, which: int) -> np.ndarray:
+    c = ln[:, :2]
     v = c[1] - c[0] if which == 0 else c[-1] - c[-2]
     norm = np.linalg.norm(v)
     return v / norm if norm > 0 else np.array([1.0, 0.0])
 
 
-def _taper_move(ln: LineString, d0: np.ndarray, d1: np.ndarray, taper: float) -> LineString:
+def _taper_move(ln: np.ndarray, d0: np.ndarray, d1: np.ndarray, taper: float) -> np.ndarray:
     """Shift the start by d0 and the end by d1, fading each to zero over ``taper``."""
     if not (d0.any() or d1.any()):
         return ln
-    c = np.asarray(ln.coords)[:, :2]
-    seg = np.linalg.norm(np.diff(c, axis=0), axis=1)
-    s = np.concatenate([[0.0], np.cumsum(seg)])
+    c = ln[:, :2]
+    s = cumlen(c)
     length = s[-1]
     t0 = min(taper, length) if d0.any() else 0.0
     t1 = min(taper, length) if d1.any() else 0.0
@@ -76,8 +77,7 @@ def _taper_move(ln: LineString, d0: np.ndarray, d1: np.ndarray, taper: float) ->
         s = s_new
     f0 = np.clip(1 - s / t0, 0, 1) if t0 > 0 else np.zeros_like(s)
     f1 = np.clip(1 - (length - s) / t1, 0, 1) if t1 > 0 else np.zeros_like(s)
-    c = c + f0[:, None] * d0 + f1[:, None] * d1
-    return LineString(c)
+    return c + f0[:, None] * d0 + f1[:, None] * d1
 
 
 def _components(n: int, pairs) -> list[list[int]]:

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import csv
 import logging
-import math
 import re
 import time
 from pathlib import Path
@@ -17,18 +16,14 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import shapely
-from scipy import ndimage
 from shapely.geometry import LineString, Point, box
 
-from .classifier import RoadClassifier, extract_samples, fit, sample_training_pixels
+from . import engine
+from .classifier import RoadClassifier
 from .config import Config
-from .imagery import Chip, ImageryReader
-from .refine import refine_line
-from .topology import snap_nodes
+from .imagery import ImageryReader
 
 log = logging.getLogger(__name__)
-
-PAD_PX = 64  # context pixels read around each tile so blurs/embeddings have no edge effects
 
 
 # --------------------------------------------------------------------------- vectors
@@ -80,64 +75,6 @@ def clip_to_grid(roads: gpd.GeoDataFrame, grids: gpd.GeoDataFrame, gi: int) -> l
     return out
 
 
-# --------------------------------------------------------------------------- probability
-
-class ProbabilityMap:
-    """Road probability over a region, stored as uint8 to keep memory down."""
-
-    def __init__(self, x0, y0, res, shape):
-        self.x0, self.y0, self.res = x0, y0, res
-        self.prob = np.zeros(shape, np.uint8)
-        self.valid = np.zeros(shape, np.uint8)
-
-    def _rc(self, x, y):
-        col = (np.asarray(x) - self.x0) / self.res - 0.5
-        row = (self.y0 - np.asarray(y)) / self.res - 0.5
-        return row, col
-
-    def sample(self, x, y):
-        row, col = self._rc(x, y)
-        v = ndimage.map_coordinates(self.prob, [row.ravel(), col.ravel()], order=1, cval=0,
-                                    output=np.float32)
-        return (v / 255.0).reshape(np.shape(x))
-
-    def sample_valid(self, x, y):
-        row, col = self._rc(x, y)
-        v = ndimage.map_coordinates(self.valid, [row.ravel(), col.ravel()], order=0, cval=0)
-        return v.reshape(np.shape(x)).astype(np.float32)
-
-
-def region_probability(reader: ImageryReader, clf: RoadClassifier, embedder, bounds,
-                       lines, cfg: Config) -> ProbabilityMap:
-    res = reader.res
-    margin = cfg.refine.search_half_width + cfg.refine.max_shift + 4 * res
-    minx, miny, maxx, maxy = bounds
-    x0 = math.floor((minx - margin) / res) * res
-    y0 = math.ceil((maxy + margin) / res) * res
-    width = int(math.ceil((maxx + margin - x0) / res))
-    height = int(math.ceil((y0 - (miny - margin)) / res))
-    pmap = ProbabilityMap(x0, y0, res, (height, width))
-
-    tile = cfg.classifier.embedding_tile if embedder is not None else 1024
-    core = max(64, tile - 2 * PAD_PX) if embedder is not None else tile
-    tree = shapely.STRtree(lines)
-    reach = cfg.refine.search_half_width + cfg.refine.max_shift
-    for r0 in range(0, height, core):
-        for c0 in range(0, width, core):
-            h, w = min(core, height - r0), min(core, width - c0)
-            tx0, ty0 = x0 + c0 * res, y0 - r0 * res
-            tbox = box(tx0, ty0 - h * res, tx0 + w * res, ty0)
-            if not len(tree.query(tbox, predicate="dwithin", distance=reach)):
-                continue  # nothing to refine near this tile
-            chip = reader.read(tx0 - PAD_PX * res, ty0 + PAD_PX * res,
-                               w + 2 * PAD_PX, h + 2 * PAD_PX)
-            p = clf.predict(chip, embedder)[PAD_PX:PAD_PX + h, PAD_PX:PAD_PX + w]
-            v = chip.valid[PAD_PX:PAD_PX + h, PAD_PX:PAD_PX + w]
-            pmap.prob[r0:r0 + h, c0:c0 + w] = np.round(p * 255).astype(np.uint8)
-            pmap.valid[r0:r0 + h, c0:c0 + w] = v
-    return pmap
-
-
 # --------------------------------------------------------------------------- training
 
 def make_embedder(cfg: Config):
@@ -149,10 +86,12 @@ def make_embedder(cfg: Config):
     return EmbeddingExtractor(cfg.classifier.embedding_model, cfg.classifier.embedding_device)
 
 
+def _coords(geom) -> np.ndarray:
+    return np.asarray(geom.coords)[:, :2]
+
+
 def train_classifier(reader: ImageryReader, roads, grids, cfg: Config, embedder,
                      seed: int = 0) -> RoadClassifier:
-    cc = cfg.classifier
-    rng = np.random.default_rng(seed)
     with_roads = [gi for gi in range(len(grids))
                   if len(roads.sindex.query(grids.geometry.iloc[gi], predicate="intersects"))]
     if cfg.grid_ids is not None:
@@ -160,59 +99,18 @@ def train_classifier(reader: ImageryReader, roads, grids, cfg: Config, embedder,
         with_roads = [gi for gi in with_roads if str(grids.grid_id.iloc[gi]) in wanted]
     if not with_roads:
         raise ValueError("No grid contains any road; check that the files overlap")
-    pick = np.unique(np.linspace(0, len(with_roads) - 1, min(cc.training_grids, len(with_roads)))
-                     .round().astype(int))
-    train_grids = [with_roads[i] for i in pick]
+    train_grids = engine.pick_spread(with_roads, cfg.classifier.training_grids)
     log.info("Training on %d grid(s): %s", len(train_grids),
              ", ".join(str(grids.grid_id.iloc[g]) for g in train_grids))
+    cells = [[_coords(roads.geometry.iloc[i])
+              for i in roads.sindex.query(grids.geometry.iloc[gi], predicate="intersects")]
+             for gi in train_grids]
 
-    # Pass 1: band stretch from a coarse look at each training grid.
-    vals = []
-    for gi in train_grids:
-        minx, miny, maxx, maxy = grids.geometry.iloc[gi].bounds
-        coarse = max(reader.res, (maxx - minx) / 512)
-        n = int(math.ceil((maxx - minx) / coarse)), int(math.ceil((maxy - miny) / coarse))
-        chip = reader.read(minx, maxy, n[0], n[1], res=coarse)
-        if chip.valid.any():
-            vals.append(chip.data[:, chip.valid])
-    if not vals:
-        raise ValueError("The training grids have no imagery; check imagery coverage and CRS")
-    allv = np.concatenate(vals, axis=1)
-    lo = np.percentile(allv, 2, axis=1)
-    hi = np.percentile(allv, 98, axis=1)
+    def lines_near(bounds):
+        return [_coords(roads.geometry.iloc[i])
+                for i in roads.sindex.query(box(*bounds), predicate="intersects")]
 
-    # Pass 2: labelled samples from tiles centred on random road points.
-    tile = cc.embedding_tile if embedder is not None else 1024
-    tiles_per_grid = 4
-    n_tiles = len(train_grids) * tiles_per_grid
-    per_tile = max(50, cc.samples_per_class // n_tiles)
-    pix_s, emb_s, lab_s = [], [], []
-    half = tile * reader.res / 2
-    for gi in train_grids:
-        cell = grids.geometry.iloc[gi]
-        idx = roads.sindex.query(cell, predicate="intersects")
-        lines = roads.geometry.iloc[idx]
-        for _ in range(tiles_per_grid):
-            li = rng.integers(len(lines))
-            ln = lines.iloc[li]
-            centre = ln.interpolate(rng.random(), normalized=True)
-            chip = reader.read(centre.x - half, centre.y + half, tile, tile)
-            near_box = box(centre.x - half - cc.negative_max_dist, centre.y - half - cc.negative_max_dist,
-                           centre.x + half + cc.negative_max_dist, centre.y + half + cc.negative_max_dist)
-            near = roads.geometry.iloc[roads.sindex.query(near_box, predicate="intersects")]
-            rows, cols, labels = sample_training_pixels(chip, list(near), cc, rng, per_tile)
-            if len(labels) == 0:
-                continue
-            pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder)
-            pix_s.append(pix)
-            lab_s.append(labels)
-            if emb is not None:
-                emb_s.append(emb)
-    if not lab_s:
-        raise ValueError("No training pixels found; check imagery coverage")
-    return fit(np.concatenate(pix_s), np.concatenate(emb_s) if emb_s else None,
-               np.concatenate(lab_s), feature_mode=cc.features, has_nir=reader.has_nir,
-               band_lo=lo, band_hi=hi, embedding_model=cc.embedding_model if embedder else None)
+    return engine.train_classifier(reader, cells, lines_near, cfg.classifier, embedder, seed)
 
 
 # --------------------------------------------------------------------------- per grid
@@ -233,27 +131,15 @@ def process_grid(reader, clf, embedder, roads, grids, gi, cfg: Config, out_dir: 
         _empty_grid(path, roads.crs)
         return summary
 
-    lines = [p[1] for p in pieces]
-    pmap = region_probability(reader, clf, embedder, grids.geometry.iloc[gi].bounds, lines, cfg)
-    records, station_rows = [], []
-    for src_id, ln in pieces:
-        r = refine_line(ln, pmap.sample, cfg.refine, step=reader.res, valid=pmap.sample_valid,
-                        keep_stations=cfg.output.write_stations)
-        (sx, sy), (ex, ey) = ln.coords[0][:2], ln.coords[-1][:2]
-        records.append(dict(
-            src_id=src_id, grid_id=grid_id, shift_avg=round(r.shift_avg, 2),
-            shift_max=round(r.shift_max, 2), conf=r.confidence, pct_valid=r.pct_valid,
-            width_med=round(r.width_med, 1), review=int(r.needs_review),
-            reason=";".join(r.reasons), o_sx=sx, o_sy=sy, o_ex=ex, o_ey=ey,
-            geometry=r.geometry,
-        ))
-        if r.stations is not None:
-            s = r.stations
-            for i in range(len(s["x"])):
-                station_rows.append(dict(src_id=src_id, grid_id=grid_id,
-                                         raw=s["raw"][i], final=s["final"][i], conf=s["conf"][i],
-                                         width=s["width"][i], used=int(s["used"][i]),
-                                         geometry=Point(s["x"][i], s["y"][i])))
+    pmap = engine.region_probability(reader, clf, embedder, grids.geometry.iloc[gi].bounds,
+                                     [_coords(p[1]) for p in pieces], cfg.refine, cfg.classifier)
+    records, stations = engine.refine_pieces(pmap, [(sid, _coords(g)) for sid, g in pieces],
+                                             cfg.refine, reader.res, cfg.output.write_stations)
+    for r in records:
+        r["grid_id"] = grid_id
+        r["geometry"] = LineString(r.pop("coords"))
+    station_rows = [dict(s, grid_id=grid_id, geometry=Point(s.pop("x"), s.pop("y")))
+                    for s in stations]
     gdf = gpd.GeoDataFrame(records, geometry="geometry", crs=roads.crs)
     tmp = path.with_suffix(".tmp.gpkg")
     gdf.to_file(tmp, layer="lines", driver="GPKG")
@@ -278,7 +164,7 @@ def _empty_grid(path: Path, crs):
         path, layer="lines", driver="GPKG")
 
 
-def _write_probability(pmap: ProbabilityMap, path: Path, crs):
+def _write_probability(pmap: "engine.ProbabilityMap", path: Path, crs):
     import rasterio
     from rasterio.transform import from_origin
 
@@ -302,10 +188,9 @@ def merge(grid_files: list[Path], cfg: Config, crs) -> gpd.GeoDataFrame:
         return gpd.GeoDataFrame(columns=FINAL_FIELDS + ["geometry"], geometry="geometry", crs=crs)
     gdf = pd.concat(parts, ignore_index=True)
     gdf = gpd.GeoDataFrame(gdf, geometry="geometry", crs=parts[0].crs)
-    ends = gdf[["o_sx", "o_sy", "o_ex", "o_ey"]].to_numpy(float).reshape(-1, 2, 2)
-    snapped = snap_nodes(ends, list(gdf.geometry), gdf.conf.to_numpy(float),
-                         cfg.refine.node_snap_tolerance, cfg.refine.node_taper)
-    gdf["geometry"] = snapped
+    records = [dict(o_sx=r.o_sx, o_sy=r.o_sy, o_ex=r.o_ex, o_ey=r.o_ey, conf=r.conf,
+                    coords=_coords(r.geometry)) for r in gdf.itertuples()]
+    gdf["geometry"] = [LineString(c) for c in engine.reconnect(records, cfg.refine)]
     return gdf[FINAL_FIELDS + ["geometry"]]
 
 

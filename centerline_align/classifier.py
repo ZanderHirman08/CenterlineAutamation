@@ -7,7 +7,8 @@ map that is far more robust than a fixed colour threshold.
 
 The model is linear on standardised features, so the embedding part can be
 evaluated at patch resolution and upsampled afterwards (see ``predict``).
-It is saved as plain JSON - no pickles.
+It is saved as plain JSON - no pickles. Only numpy and scipy are needed, so it
+also runs inside ArcGIS Pro's built-in Python.
 """
 from __future__ import annotations
 
@@ -16,10 +17,9 @@ import logging
 from dataclasses import asdict, dataclass
 
 import numpy as np
-from rasterio import features as rfeatures
-from rasterio.transform import from_origin
 from scipy import ndimage
 
+from .chip import Chip
 from .features import (
     EmbeddingExtractor,
     pixel_feature_names,
@@ -28,9 +28,9 @@ from .features import (
     scale_bands,
     upsample_lowres,
 )
-from .imagery import Chip
+from .geom import densify
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("centerline_align")
 
 
 @dataclass
@@ -78,15 +78,27 @@ class RoadClassifier:
         return prob.astype(np.float32)
 
 
+def burn_lines(chip: Chip, lines) -> np.ndarray:
+    """Boolean raster marking every pixel a line passes through."""
+    burned = np.zeros(chip.shape, bool)
+    h, w = chip.shape
+    for c in lines:
+        if c is None or len(c) < 2:
+            continue
+        pts = densify(np.asarray(c, float)[:, :2], chip.res * 0.5)
+        row, col = chip.world_to_pixel(pts[:, 0], pts[:, 1])
+        r, k = np.round(row).astype(int), np.round(col).astype(int)
+        ok = (r >= 0) & (r < h) & (k >= 0) & (k < w)
+        burned[r[ok], k[ok]] = True
+    return burned
+
+
 def distance_to_roads(chip: Chip, lines) -> np.ndarray:
     """Distance (CRS units) from each chip pixel centre to the nearest road line."""
-    transform = from_origin(chip.x0, chip.y0, chip.res, chip.res)
-    shapes = [(g, 1) for g in lines if g is not None and not g.is_empty]
-    if not shapes:
+    burned = burn_lines(chip, lines)
+    if not burned.any():
         return np.full(chip.shape, np.inf, dtype=np.float32)
-    burned = rfeatures.rasterize(shapes, out_shape=chip.shape, transform=transform,
-                                 fill=0, all_touched=True, dtype="uint8")
-    return (ndimage.distance_transform_edt(burned == 0) * chip.res).astype(np.float32)
+    return (ndimage.distance_transform_edt(~burned) * chip.res).astype(np.float32)
 
 
 def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int):
@@ -107,8 +119,6 @@ def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndar
         *, feature_mode: str, has_nir: bool, band_lo, band_hi,
         embedding_model: str | None) -> RoadClassifier:
     """Fit a balanced logistic regression on standardised features."""
-    from sklearn.linear_model import LogisticRegression
-
     if len(np.unique(labels)) < 2:
         raise ValueError(
             "Training found only one class. Check that roads overlap the imagery and "
@@ -122,11 +132,9 @@ def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndar
     std = X.std(axis=0)
     std[std < 1e-9] = 1.0
     Xs = (X - mean) / std
-    model = LogisticRegression(C=0.5, max_iter=2000, class_weight="balanced")
-    model.fit(Xs, labels)
-    acc = float(model.score(Xs, labels))
+    coef, intercept = logistic_regression(Xs, labels, C=0.5)
+    acc = float((((Xs @ coef + intercept) > 0) == (labels > 0.5)).mean())
     log.info("Classifier trained on %d samples, training accuracy %.3f", len(labels), acc)
-    coef = model.coef_[0]
     n_pix = samples_pix.shape[1]
     clf = RoadClassifier(
         feature_mode=feature_mode,
@@ -137,7 +145,7 @@ def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndar
         pix_mean=mean[:n_pix].tolist(),
         pix_std=std[:n_pix].tolist(),
         pix_coef=coef[:n_pix].tolist(),
-        intercept=float(model.intercept_[0]),
+        intercept=float(intercept),
         train_accuracy=acc,
     )
     if samples_emb is not None:
@@ -146,6 +154,34 @@ def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndar
         clf.emb_std = std[n_pix:].tolist()
         clf.emb_coef = coef[n_pix:].tolist()
     return clf
+
+
+def logistic_regression(X: np.ndarray, y: np.ndarray, C: float = 1.0,
+                        max_iter: int = 50, tol: float = 1e-8):
+    """L2-regularised logistic regression with balanced class weights (Newton's method).
+
+    Minimises ``sum(w_i * logloss_i) + |coef|^2 / (2C)``, the same objective as
+    scikit-learn's ``LogisticRegression(C=C, class_weight="balanced")``.
+    Returns (coef, intercept).
+    """
+    n, f = X.shape
+    y = np.asarray(y, dtype=np.float64)
+    n_pos = y.sum()
+    sw = np.where(y > 0.5, n / (2 * n_pos), n / (2 * (n - n_pos)))
+    A = np.hstack([X, np.ones((n, 1))])
+    beta = np.zeros(f + 1)
+    reg = np.full(f + 1, 1.0 / C)
+    reg[-1] = 0.0  # intercept not penalised
+    for _ in range(max_iter):
+        z = np.clip(A @ beta, -30, 30)
+        p = 1.0 / (1.0 + np.exp(-z))
+        grad = A.T @ (sw * (p - y)) + reg * beta
+        H = (A * (sw * p * (1 - p))[:, None]).T @ A + np.diag(reg + 1e-9)
+        step = np.linalg.solve(H, grad)
+        beta -= step
+        if np.max(np.abs(step)) < tol * (1 + np.max(np.abs(beta))):
+            break
+    return beta[:-1], float(beta[-1])
 
 
 def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi, embedder=None):

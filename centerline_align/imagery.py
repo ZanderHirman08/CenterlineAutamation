@@ -1,44 +1,15 @@
 """Windowed imagery reading in the working CRS and resolution."""
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
 from rasterio.windows import from_bounds
 
+from .chip import Chip
 from .config import Config
 from .mosaic import resolve_imagery
-
-
-@dataclass
-class Chip:
-    """A block of imagery: bands (B, H, W), validity mask (H, W) and its georeference.
-
-    ``x0, y0`` is the top-left corner; pixels are square with size ``res``.
-    """
-    data: np.ndarray
-    valid: np.ndarray
-    x0: float
-    y0: float
-    res: float
-
-    @property
-    def shape(self) -> tuple[int, int]:
-        return self.valid.shape
-
-    def world_to_pixel(self, x, y):
-        """Fractional (row, col) of pixel centres for world coords."""
-        col = (np.asarray(x) - self.x0) / self.res - 0.5
-        row = (self.y0 - np.asarray(y)) / self.res - 0.5
-        return row, col
-
-    def pixel_to_world(self, row, col):
-        x = self.x0 + (np.asarray(col) + 0.5) * self.res
-        y = self.y0 - (np.asarray(row) + 0.5) * self.res
-        return x, y
 
 
 class ImageryReader:
@@ -71,6 +42,11 @@ class ImageryReader:
     @property
     def bounds(self):
         return self._ds.bounds
+
+    def snap(self, x: float, y: float) -> tuple[float, float]:
+        """Pixel corner at or left of x and at or above y, on the imagery's grid."""
+        gx, gy, r = self._ds.transform.c, self._ds.transform.f, self.res
+        return gx + np.floor((x - gx) / r) * r, gy - np.floor((gy - y) / r) * r
 
     def read(self, x0: float, y0: float, width_px: int, height_px: int,
              res: float | None = None) -> Chip:
