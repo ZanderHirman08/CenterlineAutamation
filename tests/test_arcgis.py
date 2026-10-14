@@ -1,12 +1,14 @@
 """Run the generated ArcGIS toolbox (.pyt) against a stand-in arcpy."""
 import importlib.machinery
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import geopandas as gpd
 import numpy as np
+import pandas as pd
 import pytest
 import rasterio
 from rasterio.windows import Window
@@ -159,6 +161,26 @@ def test_toolbox_matches_cli(toolbox, tiled_scene, tmp_path):
     assert max(d) < 0.05, d
 
 
+def test_toolbox_skips_bad_tiles_and_warns_about_gaps(toolbox, tiled_scene, tmp_path):
+    import shutil
+    from shapely.geometry import box
+
+    tiles = tmp_path / "tiles"
+    shutil.copytree(tiled_scene["tiles"], tiles)
+    (tiles / "aaa_corrupt.tif").write_bytes(b"not a tiff")
+    grids = gpd.read_file(tiled_scene["grids"])
+    x0, y0 = synthetic.X0, synthetic.Y0
+    extra = gpd.GeoDataFrame({"GRID_ID": ["G9"]},
+                             geometry=[box(x0 + 5000, y0 - 1000, x0 + 5800, y0)], crs=grids.crs)
+    gpath = tmp_path / "grids.shp"
+    gpd.GeoDataFrame(pd.concat([grids, extra], ignore_index=True), crs=grids.crs).to_file(gpath)
+    out = run_tool(toolbox, dict(tiled_scene, tiles=tiles, grids=gpath), tmp_path / "r")
+    warn = "\n".join(fake_arcpy.warnings)
+    assert "aaa_corrupt.tif" in warn and "were skipped" in warn
+    assert "1 of 3 grids are not fully covered" in warn and "G9 (0%)" in warn
+    assert error_to_truth(out.geometry)[0] < 1.0      # the good tiles were still used
+
+
 def test_toolbox_probability_rasters(toolbox, tiled_scene, tmp_path):
     run_tool(toolbox, tiled_scene, tmp_path, diagnostics=True)
     probs = sorted((tmp_path / "work" / "diagnostics").glob("road_prob_*.tif"))
@@ -175,18 +197,21 @@ def test_toolbox_no_nir_and_bad_band(toolbox, tiled_scene, tmp_path):
         run_tool(toolbox, tiled_scene, tmp_path / "b", nir=5)
 
 
-def test_copy_aoi_tiles(monkeypatch, tiled_scene, tmp_path):
-    """Only tiles touching the buffered AOI polygons are copied, with their sidecars."""
-    from shapely.geometry import box
-
+def load_copy_script(monkeypatch):
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
     src = (ROOT / "arcgis" / "copy_aoi_tiles.py").read_text()
     call = "copy_aoi_tiles(STATE_TILES, AOI, BUFFER, OUT_TILES, DRY_RUN)"
     assert src.rstrip().endswith(call)
     ns = {"__name__": "copy_aoi_tiles"}
     exec(compile(src.rstrip()[: -len(call)], "copy_aoi_tiles.py", "exec"), ns)
-    copy = ns["copy_aoi_tiles"]
+    return ns["copy_aoi_tiles"]
 
+
+def test_copy_aoi_tiles(monkeypatch, tiled_scene, tmp_path):
+    """Only tiles touching the buffered AOI polygons are copied, with their sidecars."""
+    from shapely.geometry import box
+
+    copy = load_copy_script(monkeypatch)
     # tiles: 800 x 500 ft each; tile_0 top-left, tile_1 top-right, tile_2/3 below
     x0, y0 = synthetic.X0, synthetic.Y0
     grids = tmp_path / "grids.shp"
@@ -194,16 +219,17 @@ def test_copy_aoi_tiles(monkeypatch, tiled_scene, tmp_path):
              box(x0 + 100, y0 - 250, x0 + 300, y0 - 50)]      # also tile_0
     gpd.GeoDataFrame({"G": [1, 2]}, geometry=cells, crs=synthetic.CRS).to_file(grids)
     out = tmp_path / "a"
-    assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out), dry_run=True) == 1
+    assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out), dry_run=True)["matched"] == 1
     assert not out.exists()  # dry run copies nothing
-    assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out)) == 1
+    r = copy(str(tiled_scene["tiles"]), str(grids), 50, str(out))
+    assert r["copied"] == 1 and not r["failed"] and not r["uncovered"]
     assert sorted(p.name for p in out.iterdir()) == ["tile_0.tif", "tile_0.tif.aux.xml"]
 
     # a second, separate grid square in the bottom-right tile adds only that tile
     cells.append(box(x0 + 1200, y0 - 900, x0 + 1400, y0 - 700))
     gpd.GeoDataFrame({"G": [1, 2, 3]}, geometry=cells, crs=synthetic.CRS).to_file(grids)
     out2 = tmp_path / "b"
-    assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out2)) == 2
+    assert copy(str(tiled_scene["tiles"]), str(grids), 50, str(out2))["copied"] == 2
     assert {p.name for p in out2.iterdir()} >= {"tile_0.tif", "tile_3.tif"}
 
     # originals untouched, and the output can't be inside the source folder
@@ -215,4 +241,38 @@ def test_copy_aoi_tiles(monkeypatch, tiled_scene, tmp_path):
     # a 250 ft buffer crosses the tile edge at y0 - 500: the first squares pull in
     # the tile below them (tile_2), the third the tile above it (tile_1)
     out3 = tmp_path / "c"
-    assert copy(str(tiled_scene["tiles"]), str(grids), 250, str(out3)) == 4
+    assert copy(str(tiled_scene["tiles"]), str(grids), 250, str(out3))["copied"] == 4
+
+
+def test_copy_reports_problems_and_gaps(monkeypatch, tiled_scene, tmp_path):
+    """A bad tile doesn't stop the copy; unread formats and uncovered grids are reported."""
+    import shutil
+    from shapely.geometry import box
+
+    copy = load_copy_script(monkeypatch)
+    src = tmp_path / "state"
+    shutil.copytree(tiled_scene["tiles"], src)
+    (src / "aaa_corrupt.tif").write_bytes(b"not a tiff")   # sorts first: used to stop the run
+    (src / "west.sid").write_bytes(b"")                    # .sid is now considered
+    (src / "east.ecw").write_bytes(b"")                    # unknown format: reported
+    x0, y0 = synthetic.X0, synthetic.Y0
+    grids = tmp_path / "grids.shp"
+    cells = [box(x0 + 100, y0 - 300, x0 + 300, y0 - 100),        # covered
+             box(x0 + 1500, y0 - 300, x0 + 1700, y0 - 100),      # half off the imagery
+             box(x0 + 5000, y0 - 300, x0 + 5200, y0 - 100)]      # no imagery at all
+    gpd.GeoDataFrame({"G": [1, 2, 3]}, geometry=cells, crs=synthetic.CRS).to_file(grids)
+    fake_arcpy.messages.clear()
+    r = copy(str(src), str(grids), 10, str(tmp_path / "out"))
+    assert r["copied"] == 2                                  # tile_0 and tile_1, after the bad one
+    assert {os.path.basename(p) for p, _ in r["failed"]} == {"aaa_corrupt.tif", "west.sid"}
+    assert r["other"] == {".ecw": 1}
+    cov = dict(r["uncovered"])
+    assert set(cov) == {2, 3} and cov[3] == 0 and 0.4 < cov[2] < 0.6
+    text = "\n".join(fake_arcpy.messages)
+    assert "could not be read" in text and ".ecw (1)" in text
+    assert "No imagery, OBJECTID: 3" in text and "2 (50%)" in text
+
+    # running again after a fix re-copies nothing that is already there
+    fake_arcpy.messages.clear()
+    copy(str(src), str(grids), 10, str(tmp_path / "out"))
+    assert any("already there" in m for m in fake_arcpy.messages)

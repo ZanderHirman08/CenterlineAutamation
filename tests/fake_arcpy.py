@@ -80,6 +80,16 @@ class _Geometry:
     def disjoint(self, other):
         return self._shp.disjoint(other._shp)
 
+    @property
+    def area(self):
+        return self._shp.area
+
+    def intersect(self, other, dimension):
+        res = self._shp.intersection(other._shp)
+        if dimension == 4:
+            return Polygon(res, self.spatialReference)
+        return _wrap(res, self.spatialReference)
+
     def union(self, other):
         return type(self)(self._shp.union(other._shp), self.spatialReference)
 
@@ -213,9 +223,9 @@ class _SearchCursor:
         else:  # like arcpy: geometries carry the dataset's spatial reference
             spatial_reference = SpatialReference(df.crs)
         self.rows = []
-        for _, r in df.iterrows():
+        for k, (_, r) in enumerate(df.iterrows(), 1):
             self.rows.append(tuple(_wrap(r.geometry, spatial_reference) if f == "SHAPE@"
-                                   else r[f] for f in fields))
+                                   else k if f == "OID@" else r[f] for f in fields))
 
     def __enter__(self):
         return iter(self.rows)

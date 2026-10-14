@@ -72,6 +72,17 @@ Copying whole tiles is exact (no resampling, no new NoData edges) and quick.
 4. Check: add the `tiles` folder to a map with the grids. Every grid should be
    covered, with a margin and no gaps.
 
+At the end the script reports (in the Python window):
+
+* tiles it couldn't read; it skips them and keeps going instead of stopping,
+* other image formats in the source folder that it didn't consider,
+* grids (by OBJECTID) that have **no** or only **partial** imagery.
+
+If grids are listed as uncovered, the source folder has no tiles there or the
+tiles there are unreadable. Fix that, then run the script again: tiles that
+were already copied are not copied twice. The toolbox repeats the coverage
+check when it starts and lists any grids without imagery.
+
 If `AOI` is a layer in your map with grids selected, only the selected grids
 are used. That's handy for a quick test area. It copies each tile's sidecar
 files too (`.aux.xml` often holds the projection, `.ovr` the pyramids); keep

@@ -1217,7 +1217,7 @@ import time
 import numpy as np
 
 
-TILE_EXTS = (".tif", ".tiff", ".img", ".jp2")
+TILE_EXTS = (".tif", ".tiff", ".img", ".jp2", ".sid")
 
 
 class ArcTileReader:
@@ -1227,23 +1227,38 @@ class ArcTileReader:
         self.arcpy = arcpy
         paths = self._find(source)
         self.tiles = []
+        self.skipped = []  # (path, reason): unreadable tiles, or ones that don't match the rest
         for p in paths:
-            r = arcpy.Raster(p)
-            e = r.extent
-            self.tiles.append(dict(path=p, xmin=e.XMin, ymin=e.YMin, xmax=e.XMax, ymax=e.YMax,
-                                   res=float(r.meanCellWidth), count=int(r.bandCount),
-                                   sr=r.spatialReference))
+            try:
+                r = arcpy.Raster(p)
+                e = r.extent
+                t = dict(path=p, xmin=e.XMin, ymin=e.YMin, xmax=e.XMax, ymax=e.YMax,
+                         res=float(r.meanCellWidth), count=int(r.bandCount),
+                         sr=r.spatialReference)
+            except Exception as err:
+                msg = str(err).strip().splitlines()
+                self.skipped.append((p, msg[0] if msg else "could not be read"))
+                continue
+            if self.tiles:
+                ref = self.tiles[0]
+                if abs(t["res"] - ref["res"]) > 1e-6 * ref["res"]:
+                    self.skipped.append((p, f"cell size {t['res']}, expected {ref['res']}"))
+                    continue
+                if t["sr"] is None or t["sr"].name != ref["sr"].name:
+                    name = t["sr"].name if t["sr"] is not None else "no coordinate system"
+                    self.skipped.append((p, f"in {name}, expected {ref['sr'].name}"))
+                    continue
+            self.tiles.append(t)
+        if not self.tiles:
+            raise ValueError(f"None of the imagery in {source} could be read" + (
+                f" (first problem: {self.skipped[0][0]}: {self.skipped[0][1]})"
+                if self.skipped else ""))
         first = self.tiles[0]
         self.sr = first["sr"]
         self.res = first["res"]
         if self.sr is None or self.sr.type != "Projected":
             raise ValueError("The imagery must be in a projected coordinate system "
                              "(e.g. State Plane), not geographic.")
-        for t in self.tiles[1:]:
-            if abs(t["res"] - self.res) > 1e-6 * self.res:
-                raise ValueError(f"{t['path']} has cell size {t['res']}, expected {self.res}")
-            if t["sr"].name != self.sr.name:
-                raise ValueError(f"{t['path']} is in {t['sr'].name}, expected {self.sr.name}")
         self.bands = list(bands)
         if max(self.bands) > first["count"]:
             raise ValueError(f"Band {max(self.bands)} requested but the imagery has "
@@ -1262,6 +1277,17 @@ class ArcTileReader:
                 raise ValueError(f"No .tif/.img/.jp2 tiles found in {source}")
             return sorted(found)
         return [source]
+
+    def coverage(self, ext) -> float:
+        """Share (0-1) of a rectangle (xmin, ymin, xmax, ymax) covered by tile extents."""
+        x0, y0, x1, y1 = ext
+        area = (x1 - x0) * (y1 - y0)
+        if area <= 0:
+            return 0.0
+        e = self._ext
+        w = np.clip(np.minimum(e[:, 2], x1) - np.maximum(e[:, 0], x0), 0, None)
+        h = np.clip(np.minimum(e[:, 3], y1) - np.maximum(e[:, 1], y0), 0, None)
+        return float(min(1.0, (w * h).sum() / area))  # tiles may overlap a little
 
     @property
     def extent(self):
@@ -1409,12 +1435,24 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     msg(f"Imagery: {len(reader.tiles)} raster(s), {sr.name}, cell size {reader.res:g} "
         f"{sr.linearUnitName}. All distance settings are in {sr.linearUnitName}.")
     msg(f"Bands used: {reader.bands} (NIR: {'yes' if reader.has_nir else 'no'})")
+    if reader.skipped:
+        arcpy.AddWarning(f"{len(reader.skipped)} imagery file(s) were skipped:\n" + "\n".join(
+            f"  {p}: {why}" for p, why in reader.skipped[:15])
+            + (f"\n  ... and {len(reader.skipped) - 15} more" if len(reader.skipped) > 15 else ""))
 
     roads = read_lines(arcpy, roads_fc, road_id_field, sr)
     grids = read_grids(arcpy, grids_fc, grid_id_field, sr)
     if not roads or not grids:
         raise ValueError("No roads or no grids to process (check selections / definition queries)")
     msg(f"{len(roads)} roads, {len(grids)} grids (only selected features are used)")
+    gaps = [(gid, reader.coverage(ext)) for gid, _, ext in grids]
+    gaps = [(gid, f) for gid, f in gaps if f < 0.95]
+    if gaps:
+        arcpy.AddWarning(
+            f"{len(gaps)} of {len(grids)} grids are not fully covered by the imagery tiles; "
+            "roads there will be flagged no_imagery. Grid (covered %): " + ", ".join(
+                f"{g} ({f:.0%})" for g, f in gaps[:60]) + (" ..." if len(gaps) > 60 else "")
+            + ". Check the tile copy (copy_aoi_tiles.py reports which grids it couldn't cover).")
 
     model_path = os.path.join(work_folder, "road_classifier.json")
     if fresh:
