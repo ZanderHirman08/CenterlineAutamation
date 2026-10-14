@@ -15,9 +15,9 @@ import arcpy
 
 # ---- settings ---------------------------------------------------------------
 STATE_TILES = r"D:\Imagery\State_2024\tiles"            # folder of statewide .tif tiles
-AOI = r"D:\Centerline\data\Inputs.gdb\Grids_1mi"        # your work grids (layer name or path)
+AOI = r"D:\Centerline\CountyA\data\Inputs.gdb\Grids_1mi"  # the county's work grids (layer or path)
 BUFFER = 500          # keep imagery this far past the grid edges (AOI's map units)
-OUT_TILES = r"D:\Centerline\imagery\2024\tiles"         # where the AOI's tiles go
+OUT_TILES = r"D:\Centerline\CountyA\imagery\tiles"     # where the AOI's tiles go
 DRY_RUN = True        # True: only count tiles and size; set False to copy
 # -----------------------------------------------------------------------------
 

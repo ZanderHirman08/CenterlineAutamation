@@ -2,41 +2,43 @@
 
 ## 1. Folder structure
 
-Put everything on a **local drive** (not a network share; the tool reads a
-lot of imagery) with a short path and no spaces:
+One county at a time, each in its own folder. Put everything on a **local
+drive** (not a network share; the tool reads a lot of imagery) with a short
+path and no spaces:
 
 ```
 D:\Centerline\
-├── toolbox\
+├── toolbox\                         shared by every county
 │   ├── CenterlineAlign.pyt          the toolbox (add it in Pro)
 │   └── copy_aoi_tiles.py            helper for step 2
-├── imagery\
-│   └── 2024\
-│       └── tiles\                   tiles covering your grids + their .aux.xml / .ovr / .tfw
-├── data\
-│   └── Inputs.gdb                   Local_Roads, Grids_1mi (copies, not the originals)
-├── work\
-│   ├── 2024_test\                   work folder for the 2-3 grid test
-│   └── 2024_run1\                   work folder for the full run: start it empty
-├── output\
-│   └── Results.gdb                  aligned_centerlines (and the dissolved version later)
-└── Centerline.aprx                  your Pro project
+├── CountyA\
+│   ├── data\Inputs.gdb              Local_Roads, Grids_1mi (copies, not the originals)
+│   ├── imagery\tiles\               tiles covering the grids + .aux.xml / .ovr / .tfw
+│   ├── work\test\                   work folder for the 2-3 grid test
+│   ├── work\run1\                   work folder for the full run: start it empty
+│   ├── output\Results.gdb           aligned_centerlines (and the dissolved version later)
+│   └── CountyA.aprx
+└── CountyB\                         same layout when you get to the next county
 ```
 
 Rules of thumb:
 
+* **The grids define the job.** Only grids in `Grids_1mi` are processed, and only
+  road pieces inside them are written to the output. Roads outside the AOI
+  keep their current geometry when you transfer the results.
 * **One work folder per run.** It holds per-grid progress and the trained
-  classifier. If you change settings or imagery, make a new folder
-  (`2024_run2`) or tick *Start over*; otherwise finished grids are skipped.
-* **Work on copies.** Export the local roads and grids into `Inputs.gdb`
-  (right-click → Data → Export Features) so the originals are never touched.
+  classifier. Never share one between counties. If you change settings or
+  imagery, make a new folder (`run2`) or tick *Start over*; otherwise
+  finished grids are skipped.
+* **Work on copies.** Export the county's local roads and grids into
+  `Inputs.gdb` (right-click → Data → Export Features) so the originals are
+  never touched.
 * **Check disk space first.** Each of your tiles is ~380 MB uncompressed and
   covers 5,000 × 5,000 ft (~0.9 sq mi), so expect roughly 1.2-1.5 tiles per
   1-mile grid once edges are counted: 400 grids is ~500-600 tiles,
-  **~190-230 GB**. The copy script's dry run gives the exact figure. If you
-  don't have the room, skip the copy and point the tool straight at the
-  statewide tile folder: it only reads the tiles it needs, but it checks every
-  tile when it starts, which is slow for a whole state.
+  **~190-230 GB**. The copy script's dry run gives the exact figure. When a
+  county is finished and the results are transferred, its `imagery\tiles`
+  copy can be deleted to free space for the next one.
 
 ## 2. Getting the imagery for your grids
 
@@ -55,9 +57,9 @@ Copying whole tiles is exact (no resampling, no new NoData edges) and quick.
 1. Open `toolbox\copy_aoi_tiles.py` in Notepad and set the settings at the top:
    ```python
    STATE_TILES = r"D:\Imagery\State_2024\tiles"         # statewide tile folder
-   AOI = r"D:\Centerline\data\Inputs.gdb\Grids_1mi"     # your work grids
+   AOI = r"D:\Centerline\CountyA\data\Inputs.gdb\Grids_1mi"     # your work grids
    BUFFER = 500                                         # in the grids' units (feet for State Plane ft)
-   OUT_TILES = r"D:\Centerline\imagery\2024\tiles"
+   OUT_TILES = r"D:\Centerline\CountyA\imagery\tiles"
    DRY_RUN = True                                       # count first, copy second
    ```
    The tool reads about 100 ft past each grid edge (search distance + maximum
@@ -84,7 +86,7 @@ them together.
    * Output extent: `Grids_buf500`
    * **Leave *Use input features for clipping geometry* unchecked**. This keeps
      a plain rectangle and avoids NoData inside the margin.
-   * Output raster: `D:\Centerline\imagery\2024\AOI_2024.crf` (Cloud Raster
+   * Output raster: `D:\Centerline\CountyA\imagery\AOI.crf` (Cloud Raster
      Format: tiled and compressed, and much smaller than a single giant .tif)
    * NoData value: leave empty, or `0`
    * Environments: don't change the cell size or the projection
@@ -102,13 +104,13 @@ comes out at a lower resolution, ask the state for the tiles instead.
 
    | Parameter | Value |
    |---|---|
-   | Imagery | `D:\Centerline\imagery\2024\tiles` (or the `.crf`) |
+   | Imagery | `D:\Centerline\CountyA\imagery\tiles` (or the `.crf`) |
    | Local road centerlines | `Local_Roads` (layer) |
    | Road ID field | the unique ID you'll join on later |
    | Work grids | `Grids_1mi` (layer) |
    | Grid ID field | the grid's ID |
-   | Work folder | `D:\Centerline\work\2024_test` |
-   | Output | `D:\Centerline\output\Results.gdb\aligned_test` |
+   | Work folder | `D:\Centerline\CountyA\work\test` |
+   | Output | `D:\Centerline\CountyA\output\Results.gdb\aligned_test` |
    | Bands | R 1, G 2, B 3, NIR 4 |
 
 4. Read the messages: it reports the imagery's units (all distance settings
@@ -116,7 +118,7 @@ comes out at a lower resolution, ask the state for the tiles instead.
 5. Look at the output over the imagery. Symbolise `REVIEW` (1 = check) and
    look at a few unflagged lines too.
 6. Happy with it? Clear the grid selection and run all the grids with a
-   **new** work folder (`work\2024_run1`) and output
+   **new** work folder (`work\run1`) and output
    (`Results.gdb\aligned_centerlines`). The classifier is trained on the
    first run in a work folder, from grids spread across whatever is
    selected. A test folder would leave it trained on just your 2-3 test grids.
