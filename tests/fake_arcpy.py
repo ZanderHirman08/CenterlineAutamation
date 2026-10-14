@@ -80,6 +80,16 @@ class _Geometry:
     def disjoint(self, other):
         return self._shp.disjoint(other._shp)
 
+    def union(self, other):
+        return type(self)(self._shp.union(other._shp), self.spatialReference)
+
+    def buffer(self, distance):
+        return Polygon(self._shp.buffer(distance), self.spatialReference)
+
+    def projectAs(self, sr):
+        g = gpd.GeoSeries([self._shp], crs=self.spatialReference._crs).to_crs(sr._crs).iloc[0]
+        return type(self)(g, sr)
+
 
 class Polyline(_Geometry):
     def __init__(self, arr, sr=None):
@@ -102,7 +112,12 @@ class Polyline(_Geometry):
 
 
 class Polygon(_Geometry):
-    pass
+    def __init__(self, arr, sr=None):
+        from shapely.geometry.base import BaseGeometry
+        if not isinstance(arr, BaseGeometry):
+            from shapely.geometry import Polygon as SPolygon
+            arr = SPolygon([(p.X, p.Y) for p in arr])
+        super().__init__(arr, sr)
 
 
 class PointGeometry(_Geometry):
@@ -195,6 +210,8 @@ class _SearchCursor:
         df = gpd.read_file(fc)
         if spatial_reference is not None:
             df = df.to_crs(spatial_reference._crs)
+        else:  # like arcpy: geometries carry the dataset's spatial reference
+            spatial_reference = SpatialReference(df.crs)
         self.rows = []
         for _, r in df.iterrows():
             self.rows.append(tuple(_wrap(r.geometry, spatial_reference) if f == "SHAPE@"

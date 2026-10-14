@@ -1148,7 +1148,8 @@ class ArcTileReader:
         self._ext = np.array([[t["xmin"], t["ymin"], t["xmax"], t["ymax"]] for t in self.tiles])
 
     def _find(self, source: str) -> list[str]:
-        if os.path.isdir(source) and not source.lower().endswith(".gdb"):
+        # .gdb rasters and Cloud Raster Format (.crf) are folders on disk but one raster
+        if os.path.isdir(source) and not source.lower().rstrip("\\/").endswith((".gdb", ".crf")):
             found = []
             for root, _, files in os.walk(source):
                 found += [os.path.join(root, f) for f in files if f.lower().endswith(TILE_EXTS)]

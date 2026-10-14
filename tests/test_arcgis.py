@@ -143,3 +143,27 @@ def test_toolbox_no_nir_and_bad_band(toolbox, tiled_scene, tmp_path):
     assert error_to_truth(out.geometry)[0] < 1.0
     with pytest.raises(ValueError, match="Band 5"):
         run_tool(toolbox, tiled_scene, tmp_path / "b", nir=5)
+
+
+def test_copy_county_tiles(monkeypatch, tiled_scene, tmp_path):
+    """Only tiles touching the buffered boundary are copied, with their sidecars."""
+    from shapely.geometry import box
+
+    monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
+    src = (ROOT / "arcgis" / "copy_county_tiles.py").read_text()
+    call = "copy_county_tiles(STATE_TILES, BOUNDARY, BUFFER, OUT_TILES)"
+    assert src.rstrip().endswith(call)
+    ns = {"__name__": "copy_county_tiles"}
+    exec(compile(src.rstrip()[: -len(call)], "copy_county_tiles.py", "exec"), ns)
+
+    # "county" = a small box inside the top-left tile, 100 ft from its right edge
+    x0, y0 = synthetic.X0, synthetic.Y0
+    county = tmp_path / "county.shp"
+    gpd.GeoDataFrame({"NAME": ["Test"]}, geometry=[box(x0 + 100, y0 - 300, x0 + 700, y0 - 100)],
+                     crs=synthetic.CRS).to_file(county)
+    out = tmp_path / "county_tiles"
+    assert ns["copy_county_tiles"](str(tiled_scene["tiles"]), str(county), 50, str(out)) == 1
+    assert sorted(p.name for p in out.iterdir()) == ["tile_0.tif", "tile_0.tif.aux.xml"]
+    # a buffer reaching past the tile edge (800 ft) picks up the neighbour too
+    out2 = tmp_path / "county_tiles2"
+    assert ns["copy_county_tiles"](str(tiled_scene["tiles"]), str(county), 150, str(out2)) == 2
