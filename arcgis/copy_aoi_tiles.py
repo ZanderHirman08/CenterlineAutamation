@@ -6,7 +6,8 @@ below, paste the whole file into the window, and press Enter.
 AOI can be any polygon layer: your 1-mile work grids (only selected grids are
 used if any are selected), a county boundary, etc. Tiles are copied as they
 are (no clipping or resampling), together with their sidecar files (.aux.xml,
-.ovr, .tfw, ...), so the copies are exact. Needs only ArcGIS Pro (any licence).
+.ovr, .tfw, ...), so the copies are exact. Subfolders are searched, and the
+copies keep the same subfolders. Needs only ArcGIS Pro (any licence).
 
 At the end it reports:
   * tiles it could not read (it skips them and carries on),
@@ -114,12 +115,17 @@ def copy_aoi_tiles(state_tiles, aoi, buffer, out_tiles, dry_run=False):
         stem = os.path.splitext(name)[0]
         if folder not in listing:
             listing[folder] = os.listdir(folder)
+        # keep the source subfolders (e.g. tidal / untidal), so tiles with the same name
+        # in different folders don't overwrite each other
+        dest_dir = os.path.normpath(os.path.join(out_tiles, os.path.relpath(folder, state_tiles)))
         try:
+            if not dry_run:
+                os.makedirs(dest_dir, exist_ok=True)
             for f in listing[folder]:  # the tile and its sidecars: stem.tif, stem.tif.aux.xml...
                 if not f.startswith(stem + "."):
                     continue
                 s = os.path.join(folder, f)
-                d = os.path.join(out_tiles, f)
+                d = os.path.join(dest_dir, f)
                 n = os.path.getsize(s)
                 size += n
                 if dry_run:

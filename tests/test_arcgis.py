@@ -244,6 +244,26 @@ def test_copy_aoi_tiles(monkeypatch, tiled_scene, tmp_path):
     assert copy(str(tiled_scene["tiles"]), str(grids), 250, str(out3))["copied"] == 4
 
 
+def test_copy_keeps_subfolders(monkeypatch, tiled_scene, tmp_path):
+    """Same-named tiles in different subfolders (e.g. tidal / untidal) both survive."""
+    import shutil
+    from shapely.geometry import box
+
+    copy = load_copy_script(monkeypatch)
+    src = tmp_path / "imagery"
+    for sub in ("tidal", "untidal"):
+        shutil.copytree(tiled_scene["tiles"], src / sub)
+    x0, y0 = synthetic.X0, synthetic.Y0
+    grids = tmp_path / "grids.shp"
+    gpd.GeoDataFrame({"G": [1]}, geometry=[box(x0 + 100, y0 - 300, x0 + 300, y0 - 100)],
+                     crs=synthetic.CRS).to_file(grids)
+    out = tmp_path / "out"
+    r = copy(str(src), str(grids), 10, str(out))
+    assert r["copied"] == 2
+    assert (out / "tidal" / "tile_0.tif").exists() and (out / "untidal" / "tile_0.tif").exists()
+    assert (out / "tidal" / "tile_0.tif.aux.xml").exists()
+
+
 def test_copy_reports_problems_and_gaps(monkeypatch, tiled_scene, tmp_path):
     """A bad tile doesn't stop the copy; unread formats and uncovered grids are reported."""
     import shutil
