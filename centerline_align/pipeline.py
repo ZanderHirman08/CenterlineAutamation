@@ -253,6 +253,8 @@ def run(cfg: Config, resume: bool = True, train_only: bool = False) -> dict:
     _write_summary(summaries, out / "grid_summary.csv")
     log.info("Wrote %d lines (%d flagged for review) to %s",
              len(final), int(final.review.sum()) if len(final) else 0, ", ".join(written))
+    for line in engine.summarize(final.drop(columns="geometry").to_dict("records")):
+        log.info(line)
     return {"lines": len(final), "outputs": written, "grids": summaries}
 
 

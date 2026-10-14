@@ -1165,6 +1165,27 @@ def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations
     return records, stations
 
 
+def summarize(records: list[dict]) -> list[str]:
+    """Plain-language summary of a run: why lines were flagged, typical values."""
+    if not records:
+        return ["No road pieces were processed."]
+    n = len(records)
+    reasons: dict[str, int] = {}
+    for r in records:
+        for why in filter(None, str(r.get("reason") or "").split(";")):
+            reasons[why] = reasons.get(why, 0) + 1
+    med = {k: float(np.median([r[k] for r in records]))
+           for k in ("conf", "pct_valid", "shift_avg", "shift_max", "width_med")}
+    out = [f"Summary of {n} road pieces: median confidence {med['conf']:.2f}, "
+           f"median share of cross-sections that found pavement {med['pct_valid']:.0%}, "
+           f"median measured width {med['width_med']:.0f}, median average shift "
+           f"{med['shift_avg']:.1f}, median largest shift {med['shift_max']:.1f}."]
+    if reasons:
+        out.append("Flag reasons (a piece can have several): " + ", ".join(
+            f"{k} {v} ({v / n:.0%})" for k, v in sorted(reasons.items(), key=lambda kv: -kv[1])))
+    return out
+
+
 def reconnect(records: list[dict], rcfg) -> list[np.ndarray]:
     """Snapped coords for refined records (see ``topology.snap_nodes``)."""
     if not records:
@@ -1477,6 +1498,8 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field)
     n_rev = sum(r["review"] for r in records)
     msg(f"Wrote {len(records)} lines to {out_fc}; {n_rev} flagged for review (REVIEW = 1).")
+    for line in summarize(records):
+        msg(line)
     return {"lines": len(records), "review": n_rev}
 
 

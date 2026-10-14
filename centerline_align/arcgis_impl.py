@@ -17,7 +17,8 @@ import numpy as np
 from .chip import Chip
 from .classifier import RoadClassifier, distance_to_roads
 from .config import ClassifierConfig, RefineConfig
-from .engine import pick_spread, reconnect, refine_pieces, region_probability, train_classifier
+from .engine import (pick_spread, reconnect, refine_pieces, region_probability, summarize,
+                     train_classifier)
 from .geom import cumlen, interpolate
 
 TILE_EXTS = (".tif", ".tiff", ".img", ".jp2")
@@ -301,6 +302,8 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field)
     n_rev = sum(r["review"] for r in records)
     msg(f"Wrote {len(records)} lines to {out_fc}; {n_rev} flagged for review (REVIEW = 1).")
+    for line in summarize(records):
+        msg(line)
     return {"lines": len(records), "review": n_rev}
 
 

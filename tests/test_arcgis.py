@@ -110,6 +110,7 @@ def test_toolbox_aligns_roads(toolbox, tiled_scene, tmp_path):
     assert any("NIR: yes" in m for m in fake_arcpy.messages)
     assert any("Classifier trained" in m for m in fake_arcpy.messages)  # engine logs reach Pro
     assert any("Alignment check" in m for m in fake_arcpy.messages)
+    assert any(m.startswith("Summary of") for m in fake_arcpy.messages)
     assert not fake_arcpy.warnings, fake_arcpy.warnings
 
     # diagnostic rasters: the chip the tool read lines up with the source imagery
