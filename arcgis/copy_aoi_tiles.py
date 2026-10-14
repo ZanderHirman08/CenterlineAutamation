@@ -89,15 +89,17 @@ def copy_aoi_tiles(state_tiles, aoi, buffer, out_tiles, dry_run=False):
     dst = os.path.normcase(os.path.abspath(out_tiles))
     if dst == src or dst.startswith(src + os.sep):
         raise ValueError("OUT_TILES must be outside STATE_TILES; pick a separate folder")
+    free = _free_space(out_tiles)   # also fails early if the drive doesn't exist
     shapes, sr = aoi_shapes(aoi, buffer)
-    if not dry_run:
-        os.makedirs(out_tiles, exist_ok=True)
     tiles, other = find_files(state_tiles)
     arcpy.AddMessage(f"Checking {len(tiles)} tiles against the AOI...")
+
+    # Phase 1: find the tiles that touch the AOI and list the files to copy.
     listing = {}
     matched = []       # footprints of tiles that touch the AOI
     failed = []        # (path, error)
-    size = copied = skipped = 0
+    plan = []          # (tile path, [(source file, destination file, bytes)])
+    size = 0
     for i, path in enumerate(tiles, 1):
         try:
             fp = footprint(path)
@@ -107,6 +109,8 @@ def copy_aoi_tiles(state_tiles, aoi, buffer, out_tiles, dry_run=False):
         except Exception as e:  # unreadable tile: note it and keep going
             failed.append((path, str(e).strip().splitlines()[0] if str(e).strip() else "error"))
             continue
+        if i % 200 == 0:
+            arcpy.AddMessage(f"  {i}/{len(tiles)} checked, {len(matched)} touch the AOI")
         e = _extent(fp)
         if not any(_overlaps(e, b) and not fp.disjoint(g) for _, _, g, b in shapes):
             continue
@@ -118,33 +122,67 @@ def copy_aoi_tiles(state_tiles, aoi, buffer, out_tiles, dry_run=False):
         # keep the source subfolders (e.g. tidal / untidal), so tiles with the same name
         # in different folders don't overwrite each other
         dest_dir = os.path.normpath(os.path.join(out_tiles, os.path.relpath(folder, state_tiles)))
-        try:
-            if not dry_run:
-                os.makedirs(dest_dir, exist_ok=True)
-            for f in listing[folder]:  # the tile and its sidecars: stem.tif, stem.tif.aux.xml...
-                if not f.startswith(stem + "."):
-                    continue
-                s = os.path.join(folder, f)
-                d = os.path.join(dest_dir, f)
-                n = os.path.getsize(s)
+        files = []
+        for f in listing[folder]:  # the tile and its sidecars: stem.tif, stem.tif.aux.xml...
+            if f.startswith(stem + "."):
+                src_f = os.path.join(folder, f)
+                n = os.path.getsize(src_f)
+                files.append((src_f, os.path.join(dest_dir, f), n))
                 size += n
-                if dry_run:
-                    continue
-                if os.path.exists(d) and os.path.getsize(d) == n:
-                    skipped += 1   # already copied on an earlier run
-                    continue
-                shutil.copy2(s, d)
-            copied += 1
-        except Exception as e:  # e.g. disk full: report it, keep checking the rest
-            failed.append((path, f"copy failed: {e}"))
-        if i % 200 == 0:
-            arcpy.AddMessage(f"  {i}/{len(tiles)} checked, {len(matched)} touch the AOI")
+        plan.append((path, files))
+
+    # Space check: only what isn't already copied needs room.
+    todo = sum(n for _, files in plan for _, d, n in files
+               if not (os.path.exists(d) and os.path.getsize(d) == n))
+    gb = 1024 ** 3
+    arcpy.AddMessage(f"Output drive has {free / gb:,.1f} GB free; this copy needs "
+                     f"{todo / gb:,.1f} GB.")
+    if todo > free:
+        msg = (f"Not enough space for OUT_TILES: needs {todo / gb:,.1f} GB, "
+               f"{free / gb:,.1f} GB free. Free up space, pick another drive, or lower BUFFER.")
+        if not dry_run:
+            raise ValueError(msg)
+        arcpy.AddWarning(msg)
+        print("WARNING: " + msg)
+
+    # Phase 2: copy.
+    copied = skipped = 0
+    if not dry_run:
+        for k, (path, files) in enumerate(plan, 1):
+            try:
+                for src_f, d, n in files:
+                    if os.path.exists(d) and os.path.getsize(d) == n:
+                        skipped += 1   # already copied on an earlier run
+                        continue
+                    os.makedirs(os.path.dirname(d), exist_ok=True)
+                    shutil.copy2(src_f, d)
+                copied += 1
+            except Exception as e:  # e.g. disk full: report it, keep going
+                failed.append((path, f"copy failed: {e}"))
+            if k % 50 == 0:
+                arcpy.AddMessage(f"  copied {k}/{len(plan)} tiles")
 
     uncovered = _coverage(shapes, matched)
     _report(tiles, matched, copied, skipped, size, failed, other, uncovered, shapes,
             out_tiles, dry_run)
     return dict(matched=len(matched), copied=copied, failed=failed, other=other,
                 uncovered=uncovered)
+
+
+def _free_space(out_tiles):
+    """Free bytes where OUT_TILES will be; a clear error if its drive doesn't exist."""
+    p = os.path.abspath(out_tiles)
+    while not os.path.exists(p):
+        parent = os.path.dirname(p)
+        if parent == p:
+            raise ValueError(f"OUT_TILES is on a drive that doesn't exist on this computer: "
+                             f"{out_tiles}. Change OUT_TILES to a folder on a drive you have.")
+        p = parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError as e:  # e.g. a drive letter with no disk in it
+        raise ValueError(f"Can't use the drive for OUT_TILES ({out_tiles}): {e}. "
+                         "Change OUT_TILES to a folder on a drive you have.")
 
 
 def _coverage(shapes, matched):

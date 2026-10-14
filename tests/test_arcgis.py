@@ -244,6 +244,37 @@ def test_copy_aoi_tiles(monkeypatch, tiled_scene, tmp_path):
     assert copy(str(tiled_scene["tiles"]), str(grids), 250, str(out3))["copied"] == 4
 
 
+def test_copy_checks_output_drive_and_space(monkeypatch, tiled_scene, tmp_path):
+    from collections import namedtuple
+    from shapely.geometry import box
+
+    copy = load_copy_script(monkeypatch)
+    x0, y0 = synthetic.X0, synthetic.Y0
+    grids = tmp_path / "grids.shp"
+    gpd.GeoDataFrame({"G": [1]}, geometry=[box(x0 + 100, y0 - 300, x0 + 300, y0 - 100)],
+                     crs=synthetic.CRS).to_file(grids)
+    # an output whose drive can't be used fails at once, even on a dry run
+    import shutil as sh
+    real = sh.disk_usage
+
+    def broken(path):
+        raise PermissionError(21, "The device is not ready")
+    monkeypatch.setattr(sh, "disk_usage", broken)
+    with pytest.raises(ValueError, match="Change OUT_TILES"):
+        copy(str(tiled_scene["tiles"]), str(grids), 10, str(tmp_path / "x"), dry_run=True)
+
+    # not enough space: dry run warns, a real run refuses before copying anything
+    Usage = namedtuple("Usage", "total used free")
+    monkeypatch.setattr(sh, "disk_usage", lambda p: Usage(10, 10, 1000))
+    fake_arcpy.warnings.clear()
+    copy(str(tiled_scene["tiles"]), str(grids), 10, str(tmp_path / "y"), dry_run=True)
+    assert any("Not enough space" in w for w in fake_arcpy.warnings)
+    with pytest.raises(ValueError, match="Not enough space"):
+        copy(str(tiled_scene["tiles"]), str(grids), 10, str(tmp_path / "y"))
+    assert not (tmp_path / "y").exists()
+    monkeypatch.setattr(sh, "disk_usage", real)
+
+
 def test_copy_keeps_subfolders(monkeypatch, tiled_scene, tmp_path):
     """Same-named tiles in different subfolders (e.g. tidal / untidal) both survive."""
     import shutil
