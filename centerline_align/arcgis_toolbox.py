@@ -56,6 +56,9 @@ class AlignCenterlines:
         work = _param("work_folder", "Work folder (progress and trained classifier)", "DEFolder")
         out = _param("out_fc", "Output aligned centerlines", "DEFeatureClass", direction="Output")
         params = [imagery, roads, road_id, grids, grid_id, work, out]
+        params.append(_param("retrain_from",
+                             "Learn from an earlier result (optional; use a new work folder)",
+                             "GPFeatureLayer", required=False, category="Second pass"))
         for name, label, default in (("red", "Red band", 1), ("green", "Green band", 2),
                                      ("blue", "Blue band", 3)):
             params.append(_param(name, label, "GPLong", category="Bands", value=default))
@@ -106,7 +109,8 @@ class AlignCenterlines:
             out_fc=p["out_fc"].valueAsText,
             bands=bands, refine=rcfg, classifier=ccfg,
             fresh=bool(p["fresh"].value),
-            diagnostics=bool(p["diagnostics"].value))
+            diagnostics=bool(p["diagnostics"].value),
+            retrain_from=p["retrain_from"].valueAsText)
 
     def postExecute(self, parameters):
         return

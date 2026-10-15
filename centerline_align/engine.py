@@ -139,12 +139,14 @@ def alignment_check(chip, lines, has_nir: bool, max_shift: float = 60.0,
 
 
 def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
-                     seed: int = 0, on_chip=None) -> RoadClassifier:
+                     seed: int = 0, on_chip=None, trusted_near=None) -> RoadClassifier:
     """Train from tiles centred on random road points in each training cell.
 
     cells: for each training grid, the road coords inside it.
     lines_near(bounds) -> road coords intersecting ``bounds`` (for labelling).
     on_chip(k, chip, lines) is called for every training tile (for diagnostics).
+    trusted_near(bounds) -> ([(coords, half_width)], [coords]): second pass, label
+    from an earlier run's trusted lines (see ``sample_training_pixels``).
     """
     rng = np.random.default_rng(seed)
     tile = ccfg.embedding_tile if embedder is not None else 1024
@@ -190,7 +192,8 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
         a = alignment_check(chip, near, reader.has_nir)
         if a is not None:
             shifts.append(a)
-        rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile)
+        trusted = trusted_near(chip.bounds) if trusted_near is not None else None
+        rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile, trusted)
         if len(labels) == 0:
             continue
         pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder)

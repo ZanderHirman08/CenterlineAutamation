@@ -461,6 +461,7 @@ class RoadClassifier:
     emb_std: list | None = None
     emb_coef: list | None = None
     train_accuracy: float | None = None
+    trained_from: str | None = None   # second pass: the earlier result it learned from
 
     def save(self, path):
         with open(path, "w") as f:
@@ -469,7 +470,9 @@ class RoadClassifier:
     @classmethod
     def load(cls, path) -> "RoadClassifier":
         with open(path) as f:
-            return cls(**json.load(f))
+            raw = json.load(f)
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
     def predict(self, chip: Chip, embedder: EmbeddingExtractor | None = None) -> np.ndarray:
         """Road probability (H, W) float32 for a chip; 0 where imagery is missing."""
@@ -513,12 +516,36 @@ def distance_to_roads(chip: Chip, lines) -> np.ndarray:
     return (ndimage.distance_transform_edt(~burned) * chip.res).astype(np.float32)
 
 
-def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int):
-    """Pick (row, col) indexes of positive and negative training pixels in a chip."""
+def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int, trusted=None):
+    """Pick (row, col) indexes of positive and negative training pixels in a chip.
+
+    trusted: optional (lines with known pavement width [(coords, half_width)],
+    untrusted lines [coords]) from an earlier run (second pass). Then the road
+    labels cover the measured pavement (minus a margin) of trusted lines, and
+    the verges just beyond their edges are labelled not-road too, which teaches
+    the classifier where pavement ends.
+    """
     dist = distance_to_roads(chip, lines)
     ok = chip.valid
-    pos = np.flatnonzero((dist <= ccfg.positive_half_width) & ok)
-    neg = np.flatnonzero((dist > ccfg.negative_min_dist) & (dist <= ccfg.negative_max_dist) & ok)
+    far = (dist > ccfg.negative_min_dist) & (dist <= ccfg.negative_max_dist) & ok
+    if trusted is not None:
+        good, bad = trusted
+        pos_m = np.zeros(chip.shape, bool)
+        verge = np.zeros(chip.shape, bool)
+        by_width: dict[float, list] = {}
+        for c, hw in good:
+            by_width.setdefault(float(np.round(hw * 0.5) * 2), []).append(c)   # 2-unit bins
+        for hw, group in by_width.items():
+            d = distance_to_roads(chip, group)
+            pos_m |= d <= max(ccfg.positive_half_width, hw - 2.0)
+            verge |= (d > hw + 5.0) & (d <= hw + 15.0)
+        others = distance_to_roads(chip, bad) if bad else np.full(chip.shape, np.inf)
+        verge &= ~pos_m & (others > ccfg.negative_min_dist) & ok
+        pos = np.flatnonzero(pos_m & ok)
+        neg = np.flatnonzero(far | verge)
+    else:
+        pos = np.flatnonzero((dist <= ccfg.positive_half_width) & ok)
+        neg = np.flatnonzero(far)
     pos = rng.choice(pos, min(len(pos), n_per_class), replace=False) if len(pos) else pos
     neg = rng.choice(neg, min(len(neg), n_per_class), replace=False) if len(neg) else neg
     idx = np.concatenate([pos, neg])
@@ -1188,12 +1215,14 @@ def alignment_check(chip, lines, has_nir: bool, max_shift: float = 60.0,
 
 
 def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
-                     seed: int = 0, on_chip=None) -> RoadClassifier:
+                     seed: int = 0, on_chip=None, trusted_near=None) -> RoadClassifier:
     """Train from tiles centred on random road points in each training cell.
 
     cells: for each training grid, the road coords inside it.
     lines_near(bounds) -> road coords intersecting ``bounds`` (for labelling).
     on_chip(k, chip, lines) is called for every training tile (for diagnostics).
+    trusted_near(bounds) -> ([(coords, half_width)], [coords]): second pass, label
+    from an earlier run's trusted lines (see ``sample_training_pixels``).
     """
     rng = np.random.default_rng(seed)
     tile = ccfg.embedding_tile if embedder is not None else 1024
@@ -1239,7 +1268,8 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
         a = alignment_check(chip, near, reader.has_nir)
         if a is not None:
             shifts.append(a)
-        rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile)
+        trusted = trusted_near(chip.bounds) if trusted_near is not None else None
+        rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile, trusted)
         if len(labels) == 0:
             continue
         pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder)
@@ -1811,7 +1841,7 @@ def _safe(value) -> str:
 
 def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
         out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False,
-        diagnostics=False):
+        diagnostics=False, retrain_from=None):
     msg = arcpy.AddMessage
     handler = _ArcHandler(arcpy)
     root = logging.getLogger("centerline_align")
@@ -1819,13 +1849,14 @@ def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, wor
     root.setLevel(logging.INFO)
     try:
         return _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field,
-                    work_folder, out_fc, bands, refine, classifier, fresh, diagnostics)
+                    work_folder, out_fc, bands, refine, classifier, fresh, diagnostics,
+                    retrain_from)
     finally:
         root.removeHandler(handler)
 
 
 def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False):
+         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False, retrain_from=None):
     os.makedirs(work_folder, exist_ok=True)
     grid_dir = os.path.join(work_folder, "grids")
     os.makedirs(grid_dir, exist_ok=True)
@@ -1864,6 +1895,14 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     if os.path.exists(model_path):
         clf = RoadClassifier.load(model_path)
         msg(f"Using saved classifier {model_path}")
+        if retrain_from and clf.trained_from != str(retrain_from):
+            arcpy.AddWarning(
+                "This work folder already has a classifier, so the second-pass setting is "
+                "ignored. For a second pass, use a new, empty work folder (or tick Start over).")
+    elif retrain_from:
+        clf = _train_second_pass(arcpy, msg, reader, grids, retrain_from, ccfg, sr)
+        clf.save(model_path)
+        msg(f"Classifier saved to {model_path} (training accuracy {clf.train_accuracy:.3f})")
     else:
         with_roads = [gi for gi in range(len(grids))
                       if any(_overlaps(r[3], grids[gi][2]) for r in roads)]
@@ -1939,6 +1978,44 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     for line in summarize(records):
         msg(line)
     return {"lines": len(records), "review": n_rev}
+
+
+def _train_second_pass(arcpy, msg, reader, grids, earlier_fc, ccfg, sr):
+    """Train from an earlier run's output: lines it was confident about (REVIEW = 0)
+    give road labels across their measured width; the rest only mark where roads are."""
+    good, bad = [], []
+    with arcpy.da.SearchCursor(earlier_fc, ["SHAPE@", "REVIEW", "WIDTH_MED"],
+                               spatial_reference=sr) as cur:
+        for g, review, width in cur:
+            if g is None:
+                continue
+            for c in _parts(g):
+                ext = (c[:, 0].min(), c[:, 1].min(), c[:, 0].max(), c[:, 1].max())
+                if not review and width and width > 0:
+                    good.append((c, float(width) / 2, ext))
+                else:
+                    bad.append((c, ext))
+    if not good:
+        raise ValueError(f"{earlier_fc} has no lines with REVIEW = 0 to learn from")
+    msg(f"Second pass: learning from {len(good)} trusted lines (REVIEW = 0) of {earlier_fc}; "
+        f"{len(bad)} flagged lines are only used to keep road pixels out of the not-road labels")
+    with_good = [gi for gi, (_, _, ge) in enumerate(grids)
+                 if any(_overlaps(e, ge) for _, _, e in good)]
+    train = pick_spread(with_good, ccfg.training_grids)
+    msg("Training the road classifier on grid(s): " + ", ".join(str(grids[g][0]) for g in train))
+    cells = [[c for c, _, e in good if _overlaps(e, grids[gi][2])] for gi in train]
+
+    def lines_near(b):
+        return ([c for c, _, e in good if _overlaps(e, b)]
+                + [c for c, e in bad if _overlaps(e, b)])
+
+    def trusted_near(b):
+        return ([(c, hw) for c, hw, e in good if _overlaps(e, b)],
+                [c for c, e in bad if _overlaps(e, b)])
+
+    clf = train_classifier(reader, cells, lines_near, ccfg, None, trusted_near=trusted_near)
+    clf.trained_from = str(earlier_fc)
+    return clf
 
 
 def _save_raster(arcpy, arr, x_ll, y_ll, res, path, sr):
@@ -2241,6 +2318,9 @@ class AlignCenterlines:
         work = _param("work_folder", "Work folder (progress and trained classifier)", "DEFolder")
         out = _param("out_fc", "Output aligned centerlines", "DEFeatureClass", direction="Output")
         params = [imagery, roads, road_id, grids, grid_id, work, out]
+        params.append(_param("retrain_from",
+                             "Learn from an earlier result (optional; use a new work folder)",
+                             "GPFeatureLayer", required=False, category="Second pass"))
         for name, label, default in (("red", "Red band", 1), ("green", "Green band", 2),
                                      ("blue", "Blue band", 3)):
             params.append(_param(name, label, "GPLong", category="Bands", value=default))
@@ -2291,7 +2371,8 @@ class AlignCenterlines:
             out_fc=p["out_fc"].valueAsText,
             bands=bands, refine=rcfg, classifier=ccfg,
             fresh=bool(p["fresh"].value),
-            diagnostics=bool(p["diagnostics"].value))
+            diagnostics=bool(p["diagnostics"].value),
+            retrain_from=p["retrain_from"].valueAsText)
 
     def postExecute(self, parameters):
         return

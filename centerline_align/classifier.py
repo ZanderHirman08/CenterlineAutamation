@@ -49,6 +49,7 @@ class RoadClassifier:
     emb_std: list | None = None
     emb_coef: list | None = None
     train_accuracy: float | None = None
+    trained_from: str | None = None   # second pass: the earlier result it learned from
 
     def save(self, path):
         with open(path, "w") as f:
@@ -57,7 +58,9 @@ class RoadClassifier:
     @classmethod
     def load(cls, path) -> "RoadClassifier":
         with open(path) as f:
-            return cls(**json.load(f))
+            raw = json.load(f)
+        known = set(cls.__dataclass_fields__)
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
     def predict(self, chip: Chip, embedder: EmbeddingExtractor | None = None) -> np.ndarray:
         """Road probability (H, W) float32 for a chip; 0 where imagery is missing."""
@@ -101,12 +104,36 @@ def distance_to_roads(chip: Chip, lines) -> np.ndarray:
     return (ndimage.distance_transform_edt(~burned) * chip.res).astype(np.float32)
 
 
-def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int):
-    """Pick (row, col) indexes of positive and negative training pixels in a chip."""
+def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int, trusted=None):
+    """Pick (row, col) indexes of positive and negative training pixels in a chip.
+
+    trusted: optional (lines with known pavement width [(coords, half_width)],
+    untrusted lines [coords]) from an earlier run (second pass). Then the road
+    labels cover the measured pavement (minus a margin) of trusted lines, and
+    the verges just beyond their edges are labelled not-road too, which teaches
+    the classifier where pavement ends.
+    """
     dist = distance_to_roads(chip, lines)
     ok = chip.valid
-    pos = np.flatnonzero((dist <= ccfg.positive_half_width) & ok)
-    neg = np.flatnonzero((dist > ccfg.negative_min_dist) & (dist <= ccfg.negative_max_dist) & ok)
+    far = (dist > ccfg.negative_min_dist) & (dist <= ccfg.negative_max_dist) & ok
+    if trusted is not None:
+        good, bad = trusted
+        pos_m = np.zeros(chip.shape, bool)
+        verge = np.zeros(chip.shape, bool)
+        by_width: dict[float, list] = {}
+        for c, hw in good:
+            by_width.setdefault(float(np.round(hw * 0.5) * 2), []).append(c)   # 2-unit bins
+        for hw, group in by_width.items():
+            d = distance_to_roads(chip, group)
+            pos_m |= d <= max(ccfg.positive_half_width, hw - 2.0)
+            verge |= (d > hw + 5.0) & (d <= hw + 15.0)
+        others = distance_to_roads(chip, bad) if bad else np.full(chip.shape, np.inf)
+        verge &= ~pos_m & (others > ccfg.negative_min_dist) & ok
+        pos = np.flatnonzero(pos_m & ok)
+        neg = np.flatnonzero(far | verge)
+    else:
+        pos = np.flatnonzero((dist <= ccfg.positive_half_width) & ok)
+        neg = np.flatnonzero(far)
     pos = rng.choice(pos, min(len(pos), n_per_class), replace=False) if len(pos) else pos
     neg = rng.choice(neg, min(len(neg), n_per_class), replace=False) if len(neg) else neg
     idx = np.concatenate([pos, neg])

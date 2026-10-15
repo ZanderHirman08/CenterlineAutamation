@@ -363,3 +363,26 @@ def test_evaluate_tool(toolbox, tiled_scene, tmp_path):
     with pytest.raises(ValueError, match="Values found in Validated"):
         p["truth_where"].value = "Validated = 'Y'"
         tool.execute(params, None)
+
+
+def test_second_pass(toolbox, tiled_scene, tmp_path):
+    """A second run learns from the first run's trusted lines and still aligns well."""
+    import shutil
+    run_tool(toolbox, tiled_scene, tmp_path)
+    first = tmp_path / "first"
+    first.mkdir()
+    for f in tmp_path.glob("aligned.*"):
+        shutil.copy(f, first / f.name)
+    fake_arcpy.messages.clear()
+    out = run_tool(toolbox, tiled_scene, tmp_path / "p2", retrain_from=str(first / "aligned.shp"))
+    text = "\n".join(fake_arcpy.messages)
+    assert "Second pass: learning from" in text, text
+    assert error_to_truth(out.geometry)[0] < 1.0
+    import json
+    model = json.loads((tmp_path / "p2" / "work" / "road_classifier.json").read_text())
+    assert model["trained_from"].endswith("aligned.shp")
+
+    # reusing that work folder with another earlier result: warned, not silently ignored
+    fake_arcpy.warnings.clear()
+    run_tool(toolbox, tiled_scene, tmp_path / "p2", retrain_from=str(tiled_scene["roads"]))
+    assert any("second-pass setting is ignored" in w for w in fake_arcpy.warnings)
