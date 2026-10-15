@@ -97,3 +97,23 @@ def test_failed_tile_is_reported_not_fatal(monkeypatch, server, tmp_path):
     lst.write_text(missing + "\n" + base + names[(43, 343)] + "\n")
     r = ns["download_usgs_tiles"](str(lst), str(tmp_path / "o"), PROJ, None, 500)
     assert len(r["done"]) == 1 and len(r["failed"]) == 1 and "x99y999" in r["failed"][0][0]
+
+
+def test_lidar_tiles_filtered_by_albers_name(monkeypatch, tmp_path):
+    """LiDAR tiles named _e<km>n<km>.laz are placed in CONUS Albers; legacy numbered
+    tiles can't be placed and are kept unless PROJECT drops them."""
+    ns = load_script(monkeypatch)
+    # a grid square around Albers (1,372,500 m E, 996,500 m N), stored in UTM 17N
+    from pyproj import Transformer
+    t = Transformer.from_crs(6350, 26917, always_xy=True)
+    cx, cy = t.transform(1372500, 996500)
+    grids = tmp_path / "grids.shp"
+    gpd.GeoDataFrame({"G": [1]}, geometry=[box(cx - 300, cy - 300, cx + 300, cy + 300)],
+                     crs="EPSG:26917").to_file(grids)
+    cache = {}
+    url = "https://x/Projects/GA_Statewide_2018_B18_DRRA/LAZ/USGS_LPC_GA_Statewide_2018_B18_DRRA_e{}n{}.laz"
+    near = ns["may_touch"](url.format(1372, 996), cache, str(grids), 100)
+    far = ns["may_touch"](url.format(1380, 996), cache, str(grids), 100)
+    legacy = ns["may_touch"]("https://x/legacy/GA_CAMDEN_COUNTY_2010/USGS_LPC_GA_CAMDEN_2010_000047.laz",
+                             cache, str(grids), 100)
+    assert near and not far and legacy

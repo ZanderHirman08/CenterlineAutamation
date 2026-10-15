@@ -9,9 +9,10 @@ column layout doesn't matter. No USGS login or API key is needed: these
 links are public.
 
 * Only tiles from PROJECT are kept (so different LiDAR collections don't mix).
-* With AOI set, 1 m DEM tiles that can't touch your grids are skipped. The
-  check errs on the side of downloading: a tile is only skipped if it is
-  clearly away from every grid.
+* With AOI set, tiles that can't touch your grids are skipped (1 m DEM tiles
+  and LiDAR tiles named like ..._e1372n0996.laz). The check errs on the side
+  of downloading: a tile is only skipped if it is clearly away from every grid.
+  Tiles whose names don't give a position are kept.
 * Tiles already downloaded (same size as on the server) are skipped, so the
   script can be stopped and run again. Downloads go to a .part file first and
   are only renamed when complete.
@@ -36,9 +37,12 @@ DRY_RUN = True                            # True: only list what would be downlo
 # -----------------------------------------------------------------------------
 
 URL_RE = re.compile(r"https?://[^\s\"'<>,;|]+?\.(?:tif|tiff|laz|las|zip|img)\b", re.IGNORECASE)
-# USGS 1 m DEM tile names: USGS_1M_<utm zone>_x<easting/10km>y<northing/10km>_...
+# Tile names that encode the tile's position, so tiles away from the AOI can be skipped:
+#   1 m DEM:  USGS_1M_<utm zone>_x<easting/10 km>y<northing/10 km>_...   (NAD83 / UTM, 10 km)
+#   LiDAR:    ..._e<easting km>n<northing km>.laz                        (CONUS Albers, 1 km)
 DEM_TILE_RE = re.compile(r"_1M_(\d{1,2})_x(\d+)y(\d+)_", re.IGNORECASE)
-TILE_M = 10000.0
+LPC_TILE_RE = re.compile(r"_e(\d{3,4})n(\d{3,4})\.la[sz]$", re.IGNORECASE)
+ALBERS = 6350  # NAD83(2011) / CONUS Albers
 
 
 def say(m):
@@ -66,9 +70,10 @@ def read_links(path):
     return links
 
 
-def aoi_boxes_utm(aoi, zone, buffer_m):
-    """Bounding box of each AOI polygon in NAD83 / UTM <zone> N, grown by buffer_m."""
-    sr = arcpy.SpatialReference(26900 + zone)
+def aoi_boxes(aoi, epsg, buffer_m):
+    """Bounding box of each AOI polygon in the given (metre) coordinate system, grown by
+    buffer_m."""
+    sr = arcpy.SpatialReference(epsg)
     boxes = []
     with arcpy.da.SearchCursor(aoi, ["SHAPE@"]) as cur:
         for (g,) in cur:
@@ -82,19 +87,33 @@ def aoi_boxes_utm(aoi, zone, buffer_m):
     return boxes
 
 
-def may_touch(url, boxes_by_zone, aoi, buffer_m):
-    """False only when a 1 m DEM tile clearly misses every AOI box."""
-    m = DEM_TILE_RE.search(os.path.basename(url))
-    if not m or aoi is None:
-        return True  # not a 1 m DEM tile name we can place: keep it
-    zone, x, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
-    if zone not in boxes_by_zone:
-        boxes_by_zone[zone] = aoi_boxes_utm(aoi, zone, buffer_m)
-    x0 = x * TILE_M
-    # the y number may mark the tile's north or south edge; accept either reading
-    y_lo, y_hi = y * TILE_M - TILE_M, y * TILE_M + TILE_M
-    return any(b[0] <= x0 + TILE_M and b[2] >= x0 and b[1] <= y_hi and b[3] >= y_lo
-               for b in boxes_by_zone[zone])
+def tile_area(name):
+    """(epsg, xmin, ymin, xmax, ymax) that surely contains the tile, or None if the name
+    doesn't say where the tile is. Generous on purpose: the numbers may mark a tile's
+    corner or its centre, so the area allows for either."""
+    m = DEM_TILE_RE.search(name)
+    if m:
+        zone, x, y = (int(v) for v in m.groups())
+        size = 10000.0
+        # x is the tile's west edge; y may be its north or south edge, so allow both
+        return (26900 + zone, x * size, y * size - size, x * size + size, y * size + size)
+    m = LPC_TILE_RE.search(name)
+    if m:
+        e, n = (int(v) * 1000.0 for v in m.groups())
+        return (ALBERS, e - 1000.0, n - 1000.0, e + 1000.0, n + 1000.0)
+    return None
+
+
+def may_touch(url, boxes_by_epsg, aoi, buffer_m):
+    """False only when a tile clearly misses every AOI box."""
+    area = tile_area(os.path.basename(url)) if aoi is not None else None
+    if area is None:
+        return True  # can't place it: keep it
+    epsg, x0, y0, x1, y1 = area
+    if epsg not in boxes_by_epsg:
+        boxes_by_epsg[epsg] = aoi_boxes(aoi, epsg, buffer_m)
+    return any(b[0] <= x1 and b[2] >= x0 and b[1] <= y1 and b[3] >= y0
+               for b in boxes_by_epsg[epsg])
 
 
 def remote_size(url):
@@ -137,8 +156,8 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
         if len(kept) < len(links):
             say(f"  {len(links) - len(kept)} links from other projects ignored")
         links = kept
-    boxes_by_zone = {}
-    near = [u for u in links if may_touch(u, boxes_by_zone, aoi, buffer_m)]
+    boxes_by_epsg = {}
+    near = [u for u in links if may_touch(u, boxes_by_epsg, aoi, buffer_m)]
     if aoi is not None:
         say(f"  {len(links) - len(near)} tiles skipped: they don't touch the AOI")
     links = near
@@ -149,6 +168,7 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
     if not dry_run:
         os.makedirs(out_folder, exist_ok=True)
     todo, done, failed, total = [], [], [], 0
+    say(f"Checking file sizes on the server for {len(links)} tiles...")
     for url in links:
         dest = os.path.join(out_folder, os.path.basename(url))
         try:
