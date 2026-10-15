@@ -3,9 +3,11 @@
 Run in ArcGIS Pro: Analysis tab > Python > Python Window. Edit the settings
 below, paste the whole file into the window, and press Enter.
 
-LIST_FILE is the results list exported from The National Map downloader
-(.xlsx, .csv or .txt). The script pulls every download link out of it, so the
-column layout doesn't matter. No USGS login or API key is needed: these
+JOBS lists the product lists exported from The National Map downloader
+(.xlsx, .csv or .txt), each with the folder its tiles go to; the DEM and the
+LiDAR lists run one after the other, with one summary at the end. The script
+pulls every download link out of each list, so the column layout doesn't
+matter. No USGS login or API key is needed: these
 links are public.
 
 * Only tiles from PROJECT are kept (so different LiDAR collections don't mix).
@@ -30,8 +32,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import arcpy
 
 # ---- settings ---------------------------------------------------------------
-LIST_FILE = r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\1MDEM_Glynn_data_links.xlsx"
-OUT_FOLDER = r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\DEM"
+# Each line: (product list, folder its tiles go to). They run in this order.
+JOBS = [
+    (r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\DATALINKS\1MDEM_Glynn_data_links.xlsx",
+     r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\DEM"),
+    (r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\DATALINKS\LAZlidar_data_links.xlsx",
+     r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\LAZ"),
+]
 PROJECT = "GA_Statewide_2018_B18_DRRA"   # keep only this project's tiles; None = keep all
 AOI = r"C:\Users\zhirman\Desktop\Centerline\Glynn\data\Inputs.gdb\Glynn_Grid_1mi"  # None = no filter
 AOI_BUFFER_M = 500                        # metres of margin around the grids
@@ -166,7 +173,7 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
     links = near
     if not links:
         say("Nothing to download.")
-        return dict(todo=[], done=[], failed=[])
+        return dict(todo=[], done=[], failed=[], total=0)
 
     if not dry_run:
         os.makedirs(out_folder, exist_ok=True)
@@ -208,7 +215,7 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
             for url, e in failed[:10]:
                 say(f"  {os.path.basename(url)}: {e}")
         say("Dry run: nothing downloaded. Set DRY_RUN = False to download.")
-        return dict(todo=todo, done=done, failed=failed)
+        return dict(todo=todo, done=done, failed=failed, total=total)
 
     failed = []  # size-check problems were reported above; the download decides now
     t_start, got_bytes = time.time(), 0
@@ -232,7 +239,36 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
         say(f"WARNING: {len(failed)} tile(s) failed. Run the script again to retry them:")
         for url, e in failed[:15]:
             say(f"  {os.path.basename(url)}: {e}")
-    return dict(todo=todo, done=done, failed=failed)
+    return dict(todo=todo, done=done, failed=failed, total=total)
 
 
-download_usgs_tiles(LIST_FILE, OUT_FOLDER, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)
+def run_jobs(jobs, project=None, aoi=None, buffer_m=500, dry_run=False, workers=4):
+    """Run each (list, folder) job in turn; one job failing doesn't stop the others."""
+    results = []
+    for list_file, out_folder in jobs:
+        say("")
+        say(f"===== {os.path.basename(list_file)}  ->  {out_folder}")
+        try:
+            r = download_usgs_tiles(list_file, out_folder, project, aoi, buffer_m,
+                                    dry_run, workers)
+            results.append((list_file, r, None))
+        except Exception as e:  # e.g. the list file isn't there
+            say(f"ERROR: {e}")
+            results.append((list_file, None, str(e)))
+    say("")
+    say("===== Summary" + (" (dry run: nothing downloaded)" if dry_run else ""))
+    for list_file, r, err in results:
+        name = os.path.basename(list_file)
+        if err:
+            say(f"  {name}: ERROR {err}")
+        elif dry_run:
+            say(f"  {name}: {len(r['todo'])} to download, {len(r['done'])} already there, "
+                f"{r['total'] / 1024 ** 3:,.1f} GB in total")
+        else:
+            say(f"  {name}: {len(r['done'])} tiles in place, {len(r['failed'])} failed")
+    if not dry_run and any(err or r["failed"] for _, r, err in results):
+        say("Some tiles failed: run the script again to retry just those.")
+    return results
+
+
+run_jobs(JOBS, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)

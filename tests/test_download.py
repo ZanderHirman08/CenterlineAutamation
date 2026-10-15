@@ -18,7 +18,7 @@ PROJ = "GA_Statewide_2018_B18_DRRA"
 def load_script(monkeypatch):
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
     src = (ROOT / "arcgis" / "download_usgs_tiles.py").read_text()
-    call = "download_usgs_tiles(LIST_FILE, OUT_FOLDER, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)"
+    call = "run_jobs(JOBS, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)"
     assert src.rstrip().endswith(call)
     ns = {"__name__": "download_usgs_tiles"}
     exec(compile(src.rstrip()[: -len(call)], "download_usgs_tiles.py", "exec"), ns)
@@ -140,3 +140,19 @@ def test_failed_size_check_still_downloads(monkeypatch, server, tmp_path):
     # second run: nothing to do, even though one size check still fails
     again = ns["download_usgs_tiles"](str(lst), str(out), PROJ, None, 500)
     assert again["todo"] == [] and len(again["done"]) == 3
+
+
+def test_run_jobs_runs_each_list(monkeypatch, server, tmp_path):
+    base, names, _, root = server
+    ns = load_script(monkeypatch)
+    dem = list(names.values())
+    a, b = tmp_path / "a.txt", tmp_path / "b.txt"
+    a.write_text(base + dem[0])
+    b.write_text(base + dem[1] + "\n" + base + dem[2])
+    jobs = [(str(tmp_path / "missing.xlsx"), str(tmp_path / "X")),
+            (str(a), str(tmp_path / "A")), (str(b), str(tmp_path / "B"))]
+    res = ns["run_jobs"](jobs, PROJ, None, 500, dry_run=False, workers=2)
+    assert res[0][2] is not None                      # missing list: reported, not fatal
+    assert len(res[1][1]["done"]) == 1 and len(res[2][1]["done"]) == 2
+    assert (tmp_path / "A" / dem[0]).exists() and (tmp_path / "B" / dem[2]).exists()
+    assert any("Summary" in m for m in fake_arcpy.messages)
