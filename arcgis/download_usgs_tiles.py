@@ -18,9 +18,10 @@ links are public.
 * Tiles already downloaded are skipped, so the script can be stopped and run
   again. Downloads go to a .part file first and are only renamed once complete
   (checked against the size the server sends).
-* LiDAR links point at USGS's own server, which is slow to start each file; the
-  same files are fetched from USGS's Amazon copy instead (USE_FAST_MIRROR), and
-  from the original link if a file isn't there.
+* LiDAR links point at USGS's own server, which is slow to start each file. With
+  USE_FAST_MIRROR = True each file is tried on USGS's faster Amazon copy first
+  (falling back to the original link). Only worth it if the project's LAZ folder
+  is on prd-tnm.s3.amazonaws.com; Georgia's 2018 LiDAR isn't.
 * The dry run asks the server for every file's size to give a total; the real
   run skips that step and just downloads.
 * Several files download at once (WORKERS); failed downloads are retried,
