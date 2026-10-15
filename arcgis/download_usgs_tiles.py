@@ -16,7 +16,8 @@ links are public.
 * Tiles already downloaded (same size as on the server) are skipped, so the
   script can be stopped and run again. Downloads go to a .part file first and
   are only renamed when complete.
-* Failed downloads are retried, then listed at the end.
+* Several files download at once (WORKERS); failed downloads are retried,
+  then listed at the end.
 Needs only ArcGIS Pro's own Python.
 """
 import os
@@ -24,6 +25,7 @@ import re
 import time
 import urllib.request
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import arcpy
 
@@ -34,6 +36,7 @@ PROJECT = "GA_Statewide_2018_B18_DRRA"   # keep only this project's tiles; None 
 AOI = r"C:\Users\zhirman\Desktop\Centerline\Glynn\data\Inputs.gdb\Glynn_Grid_1mi"  # None = no filter
 AOI_BUFFER_M = 500                        # metres of margin around the grids
 DRY_RUN = True                            # True: only list what would be downloaded
+WORKERS = 4                               # files fetched at the same time
 # -----------------------------------------------------------------------------
 
 URL_RE = re.compile(r"https?://[^\s\"'<>,;|]+?\.(?:tif|tiff|laz|las|zip|img)\b", re.IGNORECASE)
@@ -143,12 +146,12 @@ def download(url, dest, size, tries=3):
                 os.remove(part)
             if attempt == tries:
                 raise
-            say(f"    retrying ({attempt}/{tries - 1}) after: {e}")
+            print(f"    retrying {os.path.basename(url)} ({attempt}/{tries - 1}) after: {e}")
             time.sleep(5 * attempt)
 
 
 def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=500,
-                        dry_run=False):
+                        dry_run=False, workers=4):
     links = read_links(list_file)
     say(f"{len(links)} download links found in {os.path.basename(list_file)}")
     if project:
@@ -169,39 +172,61 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
         os.makedirs(out_folder, exist_ok=True)
     todo, done, failed, total = [], [], [], 0
     say(f"Checking file sizes on the server for {len(links)} tiles...")
-    for url in links:
-        dest = os.path.join(out_folder, os.path.basename(url))
-        try:
-            size = remote_size(url)
-        except Exception as e:
-            failed.append((url, f"size check failed: {e}"))
-            continue
-        total += size or 0
-        if os.path.exists(dest) and size is not None and os.path.getsize(dest) == size:
-            done.append(dest)
-        else:
-            todo.append((url, dest, size))
+    # size checks run 8 at a time; messages are only written from this thread
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(remote_size, u): u for u in links}
+        for k, fut in enumerate(as_completed(futures), 1):
+            url = futures[fut]
+            dest = os.path.join(out_folder, os.path.basename(url))
+            if k % 100 == 0:
+                say(f"  {k}/{len(links)} checked")
+            try:
+                size = fut.result()
+            except Exception as e:  # e.g. the server was busy
+                failed.append((url, f"size check failed: {e}"))
+                size = None
+            total += size or 0
+            # downloads are renamed from .part only when complete, so an existing file
+            # whose size can't be checked is kept
+            if os.path.exists(dest) and (size is None or os.path.getsize(dest) == size):
+                done.append(dest)
+            else:
+                todo.append((url, dest, size))
+    order = {u: i for i, u in enumerate(links)}
+    todo.sort(key=lambda t: order[t[0]])
     gb = total / 1024 ** 3
     say(f"{len(links)} tiles, {gb:,.1f} GB in total; {len(done)} already downloaded, "
-        f"{len(todo)} to download")
+        f"{len(todo)} to download" + (f" ({len(failed)} of unknown size)" if failed else ""))
     if dry_run:
         for url, _, size in todo[:10]:
             say(f"  {os.path.basename(url)}  ({(size or 0) / 1024 ** 2:,.0f} MB)")
         if len(todo) > 10:
             say(f"  ... and {len(todo) - 10} more")
+        if failed:
+            say(f"WARNING: the size check failed for {len(failed)} tile(s); "
+                "the real run will try to download them anyway:")
+            for url, e in failed[:10]:
+                say(f"  {os.path.basename(url)}: {e}")
         say("Dry run: nothing downloaded. Set DRY_RUN = False to download.")
         return dict(todo=todo, done=done, failed=failed)
 
-    for i, (url, dest, size) in enumerate(todo, 1):
-        say(f"[{i}/{len(todo)}] {os.path.basename(url)} ({(size or 0) / 1024 ** 2:,.0f} MB)")
-        t0 = time.time()
-        try:
-            download(url, dest, size)
-            done.append(dest)
-            say(f"    done in {time.time() - t0:,.0f} s")
-        except Exception as e:
-            failed.append((url, str(e)))
-            say(f"    FAILED: {e}")
+    failed = []  # size-check problems were reported above; the download decides now
+    t_start, got_bytes = time.time(), 0
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(download, url, dest, size): (url, dest, size)
+                   for url, dest, size in todo}
+        for i, fut in enumerate(as_completed(futures), 1):
+            url, dest, size = futures[fut]
+            try:
+                fut.result()
+                done.append(dest)
+                got_bytes += size or 0
+                rate = got_bytes / 1024 ** 2 / max(1.0, time.time() - t_start)
+                say(f"[{i}/{len(todo)}] {os.path.basename(url)} done "
+                    f"({got_bytes / 1024 ** 3:,.1f} GB so far, {rate:,.0f} MB/s)")
+            except Exception as e:
+                failed.append((url, str(e)))
+                say(f"[{i}/{len(todo)}] {os.path.basename(url)} FAILED: {e}")
     say(f"Finished: {len(done)} of {len(links)} tiles in {out_folder}")
     if failed:
         say(f"WARNING: {len(failed)} tile(s) failed. Run the script again to retry them:")
@@ -210,4 +235,4 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
     return dict(todo=todo, done=done, failed=failed)
 
 
-download_usgs_tiles(LIST_FILE, OUT_FOLDER, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN)
+download_usgs_tiles(LIST_FILE, OUT_FOLDER, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)

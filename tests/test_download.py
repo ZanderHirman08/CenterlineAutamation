@@ -18,7 +18,7 @@ PROJ = "GA_Statewide_2018_B18_DRRA"
 def load_script(monkeypatch):
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
     src = (ROOT / "arcgis" / "download_usgs_tiles.py").read_text()
-    call = "download_usgs_tiles(LIST_FILE, OUT_FOLDER, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN)"
+    call = "download_usgs_tiles(LIST_FILE, OUT_FOLDER, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)"
     assert src.rstrip().endswith(call)
     ns = {"__name__": "download_usgs_tiles"}
     exec(compile(src.rstrip()[: -len(call)], "download_usgs_tiles.py", "exec"), ns)
@@ -117,3 +117,26 @@ def test_lidar_tiles_filtered_by_albers_name(monkeypatch, tmp_path):
     legacy = ns["may_touch"]("https://x/legacy/GA_CAMDEN_COUNTY_2010/USGS_LPC_GA_CAMDEN_2010_000047.laz",
                              cache, str(grids), 100)
     assert near and not far and legacy
+
+
+def test_failed_size_check_still_downloads(monkeypatch, server, tmp_path):
+    base, names, _, root = server
+    ns = load_script(monkeypatch)
+    lst = tmp_path / "list.txt"
+    lst.write_text("\n".join(base + n for n in names.values()))
+
+    def flaky(url):  # the server refuses the size check for one tile
+        if "x43" in url:
+            raise OSError("HTTP Error 503")
+        return (root / "TIFF" / url.rsplit("/", 1)[1]).stat().st_size
+    ns["remote_size"] = flaky
+    out = tmp_path / "DEM"
+    dry = ns["download_usgs_tiles"](str(lst), str(out), PROJ, None, 500, dry_run=True)
+    assert len(dry["todo"]) == 3 and len(dry["failed"]) == 1
+    r = ns["download_usgs_tiles"](str(lst), str(out), PROJ, None, 500, workers=3)
+    assert len(r["done"]) == 3 and not r["failed"]
+    for n in names.values():
+        assert (out / n).read_bytes() == (root / "TIFF" / n).read_bytes()
+    # second run: nothing to do, even though one size check still fails
+    again = ns["download_usgs_tiles"](str(lst), str(out), PROJ, None, 500)
+    assert again["todo"] == [] and len(again["done"]) == 3
