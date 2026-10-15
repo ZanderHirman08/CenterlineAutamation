@@ -75,6 +75,9 @@ class AlignCenterlines:
         method.filter.type = "ValueList"
         method.filter.list = ["ribbon", "midpoint"]
         params.append(method)
+        params.append(_param("keep_flagged",
+                             "Keep the original line where the result is flagged for review",
+                             "GPBoolean", required=False, category="Advanced", value=True))
         params.append(_param("training_grids", "Grids used to train the classifier", "GPLong",
                              category="Advanced", value=8))
         params.append(_param("fresh", "Start over (discard saved progress and classifier)",
@@ -100,6 +103,7 @@ class AlignCenterlines:
         if nir not in (None, "", 0):
             bands.append(int(nir))
         rcfg = RefineConfig(method=p["method"].valueAsText or "ribbon",
+                            keep_flagged=p["keep_flagged"].value is not False,
                             **{name: float(p[name].value) for name, _, _ in ADVANCED})
         ccfg = ClassifierConfig(training_grids=int(p["training_grids"].value))
         run(arcpy,

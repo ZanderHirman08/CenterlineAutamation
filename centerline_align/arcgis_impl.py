@@ -532,7 +532,8 @@ def _id_field_type(arcpy, fc, field):
 
 OUT_FIELDS = [("SRC_ID", None), ("GRID_ID", "TEXT"), ("SHIFT_AVG", "DOUBLE"),
               ("SHIFT_MAX", "DOUBLE"), ("CONF", "DOUBLE"), ("PCT_VALID", "DOUBLE"),
-              ("WIDTH_MED", "DOUBLE"), ("REVIEW", "SHORT"), ("REASON", "TEXT")]
+              ("WIDTH_MED", "DOUBLE"), ("REVIEW", "SHORT"), ("REASON", "TEXT"),
+              ("MOVED", "SHORT")]
 
 
 def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
@@ -553,7 +554,8 @@ def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
             line = arcpy.Polyline(arcpy.Array([arcpy.Point(float(x), float(y)) for x, y in c]), sr)
             src = r["src_id"] if id_type != "TEXT" else str(r["src_id"])
             cur.insertRow([src, str(r["grid_id"]), r["shift_avg"], r["shift_max"], r["conf"],
-                           r["pct_valid"], r["width_med"], int(r["review"]), r["reason"], line])
+                           r["pct_valid"], r["width_med"], int(r["review"]), r["reason"],
+                           int(r.get("moved", 1)), line])
 
 
 # --------------------------------------------------------------------------- evaluation

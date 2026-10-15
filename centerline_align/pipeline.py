@@ -178,7 +178,7 @@ def _write_probability(pmap: "engine.ProbabilityMap", path: Path, crs):
 # --------------------------------------------------------------------------- merge
 
 FINAL_FIELDS = ["src_id", "grid_id", "shift_avg", "shift_max", "conf", "pct_valid",
-                "width_med", "review", "reason"]
+                "width_med", "review", "reason", "moved"]
 
 
 def merge(grid_files: list[Path], cfg: Config, crs) -> gpd.GeoDataFrame:

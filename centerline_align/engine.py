@@ -324,7 +324,7 @@ def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations
         records.append(dict(
             src_id=src_id, shift_avg=round(r.shift_avg, 2), shift_max=round(r.shift_max, 2),
             conf=r.confidence, pct_valid=r.pct_valid, width_med=round(r.width_med, 1),
-            review=int(r.needs_review), reason=";".join(r.reasons),
+            review=int(r.needs_review), reason=";".join(r.reasons), moved=int(r.moved),
             o_sx=float(c[0, 0]), o_sy=float(c[0, 1]), o_ex=float(c[-1, 0]), o_ey=float(c[-1, 1]),
             coords=r.coords,
         ))

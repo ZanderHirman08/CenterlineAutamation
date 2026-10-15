@@ -69,7 +69,11 @@ class RefineConfig:
     offset_stiffness: float = 0.5     # cost of the line bending sideways (per ft^2 per station)
     width_stiffness: float = 0.25     # cost of the width changing between stations
     width_prior: float = 0.1          # pull toward the line's typical width (narrowing)
-    stay_prior: float = 0.01          # pull toward the original position (no evidence = no move)
+    stay_prior: float = 0.03          # pull toward the original position (no evidence = no move)
+    # Flagged lines (REVIEW = 1) keep their original geometry instead of a doubtful move:
+    # checked against hand-validated roads, moves under trees and big jumps made lines
+    # worse more often than better.
+    keep_flagged: bool = True
 
 
 @dataclass

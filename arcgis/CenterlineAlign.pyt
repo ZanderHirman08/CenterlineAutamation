@@ -93,7 +93,11 @@ class RefineConfig:
     offset_stiffness: float = 0.5     # cost of the line bending sideways (per ft^2 per station)
     width_stiffness: float = 0.25     # cost of the width changing between stations
     width_prior: float = 0.1          # pull toward the line's typical width (narrowing)
-    stay_prior: float = 0.01          # pull toward the original position (no evidence = no move)
+    stay_prior: float = 0.03          # pull toward the original position (no evidence = no move)
+    # Flagged lines (REVIEW = 1) keep their original geometry instead of a doubtful move:
+    # checked against hand-validated roads, moves under trees and big jumps made lines
+    # worse more often than better.
+    keep_flagged: bool = True
 
 
 @dataclass
@@ -744,6 +748,7 @@ class RefineResult:
     width_med: float
     reasons: list = field(default_factory=list)
     stations: dict | None = None
+    moved: bool = True                # False: the original geometry was kept
 
     @property
     def needs_review(self) -> bool:
@@ -880,6 +885,10 @@ def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
     if shift_abs.max() > cfg.review_max_shift:
         reasons.append("large_shift")
 
+    moved = True
+    if reasons and cfg.keep_flagged:
+        new_line, moved = c.copy(), False
+
     stations = None
     if keep_stations:
         stations = dict(x=pts[:, 0], y=pts[:, 1], raw=raw, final=final, conf=conf,
@@ -893,6 +902,7 @@ def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
         width_med=float(np.nanmedian(width[used])) if used.any() else 0.0,
         reasons=reasons,
         stations=stations,
+        moved=moved,
     )
 
 
@@ -1462,7 +1472,7 @@ def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations
         records.append(dict(
             src_id=src_id, shift_avg=round(r.shift_avg, 2), shift_max=round(r.shift_max, 2),
             conf=r.confidence, pct_valid=r.pct_valid, width_med=round(r.width_med, 1),
-            review=int(r.needs_review), reason=";".join(r.reasons),
+            review=int(r.needs_review), reason=";".join(r.reasons), moved=int(r.moved),
             o_sx=float(c[0, 0]), o_sy=float(c[0, 1]), o_ex=float(c[-1, 0]), o_ey=float(c[-1, 1]),
             coords=r.coords,
         ))
@@ -2220,7 +2230,8 @@ def _id_field_type(arcpy, fc, field):
 
 OUT_FIELDS = [("SRC_ID", None), ("GRID_ID", "TEXT"), ("SHIFT_AVG", "DOUBLE"),
               ("SHIFT_MAX", "DOUBLE"), ("CONF", "DOUBLE"), ("PCT_VALID", "DOUBLE"),
-              ("WIDTH_MED", "DOUBLE"), ("REVIEW", "SHORT"), ("REASON", "TEXT")]
+              ("WIDTH_MED", "DOUBLE"), ("REVIEW", "SHORT"), ("REASON", "TEXT"),
+              ("MOVED", "SHORT")]
 
 
 def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
@@ -2241,7 +2252,8 @@ def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
             line = arcpy.Polyline(arcpy.Array([arcpy.Point(float(x), float(y)) for x, y in c]), sr)
             src = r["src_id"] if id_type != "TEXT" else str(r["src_id"])
             cur.insertRow([src, str(r["grid_id"]), r["shift_avg"], r["shift_max"], r["conf"],
-                           r["pct_valid"], r["width_med"], int(r["review"]), r["reason"], line])
+                           r["pct_valid"], r["width_med"], int(r["review"]), r["reason"],
+                           int(r.get("moved", 1)), line])
 
 
 # --------------------------------------------------------------------------- evaluation
@@ -2490,6 +2502,9 @@ class AlignCenterlines:
         method.filter.type = "ValueList"
         method.filter.list = ["ribbon", "midpoint"]
         params.append(method)
+        params.append(_param("keep_flagged",
+                             "Keep the original line where the result is flagged for review",
+                             "GPBoolean", required=False, category="Advanced", value=True))
         params.append(_param("training_grids", "Grids used to train the classifier", "GPLong",
                              category="Advanced", value=8))
         params.append(_param("fresh", "Start over (discard saved progress and classifier)",
@@ -2515,6 +2530,7 @@ class AlignCenterlines:
         if nir not in (None, "", 0):
             bands.append(int(nir))
         rcfg = RefineConfig(method=p["method"].valueAsText or "ribbon",
+                            keep_flagged=p["keep_flagged"].value is not False,
                             **{name: float(p[name].value) for name, _, _ in ADVANCED})
         ccfg = ClassifierConfig(training_grids=int(p["training_grids"].value))
         run(arcpy,

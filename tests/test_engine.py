@@ -56,7 +56,7 @@ def test_ribbon_resists_shadow_and_side_lot():
         bad = ((x > 200) & (x < 350)) | ((x > 500) & (x < 560))
         err[method] = np.abs(off[bad] - true_off).mean()
         assert not r.reasons
-    assert err["ribbon"] < 2.0 < err["midpoint"], err
+    assert err["ribbon"] < 2.5 < err["midpoint"], err
 
 
 def test_find_junctions():
@@ -73,3 +73,19 @@ def test_find_junctions():
     assert find_junctions(four).tolist() == [[10, 0]]
     # two unsplit roads crossing
     assert find_junctions([a([0, 0], [20, 0]), a([10, -10], [10, 10])]).tolist() == [[10, 0]]
+
+
+def test_flagged_lines_keep_original_geometry():
+    """No usable imagery: the line is flagged and, by default, left exactly where it was."""
+    from centerline_align.config import RefineConfig
+    from centerline_align.refine import refine_line
+
+    line = np.array([[0.0, 0.0], [300.0, 0.0]])
+
+    def nothing(x, y):
+        return np.full(np.shape(x), 0.1)
+    r = refine_line(line, nothing, RefineConfig(), 0.5)
+    assert r.reasons and not r.moved
+    assert np.array_equal(r.coords, line)
+    r2 = refine_line(line, nothing, RefineConfig(keep_flagged=False), 0.5)
+    assert r2.moved
