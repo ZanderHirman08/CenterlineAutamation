@@ -61,6 +61,15 @@ class RefineConfig:
     node_taper: float = 50.0          # distance over which an end's move into its node fades out
     review_min_confidence: float = 0.2
     review_max_shift: float = 15.0
+    # "ribbon": fit both pavement edges and a smooth width along the whole line at once
+    # (shadows on one edge, cross streets and single bad cross-sections barely move it).
+    # "midpoint": the older method - midpoint of each cross-section, then smoothing.
+    method: str = "ribbon"
+    junction_mask: float = 30.0       # ignore cross-sections this close to an intersection
+    offset_stiffness: float = 0.5     # cost of the line bending sideways (per ft^2 per station)
+    width_stiffness: float = 0.25     # cost of the width changing between stations
+    width_prior: float = 0.1          # pull toward the line's typical width (narrowing)
+    stay_prior: float = 0.01          # pull toward the original position (no evidence = no move)
 
 
 @dataclass

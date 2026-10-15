@@ -17,8 +17,10 @@ import numpy as np
 from .chip import Chip
 from .classifier import RoadClassifier, distance_to_roads
 from .config import ClassifierConfig, RefineConfig
-from .engine import (pick_spread, reconnect, refine_pieces, region_probability, summarize,
-                     train_classifier)
+from .engine import (find_junctions, pick_spread, reconnect, refine_pieces,
+                     region_probability, summarize, train_classifier)
+from .evaluate import (SegmentIndex, cover_from_chip, eval_report, near_junctions,
+                       sample_lines)
 from .geom import cumlen, interpolate
 
 TILE_EXTS = (".tif", ".tiff", ".img", ".jp2", ".sid")
@@ -416,3 +418,170 @@ def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
             src = r["src_id"] if id_type != "TEXT" else str(r["src_id"])
             cur.insertRow([src, str(r["grid_id"]), r["shift_avg"], r["shift_max"], r["conf"],
                            r["pct_valid"], r["width_med"], int(r["review"]), r["reason"], line])
+
+
+# --------------------------------------------------------------------------- evaluation
+
+def evaluate(arcpy, *, truth_fc, truth_where, candidates, imagery=None, bands=(1, 2, 3, 4),
+             grids_fc=None, out_points=None, spacing=5.0, max_dist=40.0, junction_dist=40.0):
+    """Compare candidate line layers with checked truth lines; see ``evaluate.py``.
+
+    candidates: [(display name, layer or path)]. Nothing is written to any input;
+    ``out_points`` (optional) gets one point per check point with each layer's error.
+    """
+    msg = arcpy.AddMessage
+    reader = ArcTileReader(arcpy, imagery, list(bands)) if imagery else None
+    sr = reader.sr if reader is not None else arcpy.Describe(candidates[0][1]).spatialReference
+    units = sr.linearUnitName or "units"
+
+    every = []          # all truth-layer lines (for finding intersections)
+    with arcpy.da.SearchCursor(truth_fc, ["SHAPE@"], spatial_reference=sr) as cur:
+        for (g,) in cur:
+            if g is not None:
+                every += _parts(g)
+    truth, oids = [], []
+    try:
+        with arcpy.da.SearchCursor(truth_fc, ["OID@", "SHAPE@"], where_clause=truth_where or None,
+                                   spatial_reference=sr) as cur:
+            for oid, g in cur:
+                if g is not None:
+                    for c in _parts(g):
+                        truth.append(c)
+                        oids.append(oid)
+    except Exception as e:
+        raise ValueError(f"Could not read the checked roads with the filter {truth_where!r}: "
+                         f"{e}. Check the field name and value (text values need quotes, "
+                         f"e.g. Validated = 'Yes').")
+    if not truth:
+        raise ValueError(f"No checked roads match {truth_where!r}. "
+                         + _value_hint(arcpy, truth_fc, truth_where))
+    msg(f"{len(set(oids))} checked roads ({len(truth)} parts) from {truth_fc}"
+        + (f" where {truth_where}" if truth_where else ""))
+
+    pts, tans, line_idx = sample_lines(truth, spacing)
+    if grids_fc:
+        grids = [g for _, g, _ in read_grids(arcpy, grids_fc, "OID@", sr)]
+        inside = _points_in_polygons(pts, grids)
+        msg(f"{inside.sum()} of {len(pts)} check points are inside the work grids")
+        pts, tans, line_idx = pts[inside], tans[inside], line_idx[inside]
+    if not len(pts):
+        raise ValueError("No check points to compare (are the checked roads inside the grids?)")
+
+    errors = {}
+    for name, fc in candidates:
+        lines = [c for _, _, parts, _ in read_lines(arcpy, fc, "OID@", sr) for c in parts]
+        errors[name] = SegmentIndex(lines).distances(pts, tans, max_dist)
+        msg(f"{name}: {len(lines)} lines read")
+
+    cover = np.array(["unknown"] * len(pts), dtype=object)
+    if reader is not None:
+        cover = _cover_classes(reader, pts, line_idx)
+    junctions = find_junctions(every)
+    cover[near_junctions(pts, junctions, junction_dist)] = "intersection"
+    for line in eval_report(errors, cover,
+                            "ft" if "foot" in units.lower() or "feet" in units.lower() else ""):
+        msg(line)
+    if out_points:
+        _write_check_points(arcpy, out_points, sr, pts, cover, np.asarray(oids)[line_idx], errors)
+        msg(f"Check points written to {out_points}")
+    return dict(errors=errors, cover=cover)
+
+
+def _value_hint(arcpy, fc, where) -> str:
+    m = re.match(r'\s*"?([A-Za-z_]\w*)"?', where or "")
+    if not m:
+        return ""
+    field = m.group(1)
+    try:
+        vals = set()
+        with arcpy.da.SearchCursor(fc, [field]) as cur:
+            for (v,) in cur:
+                vals.add(v)
+                if len(vals) > 10:
+                    break
+        return f"Values found in {field}: " + ", ".join(repr(v) for v in sorted(vals, key=str))
+    except Exception:
+        return f"Check that the field {field} exists."
+
+
+def _points_in_polygons(pts, polys) -> np.ndarray:
+    """Even-odd rule over all rings of every polygon; vectorised over points."""
+    inside = np.zeros(len(pts), bool)
+    for g in polys:
+        e = g.extent
+        cand = np.flatnonzero((pts[:, 0] >= e.XMin) & (pts[:, 0] <= e.XMax)
+                              & (pts[:, 1] >= e.YMin) & (pts[:, 1] <= e.YMax))
+        if not len(cand):
+            continue
+        x, y = pts[cand, 0], pts[cand, 1]
+        hit = np.zeros(len(cand), bool)
+        for ring in _rings(g):
+            xa, ya = ring[:-1, 0], ring[:-1, 1]
+            xb, yb = ring[1:, 0], ring[1:, 1]
+            for x0, y0, x1, y1 in zip(xa, ya, xb, yb):
+                crosses = ((y0 > y) != (y1 > y)) & (
+                    x < (x1 - x0) * (y - y0) / ((y1 - y0) if y1 != y0 else 1e-12) + x0)
+                hit ^= crosses
+        inside[cand] |= hit
+    return inside
+
+
+def _rings(geom) -> list[np.ndarray]:
+    rings = []
+    try:
+        for part in geom:
+            ring = []
+            for p in part:
+                if p is None:  # ring separator inside a part
+                    if len(ring) >= 3:
+                        rings.append(np.array(ring + [ring[0]], float))
+                    ring = []
+                else:
+                    ring.append((p.X, p.Y))
+            if len(ring) >= 3:
+                rings.append(np.array(ring + [ring[0]], float))
+    except TypeError:
+        pass
+    if not rings:  # stand-ins without ring access
+        e = geom.extent
+        rings.append(np.array([(e.XMin, e.YMin), (e.XMin, e.YMax), (e.XMax, e.YMax),
+                               (e.XMax, e.YMin), (e.XMin, e.YMin)]))
+    return rings
+
+
+def _cover_classes(reader, pts, line_idx, chunk=80, pad=12.0):
+    cover = np.array(["unknown"] * len(pts), dtype=object)
+    order = np.argsort(line_idx, kind="stable")
+    for start in range(0, len(order), chunk):
+        sel = order[start:start + chunk]
+        p = pts[sel]
+        x0, y0 = reader.snap(p[:, 0].min() - pad, p[:, 1].max() + pad)
+        w = int(np.ceil((p[:, 0].max() + pad - x0) / reader.res)) + 1
+        h = int(np.ceil((y0 - (p[:, 1].min() - pad)) / reader.res)) + 1
+        if w * h > 4e7:  # very spread-out chunk: do it point by point
+            for i in sel:
+                cover[[i]] = _cover_classes(reader, pts[[i]], np.zeros(1, int))
+            continue
+        chip = reader.read(x0, y0, w, h)
+        cover[sel] = cover_from_chip(chip, p, reader.has_nir)
+    return cover
+
+
+def _write_check_points(arcpy, out_fc, sr, pts, cover, oids, errors):
+    if arcpy.Exists(out_fc):
+        arcpy.management.Delete(out_fc)
+    folder, name = os.path.split(out_fc)
+    arcpy.management.CreateFeatureclass(folder, name, "POINT", spatial_reference=sr)
+    arcpy.management.AddField(out_fc, "TRUTH_OID", "LONG")
+    arcpy.management.AddField(out_fc, "COVER", "TEXT", field_length=20)
+    fields = []
+    for k, cand in enumerate(errors, 1):
+        f = f"ERR_{k}"
+        arcpy.management.AddField(out_fc, f, "DOUBLE", field_alias=f"Error: {cand}"[:255])
+        fields.append(f)
+    with arcpy.da.InsertCursor(out_fc, ["TRUTH_OID", "COVER"] + fields + ["SHAPE@"]) as cur:
+        errs = [errors[k] for k in errors]
+        for i, (x, y) in enumerate(pts):
+            vals = [None if np.isnan(e[i]) else round(float(e[i]), 2) for e in errs]
+            cur.insertRow([int(oids[i]), str(cover[i])] + vals
+                          + [arcpy.PointGeometry(arcpy.Point(float(x), float(y)), sr)])

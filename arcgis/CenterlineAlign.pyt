@@ -85,6 +85,15 @@ class RefineConfig:
     node_taper: float = 50.0          # distance over which an end's move into its node fades out
     review_min_confidence: float = 0.2
     review_max_shift: float = 15.0
+    # "ribbon": fit both pavement edges and a smooth width along the whole line at once
+    # (shadows on one edge, cross streets and single bad cross-sections barely move it).
+    # "midpoint": the older method - midpoint of each cross-section, then smoothing.
+    method: str = "ribbon"
+    junction_mask: float = 30.0       # ignore cross-sections this close to an intersection
+    offset_stiffness: float = 0.5     # cost of the line bending sideways (per ft^2 per station)
+    width_stiffness: float = 0.25     # cost of the width changing between stations
+    width_prior: float = 0.1          # pull toward the line's typical width (narrowing)
+    stay_prior: float = 0.01          # pull toward the original position (no evidence = no move)
 
 
 @dataclass
@@ -606,10 +615,21 @@ def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi, embedder=
 """Move a road line to the middle of the pavement using cross-sections.
 
 At regular stations along the existing line, the road-probability map is
-sampled along a short line perpendicular to the road. The run of "road"
-pixels nearest the current line gives the two pavement edges; their midpoint
-is the measured centre. Offsets are cleaned along the road (outliers dropped,
-gaps interpolated, smoothed) and the line is rebuilt from the shifted stations.
+sampled along a short line perpendicular to the road. Two methods turn those
+profiles into a new line:
+
+* ``ribbon`` (default): the road is a ribbon with a centre offset and a width
+  at every station. The best ribbon for the whole line is found at once
+  (dynamic programming): it should cover the "road" pixels and avoid the rest,
+  while the centre bends gently and the width stays steady. A shadow that hides
+  one edge for a few stations can't drag the centre over, because that would
+  need a sudden change in width; cross-sections at intersections (which see the
+  cross street) are ignored and bridged by the neighbouring stations. This is
+  the "ribbon snake" idea from the road-conflation literature.
+* ``midpoint``: the run of "road" pixels nearest the line gives the two edges
+  at each station; their midpoint is the centre. Outliers are dropped, gaps
+  interpolated and the offsets smoothed.
+
 Where the imagery gives no usable answer (trees, shadows, no data) the line
 keeps its original position and is flagged for review.
 """
@@ -711,9 +731,11 @@ def _crossing(x, p, i, j, thr):
 
 
 def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
-                valid: Sampler | None = None, keep_stations: bool = False) -> RefineResult:
+                valid: Sampler | None = None, keep_stations: bool = False,
+                junctions: np.ndarray | None = None) -> RefineResult:
     """Refine one line given as (N, 2) coords. ``step`` is the cross-section sample
-    spacing (normally the pixel size)."""
+    spacing (normally the pixel size). ``junctions``: (k, 2) intersection points;
+    cross-sections near them are ignored by the ribbon method."""
     c = as_coords(coords)
     s = cumlen(c)
     d = station_distances(s, cfg.station_spacing)
@@ -727,25 +749,33 @@ def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
     profiles = sample(xs, ys)
 
     n = len(d)
-    raw = np.full(n, np.nan)
-    width = np.full(n, np.nan)
-    conf = np.zeros(n)
-    for i in range(n):
-        m = measure_profile(offs, profiles[i], cfg)
-        if m is not None and m[2] > 0:
-            raw[i], width[i], conf[i] = m
-
     reasons = []
     no_data = False
+    has = np.ones(n, bool)
     if valid is not None:
         has = valid(pts[:, 0], pts[:, 1]) > 0.5
-        if (~has).mean() > 0.5:
-            no_data = True
+        no_data = (~has).mean() > 0.5
+
+    if cfg.method == "ribbon":
+        near_junction = np.zeros(n, bool)
+        if junctions is not None and len(junctions) and cfg.junction_mask > 0:
+            jd = np.min(np.hypot(pts[:, None, 0] - junctions[None, :, 0],
+                                 pts[:, None, 1] - junctions[None, :, 1]), axis=1)
+            near_junction = jd < cfg.junction_mask
+        final, width, conf, used = fit_ribbon(offs, profiles, d, has & ~near_junction, cfg)
+        raw = np.where(used, final, np.nan)
+    else:
+        raw = np.full(n, np.nan)
+        width = np.full(n, np.nan)
+        conf = np.zeros(n)
+        for i in range(n):
+            m = measure_profile(offs, profiles[i], cfg)
+            if m is not None and m[2] > 0:
+                raw[i], width[i], conf[i] = m
         raw[~has] = np.nan
         conf[~has] = 0.0
-
-    final, used = _clean_offsets(d, raw, cfg)
-    final = np.clip(final, -cfg.max_shift, cfg.max_shift)
+        final, used = _clean_offsets(d, raw, cfg)
+        final = np.clip(final, -cfg.max_shift, cfg.max_shift)
 
     new_line = simplify(pts + normal * final[:, None], cfg.simplify_tolerance)
 
@@ -797,6 +827,124 @@ def _clean_offsets(d: np.ndarray, raw: np.ndarray, cfg: RefineConfig):
         sigma = max(1.0, w / 3.0)
         filled = ndimage.gaussian_filter1d(filled, sigma, mode="nearest")
     return filled, used
+
+
+# --------------------------------------------------------------------------- ribbon
+
+def _cum_at(cum: np.ndarray, edges: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    """Cumulative profile values (n, m+1) at positions ``pos`` (any shape), per station.
+
+    Positions outside the search window are clamped to it, so the area beyond it
+    counts as neither road nor not-road."""
+    step = edges[1] - edges[0]
+    m = cum.shape[1] - 1
+    f = np.clip((pos - edges[0]) / step, 0, m)
+    i0 = np.minimum(f.astype(int), m - 1)
+    t = f - i0
+    return cum[:, i0] * (1 - t) + cum[:, i0 + 1] * t
+
+
+def fit_ribbon(offs: np.ndarray, profiles: np.ndarray, d: np.ndarray, data_ok: np.ndarray,
+               cfg: RefineConfig):
+    """Best ribbon (centre offset + width per station) for a whole line.
+
+    profiles: (n stations, m samples) road probability across the road at ``offs``.
+    data_ok: stations whose cross-section may be used (imagery present, not at an
+    intersection). Returns (centre offsets, widths, per-station confidence, used mask).
+    """
+    n = len(d)
+    step = offs[1] - offs[0]
+    edges = np.concatenate([offs - step / 2, [offs[-1] + step / 2]])
+    zero = np.zeros((n, 1))
+    gain = np.hstack([zero, np.cumsum((profiles - 0.5) * step, axis=1)])  # + road, - not road
+    cum = np.hstack([zero, np.cumsum(profiles * step, axis=1)])
+
+    cstep = max(step, 1.0)
+    reach = min(cfg.max_shift, cfg.search_half_width)
+    centres = np.arange(-reach, reach + 1e-9, cstep)
+    widths = np.arange(cfg.min_road_width, cfg.max_road_width + 1e-9, 2 * cstep)
+    left = centres[:, None] - widths[None, :] / 2
+    right = centres[:, None] + widths[None, :] / 2
+    data = -(_cum_at(gain, edges, right) - _cum_at(gain, edges, left))   # (n, nc, nw)
+    data[~data_ok] = 0.0
+
+    ci, wi = _viterbi(data, d, centres, widths, cfg, None)
+    ok = data_ok.copy()
+    if ok.any():  # second pass: hold the width near this line's typical width
+        ci, wi = _viterbi(data, d, centres, widths, cfg, float(np.median(widths[wi[ok]])))
+    c, w = centres[ci], widths[wi]
+
+    # confidence: how much more "road" the ribbon holds than a band just outside it
+    lo, hi = c - w / 2, c + w / 2
+    band = np.maximum(3.0, 0.25 * w)
+    rows = np.arange(n)
+
+    def cum_pts(pos):  # cumulative probability at one position per station
+        mm = cum.shape[1] - 1
+        f = np.clip((pos - edges[0]) / step, 0, mm)
+        i0 = np.minimum(f.astype(int), mm - 1)
+        t = f - i0
+        return cum[rows, i0] * (1 - t) + cum[rows, i0 + 1] * t, np.clip(pos, edges[0], edges[-1])
+
+    def mean_p(a, b):
+        ca, pa = cum_pts(a)
+        cb, pb = cum_pts(b)
+        length = pb - pa
+        return np.where(length > step, (cb - ca) / np.maximum(length, 1e-9), np.nan)
+
+    inside = mean_p(lo, hi)
+    out_l, out_r = mean_p(lo - band, lo), mean_p(hi, hi + band)
+    outside = np.nanmean(np.vstack([out_l, out_r]), axis=0)
+    contrast = np.clip(np.nan_to_num(inside - outside), 0, 1)
+    conf = np.where(data_ok, contrast, 0.0)
+    used = data_ok & (contrast >= 0.2)
+    if n >= 3:
+        c = ndimage.gaussian_filter1d(c.astype(float), 1.0, mode="nearest")
+    return c, w.astype(float), conf, used
+
+
+def _viterbi(data, d, centres, widths, cfg: RefineConfig, w0):
+    """Cheapest path of (centre, width) states through the stations."""
+    n, nc, nw = data.shape
+    cstep = centres[1] - centres[0] if nc > 1 else 1.0
+    wstep = widths[1] - widths[0] if nw > 1 else 1.0
+    prior = cfg.stay_prior * (centres ** 2)[:, None] + np.zeros((1, nw))
+    if w0 is not None:
+        # Shadows and overhanging trees make pavement look narrower, almost never wider,
+        # so narrowing below the typical width costs much more than widening (turn lanes).
+        dw = widths - w0
+        lam = np.where(dw < 0, cfg.width_prior, cfg.width_prior * 0.1)
+        prior = prior + (lam * dw ** 2)[None, :]
+    kc = max(1, int(round(3.0 / cstep)))     # at most ~3 ft sideways per station
+    shifts = [(a, b) for a in range(-kc, kc + 1) for b in (-1, 0, 1)]
+    base = np.array([cfg.offset_stiffness * (a * cstep) ** 2 + cfg.width_stiffness * (b * wstep) ** 2
+                     for a, b in shifts])
+    back = np.zeros((n, nc, nw), np.int16)
+    v = data[0] + prior
+    inf = np.inf
+    for i in range(1, n):
+        gap = max(d[i] - d[i - 1], 1e-6)
+        scale = float(np.clip(cfg.station_spacing / gap, 0.2, 5.0))
+        best = np.full((nc, nw), inf)
+        arg = np.zeros((nc, nw), np.int16)
+        for k, (a, b) in enumerate(shifts):
+            # moved[c, w] = v[c - a, w - b]
+            moved = np.full((nc, nw), inf)
+            moved[max(a, 0):nc + min(a, 0), max(b, 0):nw + min(b, 0)] = \
+                v[max(-a, 0):nc - max(a, 0), max(-b, 0):nw - max(b, 0)]
+            moved += base[k] * scale
+            better = moved < best
+            best[better] = moved[better]
+            arg[better] = k
+        v = best + data[i] + prior
+        back[i] = arg
+    ci = np.zeros(n, int)
+    wi = np.zeros(n, int)
+    ci[-1], wi[-1] = np.unravel_index(np.argmin(v), v.shape)
+    for i in range(n - 1, 0, -1):
+        a, b = shifts[back[i, ci[i], wi[i]]]
+        ci[i - 1], wi[i - 1] = ci[i] - a, wi[i] - b
+    return ci, wi
 
 
 # ======================================================================
@@ -1139,15 +1287,84 @@ def _report_alignment(shifts):
             float(np.median(dist)))
 
 
+def find_junctions(lines, tol: float = 1.5) -> np.ndarray:
+    """Intersection points of a set of lines: ends shared by 3 or more lines, or an end
+    that touches the middle of another line (a T where the through road isn't split).
+    Two lines simply continuing each other (a grid-edge cut) are not a junction."""
+    lines = [as_coords(c) for c in lines if len(c) >= 2]
+    if len(lines) < 2:
+        return np.zeros((0, 2))
+    dense, owner = [], []
+    for k, c in enumerate(lines):
+        p = densify(c, tol)
+        dense.append(p)
+        owner.append(np.full(len(p), k))
+    dense, owner = np.concatenate(dense), np.concatenate(owner)
+    tree = cKDTree(dense)
+    ends = np.array([e for c in lines for e in (c[0], c[-1])])
+    end_tree = cKDTree(ends)
+    out = []
+    for k, c in enumerate(lines):
+        for e in (c[0], c[-1]):
+            touching = set(owner[tree.query_ball_point(e, tol)]) - {k}
+            if len(touching) >= 2:
+                out.append(e)
+            elif len(touching) == 1:
+                # the other line touches here at its own end (continuation) or mid-way (T)
+                if len(end_tree.query_ball_point(e, tol * 2)) < 2:
+                    out.append(e)
+    out += _crossings(lines, tol)
+    if not out:
+        return np.zeros((0, 2))
+    out = np.array(out)
+    # one point per junction
+    keep = np.ones(len(out), bool)
+    t = cKDTree(out)
+    for i, j in sorted(t.query_pairs(tol * 2)):
+        if keep[i]:
+            keep[j] = False
+    return out[keep]
+
+
+def _crossings(lines, tol: float, seg: float = 10.0) -> list:
+    """Points where two different lines cross mid-way (neither is split there)."""
+    a, b, owner = [], [], []
+    for k, c in enumerate(lines):
+        c = densify(c, seg)
+        a.append(c[:-1])
+        b.append(c[1:])
+        owner.append(np.full(len(c) - 1, k))
+    a, b, owner = np.concatenate(a), np.concatenate(b), np.concatenate(owner)
+    out = []
+    for i, j in cKDTree((a + b) / 2).query_pairs(seg * 1.01):
+        if owner[i] == owner[j]:
+            continue
+        p, r = a[i], b[i] - a[i]
+        q, s_ = a[j], b[j] - a[j]
+        den = r[0] * s_[1] - r[1] * s_[0]
+        if abs(den) < 1e-12:
+            continue
+        t = ((q[0] - p[0]) * s_[1] - (q[1] - p[1]) * s_[0]) / den
+        u = ((q[0] - p[0]) * r[1] - (q[1] - p[1]) * r[0]) / den
+        if -1e-9 <= t <= 1 + 1e-9 and -1e-9 <= u <= 1 + 1e-9:
+            x = p + t * r
+            # where a line ends, the end-point rules above decide
+            if min(np.hypot(*(x - e)) for k in (owner[i], owner[j])
+                   for e in (lines[k][0], lines[k][-1])) > tol:
+                out.append(x)
+    return out
+
+
 def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):
     """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts."""
     records, stations = [], []
+    junctions = find_junctions([c for _, c in pieces])
     for src_id, coords in pieces:
         c = as_coords(coords)
         if len(c) < 2:
             continue
         r = refine_line(c, pmap.sample, rcfg, step=step, valid=pmap.sample_valid,
-                        keep_stations=keep_stations)
+                        keep_stations=keep_stations, junctions=junctions)
         records.append(dict(
             src_id=src_id, shift_avg=round(r.shift_avg, 2), shift_max=round(r.shift_max, 2),
             conf=r.confidence, pct_valid=r.pct_valid, width_med=round(r.width_med, 1),
@@ -1195,6 +1412,189 @@ def reconnect(records: list[dict], rcfg) -> list[np.ndarray]:
     return snap_nodes(ends, [np.asarray(r["coords"], float) for r in records],
                       np.array([r["conf"] for r in records], float),
                       rcfg.node_snap_tolerance, rcfg.node_taper)
+
+
+# ======================================================================
+# evaluate.py
+# ======================================================================
+
+"""Measure aligned lines against hand-checked "truth" lines.
+
+Truth lines are sampled every few feet. At each sample point, every candidate
+layer (the original roads, a tool run, ...) is matched to its nearest line
+running in roughly the same direction; the perpendicular distance is that
+layer's error there. Points with no such line within ``max_dist`` count as
+"not matched" (a road the candidate doesn't have, or one far off) and are kept
+out of the distance statistics.
+
+Each point is also given a cover class, so errors can be compared for open
+road, shadow, trees and intersections:
+
+* ``intersection`` - within ``junction_dist`` of a junction of the truth lines
+* ``canopy`` / ``partial`` - share of vegetation pixels around the point
+* ``shadow`` - share of dark pixels around the point
+* ``open`` - everything else
+"""
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+
+COVER_CLASSES = ["open", "shadow", "partial", "canopy", "intersection", "unknown"]
+
+
+def sample_lines(lines, spacing: float):
+    """Points every ``spacing`` along each line: (points (n, 2), unit tangents (n, 2),
+    line index (n,))."""
+    pts, tans, idx = [], [], []
+    for k, c in enumerate(lines):
+        c = as_coords(c)
+        s = cumlen(c)
+        if len(c) < 2 or s[-1] <= 0:
+            continue
+        d = np.arange(spacing / 2, s[-1], spacing)
+        if not len(d):
+            d = np.array([s[-1] / 2])
+        h = min(spacing / 2, s[-1] / 4)
+        t = interpolate(c, np.minimum(d + h, s[-1]), s) - interpolate(c, np.maximum(d - h, 0), s)
+        t /= np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-12)
+        pts.append(interpolate(c, d, s))
+        tans.append(t)
+        idx.append(np.full(len(d), k))
+    if not pts:
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0, int)
+    return np.concatenate(pts), np.concatenate(tans), np.concatenate(idx)
+
+
+class SegmentIndex:
+    """Nearest same-direction segment lookups over a set of lines."""
+
+    def __init__(self, lines, max_seg: float = 20.0):
+        a, b = [], []
+        for c in lines:
+            c = densify(as_coords(c), max_seg)
+            if len(c) >= 2:
+                a.append(c[:-1])
+                b.append(c[1:])
+        self.a = np.concatenate(a) if a else np.zeros((0, 2))
+        self.b = np.concatenate(b) if b else np.zeros((0, 2))
+        self.half = max_seg / 2 + 1e-6
+        self.tree = cKDTree((self.a + self.b) / 2) if len(self.a) else None
+
+    def distances(self, pts, tans, max_dist: float = 40.0, max_angle: float = 30.0):
+        """Perpendicular distance from each point to the nearest segment within
+        ``max_dist`` whose direction is within ``max_angle`` of the point's; NaN if none."""
+        out = np.full(len(pts), np.nan)
+        if self.tree is None or not len(pts):
+            return out
+        cos_min = np.cos(np.radians(max_angle))
+        cands = self.tree.query_ball_point(pts, max_dist + self.half)
+        for i, idx in enumerate(cands):
+            if not idx:
+                continue
+            idx = np.asarray(idx)
+            a, b = self.a[idx], self.b[idx]
+            ab = b - a
+            ln = np.linalg.norm(ab, axis=1)
+            ok = ln > 1e-9
+            if not ok.any():
+                continue
+            a, ab, ln = a[ok], ab[ok], ln[ok]
+            u = ab / ln[:, None]
+            same_dir = np.abs(u @ tans[i]) >= cos_min
+            if not same_dir.any():
+                continue
+            a, ab, ln = a[same_dir], ab[same_dir], ln[same_dir]
+            t = np.clip(((pts[i] - a) * ab).sum(1) / (ln * ln), 0, 1)
+            d = np.linalg.norm(a + t[:, None] * ab - pts[i], axis=1).min()
+            if d <= max_dist:
+                out[i] = d
+        return out
+
+
+def cover_from_chip(chip, pts, has_nir: bool, radius: float = 8.0,
+                    veg_partial: float = 0.15, veg_canopy: float = 0.5,
+                    dark_share: float = 0.3) -> np.ndarray:
+    """Cover class per point from the imagery around it (raw band values)."""
+    out = np.array(["unknown"] * len(pts), dtype=object)
+    if not chip.valid.any():
+        return out
+    data = chip.data.astype(np.float32)
+    r, g, b = data[0], data[1], data[2]
+    if has_nir and data.shape[0] > 3:
+        nir = data[3]
+        veg = (nir - r) / np.maximum(nir + r, 1.0) > 0.2
+    else:
+        veg = (2 * g - r - b) / np.maximum(r + g + b, 1.0) > 0.05
+    bright = (r + g + b) / 3.0
+    v = chip.valid
+    dark = bright < 0.55 * np.median(bright[v])
+    rows, cols = chip.world_to_pixel(pts[:, 0], pts[:, 1])
+    k = int(np.ceil(radius / chip.res))
+    yy, xx = np.mgrid[-k:k + 1, -k:k + 1]
+    disk = (yy * yy + xx * xx) * chip.res ** 2 <= radius * radius
+    h, w = chip.shape
+    for i, (rr, cc) in enumerate(zip(np.round(rows).astype(int), np.round(cols).astype(int))):
+        r0, r1, c0, c1 = rr - k, rr + k + 1, cc - k, cc + k + 1
+        if r0 < 0 or c0 < 0 or r1 > h or c1 > w:
+            continue
+        m = disk & v[r0:r1, c0:c1]
+        if m.sum() < disk.sum() * 0.5:
+            continue
+        fv = veg[r0:r1, c0:c1][m].mean()
+        fd = dark[r0:r1, c0:c1][m].mean()
+        out[i] = ("canopy" if fv >= veg_canopy else "partial" if fv >= veg_partial
+                  else "shadow" if fd >= dark_share else "open")
+    return out
+
+
+def near_junctions(pts, junctions, dist: float) -> np.ndarray:
+    if not len(junctions) or not len(pts):
+        return np.zeros(len(pts), bool)
+    d, _ = cKDTree(junctions).query(pts)
+    return d < dist
+
+
+def point_stats(err: np.ndarray) -> dict:
+    """Summary of one candidate's errors at a set of points (NaN = not matched)."""
+    n = len(err)
+    e = err[~np.isnan(err)]
+    if not len(e):
+        return dict(n=n, matched=0.0, mean=np.nan, median=np.nan, p90=np.nan,
+                    within2=np.nan, within5=np.nan)
+    return dict(n=n, matched=len(e) / n if n else 0.0, mean=float(e.mean()),
+                median=float(np.median(e)), p90=float(np.percentile(e, 90)),
+                within2=float((e <= 2).mean()), within5=float((e <= 5).mean()))
+
+
+def eval_report(errors: dict, cover: np.ndarray, units: str = "ft") -> list[str]:
+    """Plain-text tables: per cover class, every candidate's error statistics.
+
+    ``errors``: {candidate name: per-point errors}. The comparison uses only points
+    that every candidate matched, so the layers are measured on the same roads."""
+    names = list(errors)
+    if not names:
+        return ["Nothing to compare."]
+    allm = np.all([~np.isnan(errors[k]) for k in names], axis=0)
+    lines = [f"{len(cover)} check points; {allm.sum()} matched by every layer "
+             f"(the comparison below uses only those)."]
+    for k in names:
+        lines.append(f"  {k}: matched {np.mean(~np.isnan(errors[k])):.0%} of check points")
+    width = max(len(k) for k in names)
+    head = (f"  {'layer':<{width}}  {'points':>6}  {'mean':>6}  {'median':>6}  {'worst10%':>8}"
+            f"  {'<=2' + units:>6}  {'<=5' + units:>6}")
+    for cls in ["all"] + COVER_CLASSES:
+        sel = allm if cls == "all" else allm & (cover == cls)
+        if not sel.any():
+            continue
+        lines.append("")
+        lines.append(f"{cls.upper()} ({sel.sum()} points)")
+        lines.append(head)
+        for k in names:
+            s = point_stats(errors[k][sel])
+            lines.append(f"  {k:<{width}}  {s['n']:>6}  {s['mean']:>6.2f}  {s['median']:>6.2f}  "
+                         f"{s['p90']:>8.2f}  {s['within2']:>6.0%}  {s['within5']:>6.0%}")
+    return lines
 
 
 # ======================================================================
@@ -1614,6 +2014,173 @@ def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
                            r["pct_valid"], r["width_med"], int(r["review"]), r["reason"], line])
 
 
+# --------------------------------------------------------------------------- evaluation
+
+def evaluate(arcpy, *, truth_fc, truth_where, candidates, imagery=None, bands=(1, 2, 3, 4),
+             grids_fc=None, out_points=None, spacing=5.0, max_dist=40.0, junction_dist=40.0):
+    """Compare candidate line layers with checked truth lines; see ``evaluate.py``.
+
+    candidates: [(display name, layer or path)]. Nothing is written to any input;
+    ``out_points`` (optional) gets one point per check point with each layer's error.
+    """
+    msg = arcpy.AddMessage
+    reader = ArcTileReader(arcpy, imagery, list(bands)) if imagery else None
+    sr = reader.sr if reader is not None else arcpy.Describe(candidates[0][1]).spatialReference
+    units = sr.linearUnitName or "units"
+
+    every = []          # all truth-layer lines (for finding intersections)
+    with arcpy.da.SearchCursor(truth_fc, ["SHAPE@"], spatial_reference=sr) as cur:
+        for (g,) in cur:
+            if g is not None:
+                every += _parts(g)
+    truth, oids = [], []
+    try:
+        with arcpy.da.SearchCursor(truth_fc, ["OID@", "SHAPE@"], where_clause=truth_where or None,
+                                   spatial_reference=sr) as cur:
+            for oid, g in cur:
+                if g is not None:
+                    for c in _parts(g):
+                        truth.append(c)
+                        oids.append(oid)
+    except Exception as e:
+        raise ValueError(f"Could not read the checked roads with the filter {truth_where!r}: "
+                         f"{e}. Check the field name and value (text values need quotes, "
+                         f"e.g. Validated = 'Yes').")
+    if not truth:
+        raise ValueError(f"No checked roads match {truth_where!r}. "
+                         + _value_hint(arcpy, truth_fc, truth_where))
+    msg(f"{len(set(oids))} checked roads ({len(truth)} parts) from {truth_fc}"
+        + (f" where {truth_where}" if truth_where else ""))
+
+    pts, tans, line_idx = sample_lines(truth, spacing)
+    if grids_fc:
+        grids = [g for _, g, _ in read_grids(arcpy, grids_fc, "OID@", sr)]
+        inside = _points_in_polygons(pts, grids)
+        msg(f"{inside.sum()} of {len(pts)} check points are inside the work grids")
+        pts, tans, line_idx = pts[inside], tans[inside], line_idx[inside]
+    if not len(pts):
+        raise ValueError("No check points to compare (are the checked roads inside the grids?)")
+
+    errors = {}
+    for name, fc in candidates:
+        lines = [c for _, _, parts, _ in read_lines(arcpy, fc, "OID@", sr) for c in parts]
+        errors[name] = SegmentIndex(lines).distances(pts, tans, max_dist)
+        msg(f"{name}: {len(lines)} lines read")
+
+    cover = np.array(["unknown"] * len(pts), dtype=object)
+    if reader is not None:
+        cover = _cover_classes(reader, pts, line_idx)
+    junctions = find_junctions(every)
+    cover[near_junctions(pts, junctions, junction_dist)] = "intersection"
+    for line in eval_report(errors, cover,
+                            "ft" if "foot" in units.lower() or "feet" in units.lower() else ""):
+        msg(line)
+    if out_points:
+        _write_check_points(arcpy, out_points, sr, pts, cover, np.asarray(oids)[line_idx], errors)
+        msg(f"Check points written to {out_points}")
+    return dict(errors=errors, cover=cover)
+
+
+def _value_hint(arcpy, fc, where) -> str:
+    m = re.match(r'\s*"?([A-Za-z_]\w*)"?', where or "")
+    if not m:
+        return ""
+    field = m.group(1)
+    try:
+        vals = set()
+        with arcpy.da.SearchCursor(fc, [field]) as cur:
+            for (v,) in cur:
+                vals.add(v)
+                if len(vals) > 10:
+                    break
+        return f"Values found in {field}: " + ", ".join(repr(v) for v in sorted(vals, key=str))
+    except Exception:
+        return f"Check that the field {field} exists."
+
+
+def _points_in_polygons(pts, polys) -> np.ndarray:
+    """Even-odd rule over all rings of every polygon; vectorised over points."""
+    inside = np.zeros(len(pts), bool)
+    for g in polys:
+        e = g.extent
+        cand = np.flatnonzero((pts[:, 0] >= e.XMin) & (pts[:, 0] <= e.XMax)
+                              & (pts[:, 1] >= e.YMin) & (pts[:, 1] <= e.YMax))
+        if not len(cand):
+            continue
+        x, y = pts[cand, 0], pts[cand, 1]
+        hit = np.zeros(len(cand), bool)
+        for ring in _rings(g):
+            xa, ya = ring[:-1, 0], ring[:-1, 1]
+            xb, yb = ring[1:, 0], ring[1:, 1]
+            for x0, y0, x1, y1 in zip(xa, ya, xb, yb):
+                crosses = ((y0 > y) != (y1 > y)) & (
+                    x < (x1 - x0) * (y - y0) / ((y1 - y0) if y1 != y0 else 1e-12) + x0)
+                hit ^= crosses
+        inside[cand] |= hit
+    return inside
+
+
+def _rings(geom) -> list[np.ndarray]:
+    rings = []
+    try:
+        for part in geom:
+            ring = []
+            for p in part:
+                if p is None:  # ring separator inside a part
+                    if len(ring) >= 3:
+                        rings.append(np.array(ring + [ring[0]], float))
+                    ring = []
+                else:
+                    ring.append((p.X, p.Y))
+            if len(ring) >= 3:
+                rings.append(np.array(ring + [ring[0]], float))
+    except TypeError:
+        pass
+    if not rings:  # stand-ins without ring access
+        e = geom.extent
+        rings.append(np.array([(e.XMin, e.YMin), (e.XMin, e.YMax), (e.XMax, e.YMax),
+                               (e.XMax, e.YMin), (e.XMin, e.YMin)]))
+    return rings
+
+
+def _cover_classes(reader, pts, line_idx, chunk=80, pad=12.0):
+    cover = np.array(["unknown"] * len(pts), dtype=object)
+    order = np.argsort(line_idx, kind="stable")
+    for start in range(0, len(order), chunk):
+        sel = order[start:start + chunk]
+        p = pts[sel]
+        x0, y0 = reader.snap(p[:, 0].min() - pad, p[:, 1].max() + pad)
+        w = int(np.ceil((p[:, 0].max() + pad - x0) / reader.res)) + 1
+        h = int(np.ceil((y0 - (p[:, 1].min() - pad)) / reader.res)) + 1
+        if w * h > 4e7:  # very spread-out chunk: do it point by point
+            for i in sel:
+                cover[[i]] = _cover_classes(reader, pts[[i]], np.zeros(1, int))
+            continue
+        chip = reader.read(x0, y0, w, h)
+        cover[sel] = cover_from_chip(chip, p, reader.has_nir)
+    return cover
+
+
+def _write_check_points(arcpy, out_fc, sr, pts, cover, oids, errors):
+    if arcpy.Exists(out_fc):
+        arcpy.management.Delete(out_fc)
+    folder, name = os.path.split(out_fc)
+    arcpy.management.CreateFeatureclass(folder, name, "POINT", spatial_reference=sr)
+    arcpy.management.AddField(out_fc, "TRUTH_OID", "LONG")
+    arcpy.management.AddField(out_fc, "COVER", "TEXT", field_length=20)
+    fields = []
+    for k, cand in enumerate(errors, 1):
+        f = f"ERR_{k}"
+        arcpy.management.AddField(out_fc, f, "DOUBLE", field_alias=f"Error: {cand}"[:255])
+        fields.append(f)
+    with arcpy.da.InsertCursor(out_fc, ["TRUTH_OID", "COVER"] + fields + ["SHAPE@"]) as cur:
+        errs = [errors[k] for k in errors]
+        for i, (x, y) in enumerate(pts):
+            vals = [None if np.isnan(e[i]) else round(float(e[i]), 2) for e in errs]
+            cur.insertRow([int(oids[i]), str(cover[i])] + vals
+                          + [arcpy.PointGeometry(arcpy.Point(float(x), float(y)), sr)])
+
+
 # ======================================================================
 # arcgis_toolbox.py
 # ======================================================================
@@ -1627,7 +2194,7 @@ class Toolbox:
     def __init__(self):
         self.label = "Centerline Alignment"
         self.alias = "centerline"
-        self.tools = [AlignCenterlines]
+        self.tools = [AlignCenterlines, EvaluateAlignment]
 
 
 def _param(name, label, datatype, direction="Input", required=True, category=None, value=None):
@@ -1682,6 +2249,11 @@ class AlignCenterlines:
         for name, label, default in ADVANCED:
             params.append(_param(name, label + " (map units)" if "confidence" not in label
                                  else label, "GPDouble", category="Advanced", value=default))
+        method = _param("method", "Refinement method", "GPString", category="Advanced",
+                        value="ribbon")
+        method.filter.type = "ValueList"
+        method.filter.list = ["ribbon", "midpoint"]
+        params.append(method)
         params.append(_param("training_grids", "Grids used to train the classifier", "GPLong",
                              category="Advanced", value=8))
         params.append(_param("fresh", "Start over (discard saved progress and classifier)",
@@ -1706,7 +2278,8 @@ class AlignCenterlines:
         bands = [int(p["red"].value), int(p["green"].value), int(p["blue"].value)]
         if nir not in (None, "", 0):
             bands.append(int(nir))
-        rcfg = RefineConfig(**{name: float(p[name].value) for name, _, _ in ADVANCED})
+        rcfg = RefineConfig(method=p["method"].valueAsText or "ribbon",
+                            **{name: float(p[name].value) for name, _, _ in ADVANCED})
         ccfg = ClassifierConfig(training_grids=int(p["training_grids"].value))
         run(arcpy,
             imagery=p["imagery"].valueAsText,
@@ -1719,6 +2292,71 @@ class AlignCenterlines:
             bands=bands, refine=rcfg, classifier=ccfg,
             fresh=bool(p["fresh"].value),
             diagnostics=bool(p["diagnostics"].value))
+
+    def postExecute(self, parameters):
+        return
+
+
+def _split_multi(text) -> list[str]:
+    """Values of a multi-value parameter ('a;b' with optional quotes)."""
+    return [v.strip().strip("'\"") for v in (text or "").split(";") if v.strip()]
+
+
+class EvaluateAlignment:
+    def __init__(self):
+        self.label = "Evaluate Against Checked Roads"
+        self.description = (
+            "Measures how far road layers (the original roads, aligned outputs) are from roads "
+            "you checked by hand, per cover type: open, shadow, partial trees, canopy, "
+            "intersections. Only reads the inputs.")
+        self.canRunInBackground = True
+
+    def getParameterInfo(self):
+        truth = _param("truth", "Checked roads (truth)", "GPFeatureLayer")
+        truth.filter.list = ["Polyline"]
+        where = _param("truth_where", "Only checked roads where (SQL)", "GPString",
+                       required=False, value="Validated = 'Yes'")
+        cands = arcpy.Parameter(name="candidates", displayName="Layers to evaluate",
+                                datatype="GPFeatureLayer", parameterType="Required",
+                                direction="Input", multiValue=True)
+        imagery = _param("imagery", "Imagery, for cover types (optional)",
+                         ["GPRasterLayer", "DERasterDataset", "DEMosaicDataset", "DEFolder"],
+                         required=False)
+        grids = _param("grids", "Only inside these grids (optional)", "GPFeatureLayer",
+                       required=False)
+        out = _param("out_points", "Output check points with errors (optional)",
+                     "DEFeatureClass", direction="Output", required=False)
+        spacing = _param("spacing", "Check point spacing (map units)", "GPDouble",
+                         category="Advanced", value=5.0)
+        max_dist = _param("max_dist", "Ignore matches farther than (map units)", "GPDouble",
+                          category="Advanced", value=40.0)
+        bands = _param("bands", "Imagery bands R,G,B,NIR", "GPString", category="Advanced",
+                       value="1,2,3,4")
+        return [truth, where, cands, imagery, grids, out, spacing, max_dist, bands]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        import os
+        p = {x.name: x for x in parameters}
+        cands = [(os.path.basename(v) or v, v) for v in _split_multi(p["candidates"].valueAsText)]
+        evaluate(arcpy,
+                 truth_fc=p["truth"].valueAsText,
+                 truth_where=p["truth_where"].valueAsText,
+                 candidates=cands,
+                 imagery=p["imagery"].valueAsText,
+                 bands=[int(b) for b in (p["bands"].valueAsText or "1,2,3,4").split(",")],
+                 grids_fc=p["grids"].valueAsText,
+                 out_points=p["out_points"].valueAsText,
+                 spacing=float(p["spacing"].value or 5.0),
+                 max_dist=float(p["max_dist"].value or 40.0))
 
     def postExecute(self, parameters):
         return

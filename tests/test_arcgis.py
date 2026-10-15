@@ -327,3 +327,39 @@ def test_copy_reports_problems_and_gaps(monkeypatch, tiled_scene, tmp_path):
     fake_arcpy.messages.clear()
     copy(str(src), str(grids), 10, str(tmp_path / "out"))
     assert any("already there" in m for m in fake_arcpy.messages)
+
+
+def test_evaluate_tool(toolbox, tiled_scene, tmp_path):
+    """Checked roads (truth) vs the original roads and an aligned run."""
+    run_tool(toolbox, tiled_scene, tmp_path)
+    truth = tmp_path / "checked.shp"
+    roads = synthetic.true_roads()
+    gpd.GeoDataFrame({"Validated": ["Yes", "Yes", "No"]},
+                     geometry=[g for g, _ in roads], crs=synthetic.CRS).to_file(truth)
+    tool = toolbox.Toolbox().tools[1]()
+    params = tool.getParameterInfo()
+    p = {x.name: x for x in params}
+    p["truth"].value = str(truth)
+    p["candidates"].value = f"{tiled_scene['roads']};'{tmp_path / 'aligned.shp'}'"
+    p["imagery"].value = str(tiled_scene["tiles"])
+    p["grids"].value = str(tiled_scene["grids"])
+    p["out_points"].value = str(tmp_path / "check.shp")
+    fake_arcpy.messages.clear()
+    tool.execute(params, None)
+    text = "\n".join(fake_arcpy.messages)
+    assert "2 checked roads" in text and "INTERSECTION" in text and "OPEN" in text
+
+    pts = gpd.read_file(tmp_path / "check.shp")
+    assert {"TRUTH_OID", "COVER", "ERR_1", "ERR_2"} <= set(pts.columns)
+    both = pts.dropna(subset=["ERR_1", "ERR_2"])
+    away = both[both.COVER != "intersection"]
+    assert away.ERR_1.mean() > 4.0          # the original roads are off by several feet
+    assert away.ERR_2.mean() < 1.0          # the aligned run is on the pavement
+    assert set(pts.COVER) <= {"open", "shadow", "partial", "canopy", "intersection"}
+    assert (pts.COVER == "intersection").any()
+    # only the two checked roads (horizontal, vertical) were sampled, not the curve
+    assert len(pts) < (1600 + 1000) / 5 + 10
+
+    with pytest.raises(ValueError, match="Values found in Validated"):
+        p["truth_where"].value = "Validated = 'Y'"
+        tool.execute(params, None)

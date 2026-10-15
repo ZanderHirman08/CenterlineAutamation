@@ -238,15 +238,84 @@ def _report_alignment(shifts):
             float(np.median(dist)))
 
 
+def find_junctions(lines, tol: float = 1.5) -> np.ndarray:
+    """Intersection points of a set of lines: ends shared by 3 or more lines, or an end
+    that touches the middle of another line (a T where the through road isn't split).
+    Two lines simply continuing each other (a grid-edge cut) are not a junction."""
+    lines = [as_coords(c) for c in lines if len(c) >= 2]
+    if len(lines) < 2:
+        return np.zeros((0, 2))
+    dense, owner = [], []
+    for k, c in enumerate(lines):
+        p = densify(c, tol)
+        dense.append(p)
+        owner.append(np.full(len(p), k))
+    dense, owner = np.concatenate(dense), np.concatenate(owner)
+    tree = cKDTree(dense)
+    ends = np.array([e for c in lines for e in (c[0], c[-1])])
+    end_tree = cKDTree(ends)
+    out = []
+    for k, c in enumerate(lines):
+        for e in (c[0], c[-1]):
+            touching = set(owner[tree.query_ball_point(e, tol)]) - {k}
+            if len(touching) >= 2:
+                out.append(e)
+            elif len(touching) == 1:
+                # the other line touches here at its own end (continuation) or mid-way (T)
+                if len(end_tree.query_ball_point(e, tol * 2)) < 2:
+                    out.append(e)
+    out += _crossings(lines, tol)
+    if not out:
+        return np.zeros((0, 2))
+    out = np.array(out)
+    # one point per junction
+    keep = np.ones(len(out), bool)
+    t = cKDTree(out)
+    for i, j in sorted(t.query_pairs(tol * 2)):
+        if keep[i]:
+            keep[j] = False
+    return out[keep]
+
+
+def _crossings(lines, tol: float, seg: float = 10.0) -> list:
+    """Points where two different lines cross mid-way (neither is split there)."""
+    a, b, owner = [], [], []
+    for k, c in enumerate(lines):
+        c = densify(c, seg)
+        a.append(c[:-1])
+        b.append(c[1:])
+        owner.append(np.full(len(c) - 1, k))
+    a, b, owner = np.concatenate(a), np.concatenate(b), np.concatenate(owner)
+    out = []
+    for i, j in cKDTree((a + b) / 2).query_pairs(seg * 1.01):
+        if owner[i] == owner[j]:
+            continue
+        p, r = a[i], b[i] - a[i]
+        q, s_ = a[j], b[j] - a[j]
+        den = r[0] * s_[1] - r[1] * s_[0]
+        if abs(den) < 1e-12:
+            continue
+        t = ((q[0] - p[0]) * s_[1] - (q[1] - p[1]) * s_[0]) / den
+        u = ((q[0] - p[0]) * r[1] - (q[1] - p[1]) * r[0]) / den
+        if -1e-9 <= t <= 1 + 1e-9 and -1e-9 <= u <= 1 + 1e-9:
+            x = p + t * r
+            # where a line ends, the end-point rules above decide
+            if min(np.hypot(*(x - e)) for k in (owner[i], owner[j])
+                   for e in (lines[k][0], lines[k][-1])) > tol:
+                out.append(x)
+    return out
+
+
 def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):
     """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts."""
     records, stations = [], []
+    junctions = find_junctions([c for _, c in pieces])
     for src_id, coords in pieces:
         c = as_coords(coords)
         if len(c) < 2:
             continue
         r = refine_line(c, pmap.sample, rcfg, step=step, valid=pmap.sample_valid,
-                        keep_stations=keep_stations)
+                        keep_stations=keep_stations, junctions=junctions)
         records.append(dict(
             src_id=src_id, shift_avg=round(r.shift_avg, 2), shift_max=round(r.shift_max, 2),
             conf=r.confidence, pct_valid=r.pct_valid, width_med=round(r.width_med, 1),

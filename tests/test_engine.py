@@ -30,3 +30,46 @@ def test_alignment_check_finds_offset(chip, dx, dy):
     # moving the lines by (sx, sy) should undo the offset, within a couple of feet
     assert abs(sx + dx) <= 2 and abs(sy + dy) <= 2, (sx, sy)
     assert best >= zero
+
+
+def test_ribbon_resists_shadow_and_side_lot():
+    """A shadow over one edge and a grey lot beside the road barely move the ribbon
+    fit, while the older midpoint method is pulled several feet."""
+    from centerline_align.config import RefineConfig
+    from centerline_align.refine import refine_line
+
+    rng = np.random.default_rng(0)
+    true_off, width = 5.0, 24.0
+
+    def sample(x, y):
+        p = np.where(np.abs(y - true_off) <= width / 2, 0.9, 0.1)
+        shadow = (x > 200) & (x < 350) & (y > true_off + width / 2 - 9) & (y <= true_off + 16)
+        lot = (x > 500) & (x < 560) & (y < true_off - width / 2) & (y > true_off - 27)
+        p = np.where(shadow, 0.15, np.where(lot, 0.8, p))
+        return np.clip(p + rng.normal(0, 0.1, p.shape), 0, 1)
+
+    line = np.array([[0.0, 0.0], [800.0, 0.0]])
+    err = {}
+    for method in ("midpoint", "ribbon"):
+        r = refine_line(line, sample, RefineConfig(method=method), 0.5, keep_stations=True)
+        x, off = r.stations["x"], r.stations["final"]
+        bad = ((x > 200) & (x < 350)) | ((x > 500) & (x < 560))
+        err[method] = np.abs(off[bad] - true_off).mean()
+        assert not r.reasons
+    assert err["ribbon"] < 2.0 < err["midpoint"], err
+
+
+def test_find_junctions():
+    from centerline_align.engine import find_junctions
+
+    def a(*pts):
+        return np.array(pts, float)
+    # grid-edge cut: two lines continuing each other
+    assert len(find_junctions([a([0, 0], [10, 0]), a([10, 0], [20, 0])])) == 0
+    # T where the through road isn't split
+    assert find_junctions([a([0, 0], [20, 0]), a([10, 0], [10, 10])]).tolist() == [[10, 0]]
+    # four-way, all split: one junction point
+    four = [a([0, 0], [10, 0]), a([10, 0], [20, 0]), a([10, 0], [10, 10]), a([10, -10], [10, 0])]
+    assert find_junctions(four).tolist() == [[10, 0]]
+    # two unsplit roads crossing
+    assert find_junctions([a([0, 0], [20, 0]), a([10, -10], [10, 10])]).tolist() == [[10, 0]]

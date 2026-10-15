@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import types
 
 import geopandas as gpd
@@ -200,7 +201,7 @@ class _Management:
 
     @staticmethod
     def AddField(in_table, field_name, field_type, field_precision=None, field_scale=None,
-                 field_length=None):
+                 field_length=None, field_alias=None):
         _schemas[in_table]["fields"].append((field_name, field_type))
 
     @staticmethod
@@ -215,9 +216,18 @@ class _Management:
 management = _Management()
 
 
+def Describe(path):
+    return types.SimpleNamespace(spatialReference=SpatialReference(gpd.read_file(path).crs))
+
+
 class _SearchCursor:
     def __init__(self, fc, fields, where_clause=None, spatial_reference=None):
         df = gpd.read_file(fc)
+        if where_clause:  # simple "FIELD = 'value'" filters only
+            m = re.match(r"\s*\"?(\w+)\"?\s*=\s*'?([^']*)'?\s*$", where_clause)
+            if not m or m.group(1) not in df.columns:
+                raise RuntimeError(f"An invalid SQL statement was used: {where_clause}")
+            df = df[df[m.group(1)].astype(str) == m.group(2)]
         if spatial_reference is not None:
             df = df.to_crs(spatial_reference._crs)
         else:  # like arcpy: geometries carry the dataset's spatial reference
