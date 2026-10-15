@@ -17,6 +17,7 @@ PROJ = "GA_Statewide_2018_B18_DRRA"
 
 def load_script(monkeypatch):
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
+    monkeypatch.setattr("time.sleep", lambda s: None)  # no waiting between retries
     src = (ROOT / "arcgis" / "download_usgs_tiles.py").read_text()
     call = "run_jobs(JOBS, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)"
     assert src.rstrip().endswith(call)

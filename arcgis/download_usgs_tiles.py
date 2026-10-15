@@ -15,9 +15,11 @@ links are public.
   and LiDAR tiles named like ..._e1372n0996.laz). The check errs on the side
   of downloading: a tile is only skipped if it is clearly away from every grid.
   Tiles whose names don't give a position are kept.
-* Tiles already downloaded (same size as on the server) are skipped, so the
-  script can be stopped and run again. Downloads go to a .part file first and
-  are only renamed when complete.
+* Tiles already downloaded are skipped, so the script can be stopped and run
+  again. Downloads go to a .part file first and are only renamed once complete
+  (checked against the size the server sends).
+* The dry run asks the server for every file's size to give a total; the real
+  run skips that step and just downloads.
 * Several files download at once (WORKERS); failed downloads are retried,
   then listed at the end.
 Needs only ArcGIS Pro's own Python.
@@ -126,35 +128,44 @@ def may_touch(url, boxes_by_epsg, aoi, buffer_m):
                for b in boxes_by_epsg[epsg])
 
 
-def remote_size(url):
-    req = urllib.request.Request(url, method="HEAD")
-    with urllib.request.urlopen(req, timeout=60) as r:
-        n = r.headers.get("Content-Length")
-        return int(n) if n else None
+def remote_size(url, tries=3):
+    """File size from the server (HEAD request), retried: the USGS server often times out."""
+    for attempt in range(1, tries + 1):
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=60) as r:
+                n = r.headers.get("Content-Length")
+                return int(n) if n else None
+        except Exception:
+            if attempt == tries:
+                raise
+            time.sleep(5 * attempt)
 
 
-def download(url, dest, size, tries=3):
+def download(url, dest, size=None, tries=5):
     part = dest + ".part"
     for attempt in range(1, tries + 1):
         try:
             with urllib.request.urlopen(url, timeout=120) as r, open(part, "wb") as f:
+                n = r.headers.get("Content-Length")
+                expect = size if size is not None else (int(n) if n else None)
                 while True:
                     chunk = r.read(1 << 20)
                     if not chunk:
                         break
                     f.write(chunk)
             got = os.path.getsize(part)
-            if size is not None and got != size:
-                raise IOError(f"incomplete: {got:,} of {size:,} bytes")
+            if expect is not None and got != expect:
+                raise IOError(f"incomplete: {got:,} of {expect:,} bytes")
             os.replace(part, dest)
-            return
+            return got
         except Exception as e:
             if os.path.exists(part):
                 os.remove(part)
             if attempt == tries:
                 raise
             print(f"    retrying {os.path.basename(url)} ({attempt}/{tries - 1}) after: {e}")
-            time.sleep(5 * attempt)
+            time.sleep(10 * attempt)
 
 
 def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=500,
@@ -178,46 +189,56 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
     if not dry_run:
         os.makedirs(out_folder, exist_ok=True)
     todo, done, failed, total = [], [], [], 0
-    say(f"Checking file sizes on the server for {len(links)} tiles...")
-    # size checks run 8 at a time; messages are only written from this thread
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(remote_size, u): u for u in links}
-        for k, fut in enumerate(as_completed(futures), 1):
-            url = futures[fut]
+    if not dry_run:
+        # Files are only renamed from .part when complete, so a file that is there is done.
+        # The download itself checks each file's size, so no separate size check is needed.
+        for url in links:
             dest = os.path.join(out_folder, os.path.basename(url))
-            if k % 100 == 0:
-                say(f"  {k}/{len(links)} checked")
-            try:
-                size = fut.result()
-            except Exception as e:  # e.g. the server was busy
-                failed.append((url, f"size check failed: {e}"))
-                size = None
-            total += size or 0
-            # downloads are renamed from .part only when complete, so an existing file
-            # whose size can't be checked is kept
-            if os.path.exists(dest) and (size is None or os.path.getsize(dest) == size):
+            if os.path.exists(dest):
                 done.append(dest)
             else:
-                todo.append((url, dest, size))
-    order = {u: i for i, u in enumerate(links)}
-    todo.sort(key=lambda t: order[t[0]])
-    gb = total / 1024 ** 3
-    say(f"{len(links)} tiles, {gb:,.1f} GB in total; {len(done)} already downloaded, "
-        f"{len(todo)} to download" + (f" ({len(failed)} of unknown size)" if failed else ""))
+                todo.append((url, dest, None))
+        say(f"{len(links)} tiles: {len(done)} already downloaded, {len(todo)} to download")
+    else:
+        say(f"Checking file sizes on the server for {len(links)} tiles...")
+        # a few at a time (more makes the USGS server time out); messages only from here
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = {pool.submit(remote_size, u): u for u in links}
+            for k, fut in enumerate(as_completed(futures), 1):
+                url = futures[fut]
+                dest = os.path.join(out_folder, os.path.basename(url))
+                if k % 100 == 0:
+                    say(f"  {k}/{len(links)} checked")
+                try:
+                    size = fut.result()
+                except Exception as e:
+                    failed.append((url, f"size check failed: {e}"))
+                    size = None
+                total += size or 0
+                if os.path.exists(dest):
+                    done.append(dest)
+                else:
+                    todo.append((url, dest, size))
+        order = {u: i for i, u in enumerate(links)}
+        todo.sort(key=lambda t: order[t[0]])
+        known = len(links) - len(failed)
+        say(f"{len(links)} tiles, {total / 1024 ** 3:,.1f} GB for the {known} whose size "
+            f"the server reported; {len(done)} already downloaded, {len(todo)} to download")
     if dry_run:
         for url, _, size in todo[:10]:
-            say(f"  {os.path.basename(url)}  ({(size or 0) / 1024 ** 2:,.0f} MB)")
+            mb = "size unknown" if size is None else f"{size / 1024 ** 2:,.0f} MB"
+            say(f"  {os.path.basename(url)}  ({mb})")
         if len(todo) > 10:
             say(f"  ... and {len(todo) - 10} more")
         if failed:
-            say(f"WARNING: the size check failed for {len(failed)} tile(s); "
-                "the real run will try to download them anyway:")
-            for url, e in failed[:10]:
+            say(f"NOTE: the server didn't answer the size check for {len(failed)} tile(s) "
+                "(it is often slow). They are still downloaded in the real run, so the "
+                "real total is a bit higher. First few:")
+            for url, e in failed[:5]:
                 say(f"  {os.path.basename(url)}: {e}")
         say("Dry run: nothing downloaded. Set DRY_RUN = False to download.")
         return dict(todo=todo, done=done, failed=failed, total=total)
 
-    failed = []  # size-check problems were reported above; the download decides now
     t_start, got_bytes = time.time(), 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futures = {pool.submit(download, url, dest, size): (url, dest, size)
@@ -225,9 +246,8 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
         for i, fut in enumerate(as_completed(futures), 1):
             url, dest, size = futures[fut]
             try:
-                fut.result()
+                got_bytes += fut.result() or 0
                 done.append(dest)
-                got_bytes += size or 0
                 rate = got_bytes / 1024 ** 2 / max(1.0, time.time() - t_start)
                 say(f"[{i}/{len(todo)}] {os.path.basename(url)} done "
                     f"({got_bytes / 1024 ** 3:,.1f} GB so far, {rate:,.0f} MB/s)")
@@ -263,7 +283,8 @@ def run_jobs(jobs, project=None, aoi=None, buffer_m=500, dry_run=False, workers=
             say(f"  {name}: ERROR {err}")
         elif dry_run:
             say(f"  {name}: {len(r['todo'])} to download, {len(r['done'])} already there, "
-                f"{r['total'] / 1024 ** 3:,.1f} GB in total")
+                f"about {r['total'] / 1024 ** 3:,.1f} GB"
+                + (f" + {len(r['failed'])} tiles of unknown size" if r["failed"] else ""))
         else:
             say(f"  {name}: {len(r['done'])} tiles in place, {len(r['failed'])} failed")
     if not dry_run and any(err or r["failed"] for _, r, err in results):
