@@ -50,7 +50,7 @@ AOI = r"C:\Users\zhirman\Desktop\Centerline\Glynn\data\Inputs.gdb\Glynn_Grid_1mi
 AOI_BUFFER_M = 500                        # metres of margin around the grids
 DRY_RUN = True                            # True: only list what would be downloaded
 WORKERS = 4                               # files fetched at the same time
-USE_FAST_MIRROR = True                    # fetch rockyweb links from USGS's Amazon copy
+USE_FAST_MIRROR = False                   # True: try USGS's Amazon copy first (not there for GA 2018 LiDAR)
 # -----------------------------------------------------------------------------
 
 URL_RE = re.compile(r"https?://[^\s\"'<>,;|]+?\.(?:tif|tiff|laz|las|zip|img)\b", re.IGNORECASE)
