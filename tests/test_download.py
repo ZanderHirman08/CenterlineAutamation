@@ -19,7 +19,7 @@ def load_script(monkeypatch):
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
     monkeypatch.setattr("time.sleep", lambda s: None)  # no waiting between retries
     src = (ROOT / "arcgis" / "download_usgs_tiles.py").read_text()
-    call = "run_jobs(JOBS, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)"
+    call = "run_jobs(JOBS, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS, USE_FAST_MIRROR)"
     assert src.rstrip().endswith(call)
     ns = {"__name__": "download_usgs_tiles"}
     exec(compile(src.rstrip()[: -len(call)], "download_usgs_tiles.py", "exec"), ns)
@@ -126,7 +126,7 @@ def test_failed_size_check_still_downloads(monkeypatch, server, tmp_path):
     lst = tmp_path / "list.txt"
     lst.write_text("\n".join(base + n for n in names.values()))
 
-    def flaky(url):  # the server refuses the size check for one tile
+    def flaky(url, *a):  # the server refuses the size check for one tile
         if "x43" in url:
             raise OSError("HTTP Error 503")
         return (root / "TIFF" / url.rsplit("/", 1)[1]).stat().st_size
@@ -157,3 +157,33 @@ def test_run_jobs_runs_each_list(monkeypatch, server, tmp_path):
     assert len(res[1][1]["done"]) == 1 and len(res[2][1]["done"]) == 2
     assert (tmp_path / "A" / dem[0]).exists() and (tmp_path / "B" / dem[2]).exists()
     assert any("Summary" in m for m in fake_arcpy.messages)
+
+
+def test_fast_mirror_with_fallback(monkeypatch, server, tmp_path):
+    base, names, _, root = server
+    ns = load_script(monkeypatch)
+    rocky = ns["ROCKYWEB"] + "Elevation/LPC/"
+    url = rocky + "x.laz"
+    assert ns["sources"](url) == [ns["S3_MIRROR"] + "Elevation/LPC/x.laz", url]
+    assert ns["sources"](url, use_mirror=False) == [url]
+    assert ns["sources"](base + "a.tif") == [base + "a.tif"]
+
+    # mirror has the file: it is used; mirror lacks it (404): the original link is used
+    (root / "mirror").mkdir()
+    n0, n1 = list(names.values())[:2]
+    (root / "mirror" / n0).write_bytes(b"from the mirror")
+    mirror = base.replace("TIFF/", "mirror/")
+    monkeypatch.setitem(ns, "ROCKYWEB", "https://rocky.invalid/")
+    ns["S3_MIRROR"] = mirror
+    out = tmp_path / "o"
+    out.mkdir()
+    for n in (n0, n1):
+        ns["download"](base + n, str(out / n))      # not a rockyweb link: no mirror
+    for f in out.iterdir():
+        f.unlink()
+    ns["sources"].__globals__["ROCKYWEB"] = base    # pretend the test server is rockyweb
+    for n in (n0, n1):
+        ns["download"](base + n, str(out / n))
+    assert (out / n0).read_bytes() == b"from the mirror"
+    assert (out / n1).read_bytes() == (root / "TIFF" / n1).read_bytes()
+    assert ns["remote_size"](base + n1) == (root / "TIFF" / n1).stat().st_size

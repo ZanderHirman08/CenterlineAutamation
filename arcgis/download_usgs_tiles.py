@@ -18,6 +18,9 @@ links are public.
 * Tiles already downloaded are skipped, so the script can be stopped and run
   again. Downloads go to a .part file first and are only renamed once complete
   (checked against the size the server sends).
+* LiDAR links point at USGS's own server, which is slow to start each file; the
+  same files are fetched from USGS's Amazon copy instead (USE_FAST_MIRROR), and
+  from the original link if a file isn't there.
 * The dry run asks the server for every file's size to give a total; the real
   run skips that step and just downloads.
 * Several files download at once (WORKERS); failed downloads are retried,
@@ -27,6 +30,7 @@ Needs only ArcGIS Pro's own Python.
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -46,6 +50,7 @@ AOI = r"C:\Users\zhirman\Desktop\Centerline\Glynn\data\Inputs.gdb\Glynn_Grid_1mi
 AOI_BUFFER_M = 500                        # metres of margin around the grids
 DRY_RUN = True                            # True: only list what would be downloaded
 WORKERS = 4                               # files fetched at the same time
+USE_FAST_MIRROR = True                    # fetch rockyweb links from USGS's Amazon copy
 # -----------------------------------------------------------------------------
 
 URL_RE = re.compile(r"https?://[^\s\"'<>,;|]+?\.(?:tif|tiff|laz|las|zip|img)\b", re.IGNORECASE)
@@ -55,6 +60,17 @@ URL_RE = re.compile(r"https?://[^\s\"'<>,;|]+?\.(?:tif|tiff|laz|las|zip|img)\b",
 DEM_TILE_RE = re.compile(r"_1M_(\d{1,2})_x(\d+)y(\d+)_", re.IGNORECASE)
 LPC_TILE_RE = re.compile(r"_e(\d{3,4})n(\d{3,4})\.la[sz]$", re.IGNORECASE)
 ALBERS = 6350  # NAD83(2011) / CONUS Albers
+# USGS keeps the same files on two servers: its own (rockyweb, slow to start each file) and
+# an Amazon S3 copy (fast). DEM lists already point at S3; LiDAR lists point at rockyweb.
+ROCKYWEB = "https://rockyweb.usgs.gov/vdelivery/Datasets/Staged/"
+S3_MIRROR = "https://prd-tnm.s3.amazonaws.com/StagedProducts/"
+
+
+def sources(url, use_mirror=True):
+    """URLs to try for a file, fastest first: the S3 copy (if there is one), then the link."""
+    if use_mirror and url.startswith(ROCKYWEB):
+        return [S3_MIRROR + url[len(ROCKYWEB):], url]
+    return [url]
 
 
 def say(m):
@@ -128,25 +144,39 @@ def may_touch(url, boxes_by_epsg, aoi, buffer_m):
                for b in boxes_by_epsg[epsg])
 
 
-def remote_size(url, tries=3):
-    """File size from the server (HEAD request), retried: the USGS server often times out."""
+def _head(url, tries):
     for attempt in range(1, tries + 1):
         try:
             req = urllib.request.Request(url, method="HEAD")
             with urllib.request.urlopen(req, timeout=60) as r:
                 n = r.headers.get("Content-Length")
                 return int(n) if n else None
+        except urllib.error.HTTPError:
+            raise  # the server answered "no": retrying won't help
         except Exception:
             if attempt == tries:
                 raise
             time.sleep(5 * attempt)
 
 
-def download(url, dest, size=None, tries=5):
-    part = dest + ".part"
-    for attempt in range(1, tries + 1):
+def remote_size(url, tries=3, use_mirror=True):
+    """File size from the server (HEAD request), retried: the USGS server often times out."""
+    urls = sources(url, use_mirror)
+    for k, u in enumerate(urls):
         try:
-            with urllib.request.urlopen(url, timeout=120) as r, open(part, "wb") as f:
+            return _head(u, 1 if k < len(urls) - 1 else tries)
+        except Exception:
+            if k == len(urls) - 1:
+                raise
+
+
+def download(url, dest, size=None, tries=5, use_mirror=True):
+    part = dest + ".part"
+    urls = sources(url, use_mirror)
+    for attempt in range(1, tries + 1):
+        src = urls[0]
+        try:
+            with urllib.request.urlopen(src, timeout=120) as r, open(part, "wb") as f:
                 n = r.headers.get("Content-Length")
                 expect = size if size is not None else (int(n) if n else None)
                 while True:
@@ -162,6 +192,9 @@ def download(url, dest, size=None, tries=5):
         except Exception as e:
             if os.path.exists(part):
                 os.remove(part)
+            if len(urls) > 1:  # the fast copy didn't work for this file: use the original link
+                urls.pop(0)
+                continue
             if attempt == tries:
                 raise
             print(f"    retrying {os.path.basename(url)} ({attempt}/{tries - 1}) after: {e}")
@@ -169,7 +202,7 @@ def download(url, dest, size=None, tries=5):
 
 
 def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=500,
-                        dry_run=False, workers=4):
+                        dry_run=False, workers=4, use_mirror=True):
     links = read_links(list_file)
     say(f"{len(links)} download links found in {os.path.basename(list_file)}")
     if project:
@@ -203,7 +236,7 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
         say(f"Checking file sizes on the server for {len(links)} tiles...")
         # a few at a time (more makes the USGS server time out); messages only from here
         with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-            futures = {pool.submit(remote_size, u): u for u in links}
+            futures = {pool.submit(remote_size, u, 3, use_mirror): u for u in links}
             for k, fut in enumerate(as_completed(futures), 1):
                 url = futures[fut]
                 dest = os.path.join(out_folder, os.path.basename(url))
@@ -241,7 +274,7 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
 
     t_start, got_bytes = time.time(), 0
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {pool.submit(download, url, dest, size): (url, dest, size)
+        futures = {pool.submit(download, url, dest, size, 5, use_mirror): (url, dest, size)
                    for url, dest, size in todo}
         for i, fut in enumerate(as_completed(futures), 1):
             url, dest, size = futures[fut]
@@ -262,7 +295,8 @@ def download_usgs_tiles(list_file, out_folder, project=None, aoi=None, buffer_m=
     return dict(todo=todo, done=done, failed=failed, total=total)
 
 
-def run_jobs(jobs, project=None, aoi=None, buffer_m=500, dry_run=False, workers=4):
+def run_jobs(jobs, project=None, aoi=None, buffer_m=500, dry_run=False, workers=4,
+             use_mirror=True):
     """Run each (list, folder) job in turn; one job failing doesn't stop the others."""
     results = []
     for list_file, out_folder in jobs:
@@ -270,7 +304,7 @@ def run_jobs(jobs, project=None, aoi=None, buffer_m=500, dry_run=False, workers=
         say(f"===== {os.path.basename(list_file)}  ->  {out_folder}")
         try:
             r = download_usgs_tiles(list_file, out_folder, project, aoi, buffer_m,
-                                    dry_run, workers)
+                                    dry_run, workers, use_mirror)
             results.append((list_file, r, None))
         except Exception as e:  # e.g. the list file isn't there
             say(f"ERROR: {e}")
@@ -292,4 +326,4 @@ def run_jobs(jobs, project=None, aoi=None, buffer_m=500, dry_run=False, workers=
     return results
 
 
-run_jobs(JOBS, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS)
+run_jobs(JOBS, PROJECT, AOI, AOI_BUFFER_M, DRY_RUN, WORKERS, USE_FAST_MIRROR)
