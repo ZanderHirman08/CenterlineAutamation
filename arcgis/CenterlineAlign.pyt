@@ -179,6 +179,11 @@ class Chip:
     x0: float
     y0: float
     res: float
+    # optional LiDAR layers resampled to this chip: (intensity, ground elevation,
+    # surface elevation), heights in metres; aux_valid marks where they exist
+    aux: np.ndarray | None = None
+    aux_valid: np.ndarray | None = None
+    xy_to_m: float = 0.3048006096  # metres per CRS unit (for slopes)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -335,6 +340,55 @@ def pixel_features(scaled: np.ndarray, has_nir: bool) -> np.ndarray:
     return np.stack(feats).astype(np.float32)
 
 
+def lidar_feature_names(has_nir: bool) -> list[str]:
+    names = ["l_int", "l_int_s", "l_height", "l_canopy", "l_slope", "l_rough",
+             "x_canopy_bright", "x_canopy_sat"]
+    if has_nir:
+        names.append("x_canopy_ndvi")
+    return names
+
+
+def lidar_features(chip, img_feats: np.ndarray, has_nir: bool) -> np.ndarray:
+    """Features from the chip's LiDAR layers (see ``Chip.aux``); NaN where there is
+    no LiDAR. Ground intensity shows asphalt under gaps in the canopy, the ground
+    surface is flat and smooth on a road bed, canopy height says where the imagery
+    can't see the ground, and the canopy x imagery terms let the (linear)
+    classifier trust the imagery less under trees."""
+    inten, dtm, dsm = (a.astype(np.float32) for a in chip.aux)
+    ok = chip.aux_valid
+    if not ok.any():
+        return np.full((len(lidar_feature_names(has_nir)),) + chip.shape, np.nan, np.float32)
+    for a in (inten, dtm, dsm):  # neutral values where missing, so blurs stay sane
+        a[~ok] = np.median(a[ok])
+    res_m = chip.res * chip.xy_to_m
+    blur = ndimage.gaussian_filter
+    height = np.clip(dsm - dtm, 0, 40)
+    canopy = np.clip((height - 1.0) / 8.0, 0, 1)
+    gy, gx = np.gradient(dtm, res_m)
+    slope = np.hypot(gx, gy)
+    sig = 1.5 / res_m
+    rough = np.sqrt(np.maximum(blur(dtm * dtm, sig) - blur(dtm, sig) ** 2, 0))
+    names = pixel_feature_names(has_nir)
+    feats = [inten, blur(inten, 1.0 / res_m), height, canopy, slope, rough,
+             canopy * img_feats[names.index("bright")], canopy * img_feats[names.index("sat")]]
+    if has_nir:
+        feats.append(canopy * img_feats[names.index("ndvi")])
+    out = np.stack(feats).astype(np.float32)
+    out[:, ~ok] = np.nan
+    return out
+
+
+def all_features(chip, scaled: np.ndarray, has_nir: bool, lidar: bool) -> np.ndarray:
+    """Pixel features, plus LiDAR features when the classifier uses them."""
+    feats = pixel_features(scaled, has_nir)
+    if not lidar:
+        return feats
+    if chip.aux is None:
+        raise ValueError("This classifier was trained with LiDAR layers: give the same "
+                         "LiDAR folder again (or retrain without LiDAR in a new work folder).")
+    return np.concatenate([feats, lidar_features(chip, feats, has_nir)])
+
+
 def sample_lowres(grid: np.ndarray, rows: np.ndarray, cols: np.ndarray, patch: int) -> np.ndarray:
     """Bilinearly sample a patch-resolution array (C, h, w) at full-res pixel positions.
 
@@ -462,6 +516,7 @@ class RoadClassifier:
     emb_coef: list | None = None
     train_accuracy: float | None = None
     trained_from: str | None = None   # second pass: the earlier result it learned from
+    lidar: bool = False               # uses LiDAR layers as well as the imagery
 
     def save(self, path):
         with open(path, "w") as f:
@@ -477,9 +532,12 @@ class RoadClassifier:
     def predict(self, chip: Chip, embedder: EmbeddingExtractor | None = None) -> np.ndarray:
         """Road probability (H, W) float32 for a chip; 0 where imagery is missing."""
         scaled = scale_bands(chip.data, self.band_lo, self.band_hi)
-        feats = pixel_features(scaled, self.has_nir)
+        feats = all_features(chip, scaled, self.has_nir, self.lidar)
+        mean = np.asarray(self.pix_mean, np.float32)[:, None, None]
+        if self.lidar:  # no LiDAR here: those features count as average (no effect)
+            feats = np.where(np.isnan(feats), mean, feats)
         w = np.asarray(self.pix_coef, np.float32) / np.asarray(self.pix_std, np.float32)
-        z = np.tensordot(w, feats - np.asarray(self.pix_mean, np.float32)[:, None, None], axes=1)
+        z = np.tensordot(w, feats - mean, axes=1)
         z += self.intercept
         if self.feature_mode == "embedding":
             if embedder is None:
@@ -556,7 +614,7 @@ def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int, trust
 
 def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndarray,
         *, feature_mode: str, has_nir: bool, band_lo, band_hi,
-        embedding_model: str | None) -> RoadClassifier:
+        embedding_model: str | None, lidar: bool = False) -> RoadClassifier:
     """Fit a balanced logistic regression on standardised features."""
     if len(np.unique(labels)) < 2:
         raise ValueError(
@@ -567,7 +625,9 @@ def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndar
     if samples_emb is not None:
         X.append(samples_emb)
     X = np.concatenate(X, axis=1).astype(np.float64)
-    mean = X.mean(axis=0)
+    mean = np.nanmean(X, axis=0)
+    mean[np.isnan(mean)] = 0.0
+    X = np.where(np.isnan(X), mean, X)   # pixels without LiDAR count as average
     std = X.std(axis=0)
     std[std < 1e-9] = 1.0
     Xs = (X - mean) / std
@@ -580,12 +640,13 @@ def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndar
         has_nir=has_nir,
         band_lo=[float(v) for v in band_lo],
         band_hi=[float(v) for v in band_hi],
-        pix_names=pixel_feature_names(has_nir),
+        pix_names=pixel_feature_names(has_nir) + (lidar_feature_names(has_nir) if lidar else []),
         pix_mean=mean[:n_pix].tolist(),
         pix_std=std[:n_pix].tolist(),
         pix_coef=coef[:n_pix].tolist(),
         intercept=float(intercept),
         train_accuracy=acc,
+        lidar=lidar,
     )
     if samples_emb is not None:
         clf.embedding_model = embedding_model
@@ -623,10 +684,11 @@ def logistic_regression(X: np.ndarray, y: np.ndarray, C: float = 1.0,
     return beta[:-1], float(beta[-1])
 
 
-def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi, embedder=None):
+def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi, embedder=None,
+                    lidar: bool = False):
     """Feature vectors (n, F) at the given pixels, matching what ``predict`` computes."""
     scaled = scale_bands(chip.data, band_lo, band_hi)
-    feats = pixel_features(scaled, has_nir)
+    feats = all_features(chip, scaled, has_nir, lidar)
     pix = feats[:, rows, cols].T
     emb = None
     if embedder is not None:
@@ -1272,7 +1334,8 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
         rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile, trusted)
         if len(labels) == 0:
             continue
-        pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder)
+        pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder,
+                                   lidar=getattr(reader, "has_lidar", False))
         pix_s.append(pix)
         lab_s.append(labels)
         if emb is not None:
@@ -1289,7 +1352,8 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
                  ", ".join(f"{n} {m:.2f}" for n, m in zip(names, means)))
     clf = fit(pix, np.concatenate(emb_s) if emb_s else None, labels,
               feature_mode=ccfg.features, has_nir=reader.has_nir, band_lo=lo, band_hi=hi,
-              embedding_model=ccfg.embedding_model if embedder is not None else None)
+              embedding_model=ccfg.embedding_model if embedder is not None else None,
+              lidar=getattr(reader, "has_lidar", False))
     if clf.train_accuracy is not None and clf.train_accuracy < 0.75:
         log.warning(
             "Training accuracy is only %.2f: the classifier can barely tell road from not-road "
@@ -1645,6 +1709,7 @@ import re
 import time
 
 import numpy as np
+from scipy import ndimage
 
 
 TILE_EXTS = (".tif", ".tiff", ".img", ".jp2", ".sid")
@@ -1653,8 +1718,9 @@ TILE_EXTS = (".tif", ".tiff", ".img", ".jp2", ".sid")
 class ArcTileReader:
     """Reads blocks from one raster or a folder of same-grid tiles."""
 
-    def __init__(self, arcpy, source: str, bands: list[int]):
+    def __init__(self, arcpy, source: str, bands: list[int], nodata=0):
         self.arcpy = arcpy
+        self.nodata = nodata
         paths = self._find(source)
         self.tiles = []
         self.skipped = []  # (path, reason): unreadable tiles, or ones that don't match the rest
@@ -1748,12 +1814,85 @@ class ArcTileReader:
             # a point a quarter-cell inside the block's lower-left cell, so the
             # read starts on that cell however the corner is snapped
             corner = self.arcpy.Point(x0 + c0 * r + r / 4, y0 - r1 * r + r / 4)
-            arr = self.arcpy.RasterToNumPyArray(t["path"], corner, nc, nr, 0)
+            arr = self.arcpy.RasterToNumPyArray(t["path"], corner, nc, nr, self.nodata)
             arr = arr[None] if arr.ndim == 2 else arr
             block = arr[[b - 1 for b in self.bands]].astype(np.float32)
-            data[:, r0:r1, c0:c1] = block
-            valid[r0:r1, c0:c1] = block.any(axis=0)
+            ok = (block.any(axis=0) if self.nodata == 0
+                  else (block != self.nodata).all(axis=0))
+            # overlapping tiles: a tile's empty edge never overwrites another's data
+            data[:, r0:r1, c0:c1][:, ok] = block[:, ok]
+            valid[r0:r1, c0:c1] |= ok
         return Chip(data=data, valid=valid, x0=x0, y0=y0, res=r)
+
+
+LIDAR_LAYERS = ("intensity", "dtm", "dsm")
+LIDAR_NODATA = -9999.0
+
+
+class LidarLayers:
+    """The rasters made by make_lidar_layers.py: ground intensity, ground elevation
+    (dtm) and surface elevation (dsm), as tiles in subfolders of one folder."""
+
+    def __init__(self, arcpy, folder: str, sr):
+        meta_path = os.path.join(folder, "lidar_layers.json")
+        if not os.path.exists(meta_path):
+            raise ValueError(f"{folder} is not a LiDAR layers folder (no lidar_layers.json); "
+                             "make it with make_lidar_layers.py")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        self.z_to_m = float(meta.get("z_to_m", 1.0))
+        self.xy_to_m = float(meta.get("xy_to_m", 0.3048006096))
+        self.readers = []
+        for name in LIDAR_LAYERS:
+            sub = os.path.join(folder, name)
+            if not os.path.isdir(sub):
+                raise ValueError(f"LiDAR folder {folder} has no '{name}' subfolder")
+            r = ArcTileReader(arcpy, sub, [1], nodata=LIDAR_NODATA)
+            if r.sr.name != sr.name:
+                raise ValueError(f"LiDAR layers are in {r.sr.name} but the imagery is in "
+                                 f"{sr.name}; remake them with the imagery's coordinate system")
+            self.readers.append(r)
+
+    def sample(self, chip):
+        """(3, H, W) LiDAR values at the chip's pixel centres (heights in metres), and
+        where all three exist."""
+        bx0, by0, bx1, by1 = chip.bounds
+        out = np.zeros((3,) + chip.shape, np.float32)
+        ok = np.ones(chip.shape, bool)
+        h, w = chip.shape
+        for k, rd in enumerate(self.readers):
+            r = rd.res
+            x0, y0 = rd.snap(bx0 - 2 * r, by1 + 2 * r)
+            nw = int(np.ceil((bx1 + 2 * r - x0) / r))
+            nh = int(np.ceil((y0 - (by0 - 2 * r)) / r))
+            blk = rd.read(x0, y0, nw, nh)
+            cols = (chip.x0 + (np.arange(w) + 0.5) * chip.res - x0) / r - 0.5
+            rows = (y0 - (chip.y0 - (np.arange(h) + 0.5) * chip.res)) / r - 0.5
+            rr, cc = np.meshgrid(rows, cols, indexing="ij")
+            v = ndimage.map_coordinates(blk.data[0], [rr, cc], order=1, mode="nearest")
+            good = ndimage.map_coordinates(blk.valid.astype(np.float32), [rr, cc], order=1,
+                                           mode="constant", cval=0.0) > 0.99
+            out[k] = v * (self.z_to_m if k > 0 else 1.0)
+            ok &= good
+        return out, ok
+
+
+class WithLidar:
+    """An imagery reader whose chips also carry the LiDAR layers."""
+
+    has_lidar = True
+
+    def __init__(self, reader, lidar: LidarLayers):
+        self.base, self.lidar = reader, lidar
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def read(self, x0, y0, width_px, height_px):
+        chip = self.base.read(x0, y0, width_px, height_px)
+        chip.aux, chip.aux_valid = self.lidar.sample(chip)
+        chip.xy_to_m = self.lidar.xy_to_m
+        return chip
 
 
 # --------------------------------------------------------------------------- vectors
@@ -1841,7 +1980,7 @@ def _safe(value) -> str:
 
 def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
         out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False,
-        diagnostics=False, retrain_from=None):
+        diagnostics=False, retrain_from=None, lidar_folder=None):
     msg = arcpy.AddMessage
     handler = _ArcHandler(arcpy)
     root = logging.getLogger("centerline_align")
@@ -1850,13 +1989,14 @@ def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, wor
     try:
         return _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field,
                     work_folder, out_fc, bands, refine, classifier, fresh, diagnostics,
-                    retrain_from)
+                    retrain_from, lidar_folder)
     finally:
         root.removeHandler(handler)
 
 
 def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False, retrain_from=None):
+         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False, retrain_from=None,
+         lidar_folder=None):
     os.makedirs(work_folder, exist_ok=True)
     grid_dir = os.path.join(work_folder, "grids")
     os.makedirs(grid_dir, exist_ok=True)
@@ -1870,6 +2010,12 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
         arcpy.AddWarning(f"{len(reader.skipped)} imagery file(s) were skipped:\n" + "\n".join(
             f"  {p}: {why}" for p, why in reader.skipped[:15])
             + (f"\n  ... and {len(reader.skipped) - 15} more" if len(reader.skipped) > 15 else ""))
+
+    if lidar_folder:
+        lidar = LidarLayers(arcpy, lidar_folder, sr)
+        reader = WithLidar(reader, lidar)
+        counts = ", ".join(f"{len(r.tiles)} {n}" for n, r in zip(LIDAR_LAYERS, lidar.readers))
+        msg(f"LiDAR layers: {lidar_folder} (tiles: {counts})")
 
     roads = read_lines(arcpy, roads_fc, road_id_field, sr)
     grids = read_grids(arcpy, grids_fc, grid_id_field, sr)
@@ -1895,6 +2041,13 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     if os.path.exists(model_path):
         clf = RoadClassifier.load(model_path)
         msg(f"Using saved classifier {model_path}")
+        if clf.lidar and not lidar_folder:
+            raise ValueError("The saved classifier in this work folder uses LiDAR: give the "
+                             "LiDAR folder, or use a new work folder.")
+        if lidar_folder and not clf.lidar:
+            arcpy.AddWarning("The saved classifier in this work folder was trained without "
+                             "LiDAR, so the LiDAR layers are not used. Use a new work folder "
+                             "to train with them.")
         if retrain_from and clf.trained_from != str(retrain_from):
             arcpy.AddWarning(
                 "This work folder already has a classifier, so the second-pass setting is "
@@ -2318,6 +2471,9 @@ class AlignCenterlines:
         work = _param("work_folder", "Work folder (progress and trained classifier)", "DEFolder")
         out = _param("out_fc", "Output aligned centerlines", "DEFeatureClass", direction="Output")
         params = [imagery, roads, road_id, grids, grid_id, work, out]
+        params.append(_param("lidar_folder",
+                             "LiDAR layers folder (optional; from make_lidar_layers.py)",
+                             "DEFolder", required=False, category="LiDAR"))
         params.append(_param("retrain_from",
                              "Learn from an earlier result (optional; use a new work folder)",
                              "GPFeatureLayer", required=False, category="Second pass"))
@@ -2372,7 +2528,8 @@ class AlignCenterlines:
             bands=bands, refine=rcfg, classifier=ccfg,
             fresh=bool(p["fresh"].value),
             diagnostics=bool(p["diagnostics"].value),
-            retrain_from=p["retrain_from"].valueAsText)
+            retrain_from=p["retrain_from"].valueAsText,
+            lidar_folder=p["lidar_folder"].valueAsText)
 
     def postExecute(self, parameters):
         return

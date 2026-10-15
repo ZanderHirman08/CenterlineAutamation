@@ -22,8 +22,9 @@ from scipy import ndimage
 from .chip import Chip
 from .features import (
     EmbeddingExtractor,
+    all_features,
+    lidar_feature_names,
     pixel_feature_names,
-    pixel_features,
     sample_lowres,
     scale_bands,
     upsample_lowres,
@@ -50,6 +51,7 @@ class RoadClassifier:
     emb_coef: list | None = None
     train_accuracy: float | None = None
     trained_from: str | None = None   # second pass: the earlier result it learned from
+    lidar: bool = False               # uses LiDAR layers as well as the imagery
 
     def save(self, path):
         with open(path, "w") as f:
@@ -65,9 +67,12 @@ class RoadClassifier:
     def predict(self, chip: Chip, embedder: EmbeddingExtractor | None = None) -> np.ndarray:
         """Road probability (H, W) float32 for a chip; 0 where imagery is missing."""
         scaled = scale_bands(chip.data, self.band_lo, self.band_hi)
-        feats = pixel_features(scaled, self.has_nir)
+        feats = all_features(chip, scaled, self.has_nir, self.lidar)
+        mean = np.asarray(self.pix_mean, np.float32)[:, None, None]
+        if self.lidar:  # no LiDAR here: those features count as average (no effect)
+            feats = np.where(np.isnan(feats), mean, feats)
         w = np.asarray(self.pix_coef, np.float32) / np.asarray(self.pix_std, np.float32)
-        z = np.tensordot(w, feats - np.asarray(self.pix_mean, np.float32)[:, None, None], axes=1)
+        z = np.tensordot(w, feats - mean, axes=1)
         z += self.intercept
         if self.feature_mode == "embedding":
             if embedder is None:
@@ -144,7 +149,7 @@ def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int, trust
 
 def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndarray,
         *, feature_mode: str, has_nir: bool, band_lo, band_hi,
-        embedding_model: str | None) -> RoadClassifier:
+        embedding_model: str | None, lidar: bool = False) -> RoadClassifier:
     """Fit a balanced logistic regression on standardised features."""
     if len(np.unique(labels)) < 2:
         raise ValueError(
@@ -155,7 +160,9 @@ def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndar
     if samples_emb is not None:
         X.append(samples_emb)
     X = np.concatenate(X, axis=1).astype(np.float64)
-    mean = X.mean(axis=0)
+    mean = np.nanmean(X, axis=0)
+    mean[np.isnan(mean)] = 0.0
+    X = np.where(np.isnan(X), mean, X)   # pixels without LiDAR count as average
     std = X.std(axis=0)
     std[std < 1e-9] = 1.0
     Xs = (X - mean) / std
@@ -168,12 +175,13 @@ def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndar
         has_nir=has_nir,
         band_lo=[float(v) for v in band_lo],
         band_hi=[float(v) for v in band_hi],
-        pix_names=pixel_feature_names(has_nir),
+        pix_names=pixel_feature_names(has_nir) + (lidar_feature_names(has_nir) if lidar else []),
         pix_mean=mean[:n_pix].tolist(),
         pix_std=std[:n_pix].tolist(),
         pix_coef=coef[:n_pix].tolist(),
         intercept=float(intercept),
         train_accuracy=acc,
+        lidar=lidar,
     )
     if samples_emb is not None:
         clf.embedding_model = embedding_model
@@ -211,10 +219,11 @@ def logistic_regression(X: np.ndarray, y: np.ndarray, C: float = 1.0,
     return beta[:-1], float(beta[-1])
 
 
-def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi, embedder=None):
+def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi, embedder=None,
+                    lidar: bool = False):
     """Feature vectors (n, F) at the given pixels, matching what ``predict`` computes."""
     scaled = scale_bands(chip.data, band_lo, band_hi)
-    feats = pixel_features(scaled, has_nir)
+    feats = all_features(chip, scaled, has_nir, lidar)
     pix = feats[:, rows, cols].T
     emb = None
     if embedder is not None:

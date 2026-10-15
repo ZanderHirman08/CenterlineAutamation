@@ -196,7 +196,8 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
         rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile, trusted)
         if len(labels) == 0:
             continue
-        pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder)
+        pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder,
+                                   lidar=getattr(reader, "has_lidar", False))
         pix_s.append(pix)
         lab_s.append(labels)
         if emb is not None:
@@ -213,7 +214,8 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
                  ", ".join(f"{n} {m:.2f}" for n, m in zip(names, means)))
     clf = fit(pix, np.concatenate(emb_s) if emb_s else None, labels,
               feature_mode=ccfg.features, has_nir=reader.has_nir, band_lo=lo, band_hi=hi,
-              embedding_model=ccfg.embedding_model if embedder is not None else None)
+              embedding_model=ccfg.embedding_model if embedder is not None else None,
+              lidar=getattr(reader, "has_lidar", False))
     if clf.train_accuracy is not None and clf.train_accuracy < 0.75:
         log.warning(
             "Training accuracy is only %.2f: the classifier can barely tell road from not-road "

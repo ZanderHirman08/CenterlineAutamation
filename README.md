@@ -17,12 +17,16 @@ deliverable road layer. Everything runs on your own machine; no data leaves it.
    up better with shadows, mixed surfaces and gravel.
 2. **Turn each grid into a road-probability map** (only near roads, to save time).
 3. **Take cross-sections.** Every 10 ft along each road, the probability is
-   sampled across the road, ±40 ft. The two pavement edges nearest the current
-   line are found and their midpoint is the measured centre.
-4. **Clean and rebuild.** Bad readings (trees, shadows, driveways) are dropped,
-   gaps are filled from neighbouring stations, offsets are smoothed, and the
-   line is rebuilt. Where the imagery gives no answer, the line stays put and
-   is **flagged**, never guessed.
+   sampled across the road, ±40 ft.
+4. **Fit a ribbon along the whole road.** The road is treated as a ribbon with
+   a centre and a width at every cross-section, and the best ribbon for the
+   whole line is found at once: it should cover road pixels and avoid the rest,
+   while the centre bends gently and the width stays steady (narrowing costs
+   more than widening, since shadows and trees only ever make pavement look
+   narrower). Cross-sections at intersections are ignored and bridged by their
+   neighbours. Where the imagery gives no answer, the line stays put and is
+   **flagged**, never guessed. (The older per-cross-section *midpoint* method
+   is still available under Advanced.)
 5. **Keep the network connected.** Intersections and grid-edge cuts are put
    back together at the point where the corrected roads cross.
 6. **Write outputs** with QA fields for every line.
@@ -60,6 +64,22 @@ the imagery's units; all distance settings use them.
 
 The toolbox uses the colour/texture classifier. GPU embeddings need PyTorch,
 which is an install, so they're only in Option B.
+
+**Also in the toolbox:**
+
+* **LiDAR** (optional): make ground intensity / ground / surface layers from
+  USGS LAZ tiles with [`arcgis/make_lidar_layers.py`](arcgis/make_lidar_layers.py)
+  and point *LiDAR layers folder* at them. The classifier then also uses
+  asphalt's laser return strength, the flat road bed and the canopy height,
+  which lets it find roads the imagery can't see under trees.
+* **Second pass** (optional): point *Learn from an earlier result* at a
+  finished output (and use a new work folder). The classifier retrains from
+  that run's trusted lines, labelling their full measured pavement width as
+  road and the verges as not-road.
+* **Evaluate Against Checked Roads**: measures any number of road layers
+  against roads you checked by hand (e.g. `Validated = 'Yes'`), by cover type
+  (open, shadow, partial trees, canopy, intersection). Use it to compare runs
+  and settings on the same roads.
 
 ## Option B: command line (needs a Python environment)
 

@@ -135,3 +135,47 @@ comes out at a lower resolution, ask the state for the tiles instead.
    selected. A test folder would leave it trained on just your 2-3 test grids.
    Expect about a minute per grid, so plan an overnight run. If it stops,
    run it again with the same work folder and it picks up where it left off.
+
+## 4. Measure the results
+
+Use roads you have checked by hand as the truth: the tool never edits them, it
+only reads them.
+
+1. Add your checked road layer to the map (e.g. the source of `Roads_working`;
+   right-click it in the work project → Properties → Source shows where it is).
+   Don't edit it in this project.
+2. Open **Evaluate Against Checked Roads**:
+
+   | Parameter | Value |
+   |---|---|
+   | Checked roads | the checked layer |
+   | Only checked roads where | `Validated = 'Yes'` |
+   | Layers to evaluate | the original local roads, plus every output to compare |
+   | Imagery | the tiles folder (gives the cover types) |
+   | Only inside these grids | `Grids_1mi` |
+   | Output check points | optional: points with each layer's error, to map |
+
+3. The messages show, per cover type, each layer's mean, median and worst-10%
+   distance from your lines, and the share within 2 ft and 5 ft. Only points
+   every layer matched are compared, so the numbers are like for like.
+
+Run it after every change (settings, second pass, LiDAR) on the same checked
+roads, and keep the one that does best where it matters to you.
+
+## 5. Second pass
+
+After a full run, start a **new** work folder and set *Learn from an earlier
+result* (Second pass) to that run's output. The classifier retrains from the
+lines the first run was confident about (REVIEW = 0), using their measured
+pavement width, then every grid is refined again.
+
+## 6. LiDAR
+
+1. Download the LAZ tiles (`download_usgs_tiles.py`).
+2. Edit and run `make_lidar_layers.py` in Pro's Python window: first with
+   `DRY_RUN = True`, then `False`. It makes three rasters per grid (ground
+   intensity, ground elevation, surface elevation) in the imagery's coordinate
+   system, and skips grids already done if stopped and restarted. Plan an
+   overnight run.
+3. In the toolbox, set *LiDAR layers folder* to its output folder and use a
+   **new** work folder, so the classifier is trained with the LiDAR.

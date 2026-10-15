@@ -13,6 +13,7 @@ import re
 import time
 
 import numpy as np
+from scipy import ndimage
 
 from .chip import Chip
 from .classifier import RoadClassifier, distance_to_roads
@@ -29,8 +30,9 @@ TILE_EXTS = (".tif", ".tiff", ".img", ".jp2", ".sid")
 class ArcTileReader:
     """Reads blocks from one raster or a folder of same-grid tiles."""
 
-    def __init__(self, arcpy, source: str, bands: list[int]):
+    def __init__(self, arcpy, source: str, bands: list[int], nodata=0):
         self.arcpy = arcpy
+        self.nodata = nodata
         paths = self._find(source)
         self.tiles = []
         self.skipped = []  # (path, reason): unreadable tiles, or ones that don't match the rest
@@ -124,12 +126,85 @@ class ArcTileReader:
             # a point a quarter-cell inside the block's lower-left cell, so the
             # read starts on that cell however the corner is snapped
             corner = self.arcpy.Point(x0 + c0 * r + r / 4, y0 - r1 * r + r / 4)
-            arr = self.arcpy.RasterToNumPyArray(t["path"], corner, nc, nr, 0)
+            arr = self.arcpy.RasterToNumPyArray(t["path"], corner, nc, nr, self.nodata)
             arr = arr[None] if arr.ndim == 2 else arr
             block = arr[[b - 1 for b in self.bands]].astype(np.float32)
-            data[:, r0:r1, c0:c1] = block
-            valid[r0:r1, c0:c1] = block.any(axis=0)
+            ok = (block.any(axis=0) if self.nodata == 0
+                  else (block != self.nodata).all(axis=0))
+            # overlapping tiles: a tile's empty edge never overwrites another's data
+            data[:, r0:r1, c0:c1][:, ok] = block[:, ok]
+            valid[r0:r1, c0:c1] |= ok
         return Chip(data=data, valid=valid, x0=x0, y0=y0, res=r)
+
+
+LIDAR_LAYERS = ("intensity", "dtm", "dsm")
+LIDAR_NODATA = -9999.0
+
+
+class LidarLayers:
+    """The rasters made by make_lidar_layers.py: ground intensity, ground elevation
+    (dtm) and surface elevation (dsm), as tiles in subfolders of one folder."""
+
+    def __init__(self, arcpy, folder: str, sr):
+        meta_path = os.path.join(folder, "lidar_layers.json")
+        if not os.path.exists(meta_path):
+            raise ValueError(f"{folder} is not a LiDAR layers folder (no lidar_layers.json); "
+                             "make it with make_lidar_layers.py")
+        with open(meta_path) as f:
+            meta = json.load(f)
+        self.z_to_m = float(meta.get("z_to_m", 1.0))
+        self.xy_to_m = float(meta.get("xy_to_m", 0.3048006096))
+        self.readers = []
+        for name in LIDAR_LAYERS:
+            sub = os.path.join(folder, name)
+            if not os.path.isdir(sub):
+                raise ValueError(f"LiDAR folder {folder} has no '{name}' subfolder")
+            r = ArcTileReader(arcpy, sub, [1], nodata=LIDAR_NODATA)
+            if r.sr.name != sr.name:
+                raise ValueError(f"LiDAR layers are in {r.sr.name} but the imagery is in "
+                                 f"{sr.name}; remake them with the imagery's coordinate system")
+            self.readers.append(r)
+
+    def sample(self, chip):
+        """(3, H, W) LiDAR values at the chip's pixel centres (heights in metres), and
+        where all three exist."""
+        bx0, by0, bx1, by1 = chip.bounds
+        out = np.zeros((3,) + chip.shape, np.float32)
+        ok = np.ones(chip.shape, bool)
+        h, w = chip.shape
+        for k, rd in enumerate(self.readers):
+            r = rd.res
+            x0, y0 = rd.snap(bx0 - 2 * r, by1 + 2 * r)
+            nw = int(np.ceil((bx1 + 2 * r - x0) / r))
+            nh = int(np.ceil((y0 - (by0 - 2 * r)) / r))
+            blk = rd.read(x0, y0, nw, nh)
+            cols = (chip.x0 + (np.arange(w) + 0.5) * chip.res - x0) / r - 0.5
+            rows = (y0 - (chip.y0 - (np.arange(h) + 0.5) * chip.res)) / r - 0.5
+            rr, cc = np.meshgrid(rows, cols, indexing="ij")
+            v = ndimage.map_coordinates(blk.data[0], [rr, cc], order=1, mode="nearest")
+            good = ndimage.map_coordinates(blk.valid.astype(np.float32), [rr, cc], order=1,
+                                           mode="constant", cval=0.0) > 0.99
+            out[k] = v * (self.z_to_m if k > 0 else 1.0)
+            ok &= good
+        return out, ok
+
+
+class WithLidar:
+    """An imagery reader whose chips also carry the LiDAR layers."""
+
+    has_lidar = True
+
+    def __init__(self, reader, lidar: LidarLayers):
+        self.base, self.lidar = reader, lidar
+
+    def __getattr__(self, name):
+        return getattr(self.base, name)
+
+    def read(self, x0, y0, width_px, height_px):
+        chip = self.base.read(x0, y0, width_px, height_px)
+        chip.aux, chip.aux_valid = self.lidar.sample(chip)
+        chip.xy_to_m = self.lidar.xy_to_m
+        return chip
 
 
 # --------------------------------------------------------------------------- vectors
@@ -217,7 +292,7 @@ def _safe(value) -> str:
 
 def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
         out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False,
-        diagnostics=False, retrain_from=None):
+        diagnostics=False, retrain_from=None, lidar_folder=None):
     msg = arcpy.AddMessage
     handler = _ArcHandler(arcpy)
     root = logging.getLogger("centerline_align")
@@ -226,13 +301,14 @@ def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, wor
     try:
         return _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field,
                     work_folder, out_fc, bands, refine, classifier, fresh, diagnostics,
-                    retrain_from)
+                    retrain_from, lidar_folder)
     finally:
         root.removeHandler(handler)
 
 
 def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False, retrain_from=None):
+         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False, retrain_from=None,
+         lidar_folder=None):
     os.makedirs(work_folder, exist_ok=True)
     grid_dir = os.path.join(work_folder, "grids")
     os.makedirs(grid_dir, exist_ok=True)
@@ -246,6 +322,12 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
         arcpy.AddWarning(f"{len(reader.skipped)} imagery file(s) were skipped:\n" + "\n".join(
             f"  {p}: {why}" for p, why in reader.skipped[:15])
             + (f"\n  ... and {len(reader.skipped) - 15} more" if len(reader.skipped) > 15 else ""))
+
+    if lidar_folder:
+        lidar = LidarLayers(arcpy, lidar_folder, sr)
+        reader = WithLidar(reader, lidar)
+        counts = ", ".join(f"{len(r.tiles)} {n}" for n, r in zip(LIDAR_LAYERS, lidar.readers))
+        msg(f"LiDAR layers: {lidar_folder} (tiles: {counts})")
 
     roads = read_lines(arcpy, roads_fc, road_id_field, sr)
     grids = read_grids(arcpy, grids_fc, grid_id_field, sr)
@@ -271,6 +353,13 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     if os.path.exists(model_path):
         clf = RoadClassifier.load(model_path)
         msg(f"Using saved classifier {model_path}")
+        if clf.lidar and not lidar_folder:
+            raise ValueError("The saved classifier in this work folder uses LiDAR: give the "
+                             "LiDAR folder, or use a new work folder.")
+        if lidar_folder and not clf.lidar:
+            arcpy.AddWarning("The saved classifier in this work folder was trained without "
+                             "LiDAR, so the LiDAR layers are not used. Use a new work folder "
+                             "to train with them.")
         if retrain_from and clf.trained_from != str(retrain_from):
             arcpy.AddWarning(
                 "This work folder already has a classifier, so the second-pass setting is "

@@ -56,6 +56,9 @@ class AlignCenterlines:
         work = _param("work_folder", "Work folder (progress and trained classifier)", "DEFolder")
         out = _param("out_fc", "Output aligned centerlines", "DEFeatureClass", direction="Output")
         params = [imagery, roads, road_id, grids, grid_id, work, out]
+        params.append(_param("lidar_folder",
+                             "LiDAR layers folder (optional; from make_lidar_layers.py)",
+                             "DEFolder", required=False, category="LiDAR"))
         params.append(_param("retrain_from",
                              "Learn from an earlier result (optional; use a new work folder)",
                              "GPFeatureLayer", required=False, category="Second pass"))
@@ -110,7 +113,8 @@ class AlignCenterlines:
             bands=bands, refine=rcfg, classifier=ccfg,
             fresh=bool(p["fresh"].value),
             diagnostics=bool(p["diagnostics"].value),
-            retrain_from=p["retrain_from"].valueAsText)
+            retrain_from=p["retrain_from"].valueAsText,
+            lidar_folder=p["lidar_folder"].valueAsText)
 
     def postExecute(self, parameters):
         return

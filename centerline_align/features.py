@@ -71,6 +71,55 @@ def pixel_features(scaled: np.ndarray, has_nir: bool) -> np.ndarray:
     return np.stack(feats).astype(np.float32)
 
 
+def lidar_feature_names(has_nir: bool) -> list[str]:
+    names = ["l_int", "l_int_s", "l_height", "l_canopy", "l_slope", "l_rough",
+             "x_canopy_bright", "x_canopy_sat"]
+    if has_nir:
+        names.append("x_canopy_ndvi")
+    return names
+
+
+def lidar_features(chip, img_feats: np.ndarray, has_nir: bool) -> np.ndarray:
+    """Features from the chip's LiDAR layers (see ``Chip.aux``); NaN where there is
+    no LiDAR. Ground intensity shows asphalt under gaps in the canopy, the ground
+    surface is flat and smooth on a road bed, canopy height says where the imagery
+    can't see the ground, and the canopy x imagery terms let the (linear)
+    classifier trust the imagery less under trees."""
+    inten, dtm, dsm = (a.astype(np.float32) for a in chip.aux)
+    ok = chip.aux_valid
+    if not ok.any():
+        return np.full((len(lidar_feature_names(has_nir)),) + chip.shape, np.nan, np.float32)
+    for a in (inten, dtm, dsm):  # neutral values where missing, so blurs stay sane
+        a[~ok] = np.median(a[ok])
+    res_m = chip.res * chip.xy_to_m
+    blur = ndimage.gaussian_filter
+    height = np.clip(dsm - dtm, 0, 40)
+    canopy = np.clip((height - 1.0) / 8.0, 0, 1)
+    gy, gx = np.gradient(dtm, res_m)
+    slope = np.hypot(gx, gy)
+    sig = 1.5 / res_m
+    rough = np.sqrt(np.maximum(blur(dtm * dtm, sig) - blur(dtm, sig) ** 2, 0))
+    names = pixel_feature_names(has_nir)
+    feats = [inten, blur(inten, 1.0 / res_m), height, canopy, slope, rough,
+             canopy * img_feats[names.index("bright")], canopy * img_feats[names.index("sat")]]
+    if has_nir:
+        feats.append(canopy * img_feats[names.index("ndvi")])
+    out = np.stack(feats).astype(np.float32)
+    out[:, ~ok] = np.nan
+    return out
+
+
+def all_features(chip, scaled: np.ndarray, has_nir: bool, lidar: bool) -> np.ndarray:
+    """Pixel features, plus LiDAR features when the classifier uses them."""
+    feats = pixel_features(scaled, has_nir)
+    if not lidar:
+        return feats
+    if chip.aux is None:
+        raise ValueError("This classifier was trained with LiDAR layers: give the same "
+                         "LiDAR folder again (or retrain without LiDAR in a new work folder).")
+    return np.concatenate([feats, lidar_features(chip, feats, has_nir)])
+
+
 def sample_lowres(grid: np.ndarray, rows: np.ndarray, cols: np.ndarray, patch: int) -> np.ndarray:
     """Bilinearly sample a patch-resolution array (C, h, w) at full-res pixel positions.
 

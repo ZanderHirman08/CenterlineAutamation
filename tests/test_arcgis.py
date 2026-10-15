@@ -54,14 +54,10 @@ def toolbox(monkeypatch):
     return mod
 
 
-@pytest.fixture(scope="module")
-def tiled_scene(tmp_path_factory):
-    """4-band scene split into four tiles with .aux.xml sidecars, like a county ortho."""
-    base = tmp_path_factory.mktemp("arc")
-    paths = synthetic.write_scene(base, nir=True)
-    tiles = base / "tiles"
+def split_tiles(ortho, tiles):
+    """Split an ortho into four tiles with .aux.xml sidecars, like a county ortho."""
     tiles.mkdir()
-    with rasterio.open(paths["imagery"]) as src:
+    with rasterio.open(ortho) as src:
         h, w = src.height, src.width
         for i, (r0, c0) in enumerate([(0, 0), (0, w // 2), (h // 2, 0), (h // 2, w // 2)]):
             win = Window(c0, r0, w - w // 2 if c0 else w // 2, h - h // 2 if r0 else h // 2)
@@ -70,7 +66,15 @@ def tiled_scene(tmp_path_factory):
             with rasterio.open(tiles / f"tile_{i}.tif", "w", **prof) as dst:
                 dst.write(src.read(window=win))
             (tiles / f"tile_{i}.tif.aux.xml").write_text("<PAMDataset></PAMDataset>")
-    return dict(paths, tiles=tiles)
+
+
+@pytest.fixture(scope="module")
+def tiled_scene(tmp_path_factory):
+    """4-band scene split into four tiles, like a county ortho."""
+    base = tmp_path_factory.mktemp("arc")
+    paths = synthetic.write_scene(base, nir=True)
+    split_tiles(paths["imagery"], base / "tiles")
+    return dict(paths, tiles=base / "tiles")
 
 
 def run_tool(mod, scene, tmp_path, **overrides):
@@ -386,3 +390,101 @@ def test_second_pass(toolbox, tiled_scene, tmp_path):
     fake_arcpy.warnings.clear()
     run_tool(toolbox, tiled_scene, tmp_path / "p2", retrain_from=str(tiled_scene["roads"]))
     assert any("second-pass setting is ignored" in w for w in fake_arcpy.warnings)
+
+
+def test_lidar_sees_road_under_canopy(toolbox, tmp_path):
+    """A stretch of road hidden by trees in the imagery: without LiDAR the line can't
+    move there; with ground intensity and a smooth road bed it lands on the road."""
+    from shapely.geometry import box
+
+    base = tmp_path / "scene"
+    paths = synthetic.write_scene(base, nir=True)
+    synthetic.hide_under_canopy(paths["imagery"])
+    split_tiles(paths["imagery"], base / "tiles")
+    scene = dict(paths, tiles=base / "tiles")
+    lidar = synthetic.write_lidar(tmp_path / "lidar")
+    x0, y0, x1, y1 = synthetic.CANOPY
+    hidden = box(x0 + 40, y0, x1 - 40, y1)
+
+    def error_hidden(out):
+        from shapely.geometry import LineString
+        road = LineString([(synthetic.X0, synthetic.MID), (synthetic.X0 + 1600, synthetic.MID)])
+        d = [ln.interpolate(s).distance(road) for ln in out.geometry
+             for s in np.arange(0, ln.length, 5.0) if hidden.contains(ln.interpolate(s))]
+        assert d
+        return float(np.mean(d))
+
+    plain = error_hidden(run_tool(toolbox, scene, tmp_path / "a"))
+    fake_arcpy.messages.clear()
+    with_lidar = error_hidden(run_tool(toolbox, scene, tmp_path / "b", lidar_folder=str(lidar)))
+    assert any("LiDAR layers:" in m for m in fake_arcpy.messages)
+    assert plain > 4.0, plain            # stays near the original line (7 ft off)
+    assert with_lidar < 2.0, with_lidar
+
+    # a work folder trained with LiDAR refuses to run without it
+    with pytest.raises(ValueError, match="uses LiDAR"):
+        run_tool(toolbox, scene, tmp_path / "b")
+
+
+def test_make_lidar_layers_flow(monkeypatch, tiled_scene, tmp_path):
+    """Control flow of make_lidar_layers.py with the LAS tools stubbed out: one set of
+    rasters per grid, done grids skipped, a failing grid reported and cleaned up."""
+    import types
+    monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
+    src = (ROOT / "arcgis" / "make_lidar_layers.py").read_text()
+    call = "make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN)"
+    assert src.rstrip().endswith(call)
+    ns = {"__name__": "make_lidar_layers"}
+    exec(compile(src.rstrip()[: -len(call)], "make_lidar_layers.py", "exec"), ns)
+
+    laz = tmp_path / "laz"
+    laz.mkdir()
+    (laz / "a.laz").write_bytes(b"")
+    calls = []
+    sr = fake_arcpy.SpatialReference(synthetic.CRS)
+    sr.metersPerUnit = 0.3048006096
+    real_describe = fake_arcpy.Describe
+
+    def describe(path):
+        if str(path).endswith(".lasd"):
+            return types.SimpleNamespace(fileCount=1, spatialReference=sr)
+        return types.SimpleNamespace(spatialReference=sr)
+
+    def to_raster(lyr, out, field, *a):
+        calls.append((field, a[0]))
+        if field == "ELEVATION" and fake_arcpy.env.extent.XMin > synthetic.X0 + 500:
+            raise RuntimeError("ERROR 999999: something went wrong")   # second grid fails
+        open(out, "w").close()
+
+    def project(raw, out, *a):
+        open(out, "w").close()
+
+    monkeypatch.setattr(fake_arcpy, "Describe", describe)
+    monkeypatch.setattr(fake_arcpy.management, "CreateLasDataset",
+                        lambda src_, out, *a, **k: open(out, "w").close(), raising=False)
+    monkeypatch.setattr(fake_arcpy.management, "MakeLasDatasetLayer",
+                        lambda lasd, name, **k: [name], raising=False)
+    monkeypatch.setattr(fake_arcpy.management, "ProjectRaster", project, raising=False)
+    monkeypatch.setattr(fake_arcpy, "conversion",
+                        types.SimpleNamespace(LasDatasetToRaster=to_raster), raising=False)
+    for k in ("extent", "outputCoordinateSystem", "pyramid", "rasterStatistics",
+              "compression"):
+        monkeypatch.setattr(fake_arcpy.env, k, None, raising=False)
+    sr.type = "Projected"
+
+    out = tmp_path / "lidar"
+    make = ns["make_lidar_layers"]
+    dry = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out),
+               dry_run=True)
+    assert dry["todo"] == [1, 2] and not out.exists()
+    r = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out))
+    assert r["done"] == [1] and [o for o, _ in r["failed"]] == [2]
+    assert sorted(p.name for p in (out / "dtm").iterdir()) == ["g1.tif"]
+    assert {c[0] for c in calls} == {"INTENSITY", "ELEVATION"}
+    import json
+    assert json.loads((out / "lidar_layers.json").read_text())["xy_to_m"] == sr.metersPerUnit
+    assert fake_arcpy.env.extent is None          # environment restored
+    calls.clear()
+    r2 = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out))
+    assert r2["todo"] == [2]                      # grid 1 is skipped
+    monkeypatch.setattr(fake_arcpy, "Describe", real_describe)

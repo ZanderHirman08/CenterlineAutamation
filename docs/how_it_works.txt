@@ -61,31 +61,58 @@ a slice through the road:
                      left edge  right edge
                          \-- midpoint = measured center
 
-At each cross-section it:
+Fitting a ribbon (the default method). Instead of judging each
+cross-section on its own, the tool treats the road as a ribbon: at every
+cross-section it has a center and a width. It tries every combination of
+center (within 30 ft, in 1 ft steps) and width (10 to 60 ft) at every
+cross-section, and picks the one path through all of them that best:
 
-  1. Finds where the probability crosses 50% on each side of the current
-     line. Those are the two pavement edges.
-  2. Takes the midpoint between the edges. That is the measured center.
-  3. Records the width between the edges. That is where the median 24 ft
-     width in the Glynn test came from.
-  4. Rejects the reading if the width is implausible (under 10 or over
-     60 ft), if no edge is found, or if the center is more than 30 ft away.
+  - covers pixels that look like road and leaves out the rest,
+  - bends gently (the center can't jump sideways between cross-sections),
+  - keeps a steady width, near the road's typical width.
 
-Cleanup along the road. Single readings can be wrong where there is a tree
-shadow, a driveway or a parked car, so:
+Narrowing below the typical width costs more than widening, because a tree
+shadow or overhanging crown makes pavement look narrower, never wider. So
+when a shadow hides one edge for a while, the ribbon keeps its width and
+stays centered instead of sliding toward the sunny side. A grey parking lot
+or driveway next to the road would need a sudden widening, so it barely
+pulls the line either.
 
-  - Readings that disagree sharply with their neighbors are thrown out.
-  - Gaps are filled from the neighboring good readings.
-  - The offsets are smoothed, so the line bends gently instead of
-    zig-zagging.
-  - Where nothing usable was found (canopy, no imagery), the line stays where
-    it was and gets flagged. It never guesses.
+Cross-sections within 30 ft of an intersection are ignored, because they
+look along the cross street. The ribbon carries through them from the
+cross-sections on either side, which removes the bends at intersections.
+
+Where nothing usable was found (canopy, no imagery), the line stays where it
+was and gets flagged. It never guesses.
+
+The older method is still there (Advanced > Refinement method > midpoint):
+it finds the two 50% edges at each cross-section, takes their midpoint, then
+drops outliers and smooths.
 
 Keeping the network connected. Each road is processed on its own, so where
 roads meet their ends could drift apart. The tool works out where the
 corrected roads actually cross and moves all the ends to that point. It
 blends that move back over 50 ft so the rest of each line is not bent. The
 same thing happens where a road is cut at a grid edge.
+
+
+OPTIONAL EXTRAS
+---------------
+LiDAR. make_lidar_layers.py turns the USGS LAZ tiles into three rasters per
+grid: the laser return strength of ground points (asphalt reads differently
+from grass), the ground elevation (road beds are flat and smooth) and the
+surface elevation (minus the ground gives tree height). With those, the
+classifier can find pavement where the imagery only shows tree tops, and it
+learns to trust the imagery less where trees are tall.
+
+Second pass. After a full run, a new run can learn from the first one's
+confident lines: it labels their full measured width as road and the verges
+just outside them as not-road, which is far better training data than "within
+4 ft of the original line".
+
+Measuring. "Evaluate Against Checked Roads" compares any road layers with the
+roads you validated by hand, every 5 ft, and reports the error by cover type
+(open, shadow, partial trees, canopy, intersection).
 
 
 THE OUTPUT FIELDS

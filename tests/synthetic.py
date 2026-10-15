@@ -98,3 +98,54 @@ def write_scene(folder: Path, nir: bool = False) -> dict:
     local_roads().to_file(paths["roads"])
     grids().to_file(paths["grids"])
     return paths
+
+
+# --------------------------------------------------------------------------- LiDAR
+
+CANOPY = (X0 + 930, MID - 60, X0 + W_FT, MID + 60)   # trees hiding a whole road piece
+LIDAR_RES = 3.0
+
+
+def hide_under_canopy(path: Path, seed: int = 1):
+    """Paint tree crowns over the CANOPY box of an ortho (in place)."""
+    rng = np.random.default_rng(seed)
+    with rasterio.open(path, "r+") as dst:
+        img = dst.read()
+        x0, y0, x1, y1 = CANOPY
+        c0, c1 = int((x0 - X0) / RES), int((x1 - X0) / RES)
+        r0, r1 = int((Y0 - y1) / RES), int((Y0 - y0) / RES)
+        tree = np.array([35, 60, 30, 150])[: img.shape[0]]
+        patch = tree[:, None, None] + rng.normal(0, 8, (img.shape[0], r1 - r0, c1 - c0))
+        img[:, r0:r1, c0:c1] = np.clip(patch, 0, 255).astype(np.uint8)
+        dst.write(img)
+
+
+def write_lidar(folder: Path, seed: int = 2) -> Path:
+    """Ground intensity, ground and surface elevation (metres) at 3 ft, as the
+    make_lidar_layers.py script would produce: asphalt is bright and the road bed
+    smooth everywhere, including under the CANOPY trees (15 m tall)."""
+    import json
+    rng = np.random.default_rng(seed)
+    folder = Path(folder)
+    w, h = int(W_FT / LIDAR_RES), int(H_FT / LIDAR_RES)
+    transform = from_origin(X0, Y0, LIDAR_RES, LIDAR_RES)
+    road = np.zeros((h, w), bool)
+    for line, width in true_roads():
+        road |= rfeatures.rasterize([(line.buffer(width / 2, cap_style="flat"), 1)],
+                                    out_shape=(h, w), transform=transform).astype(bool)
+    inten = np.where(road, 220.0, 90.0) + rng.normal(0, 15, (h, w))
+    dtm = 3.0 + np.where(road, 0.0, rng.normal(0, 0.08, (h, w)))
+    dsm = dtm.copy()
+    x0, y0, x1, y1 = CANOPY
+    c0, c1 = int((x0 - X0) / LIDAR_RES), int((x1 - X0) / LIDAR_RES)
+    r0, r1 = int((Y0 - y1) / LIDAR_RES), int((Y0 - y0) / LIDAR_RES)
+    dsm[r0:r1, c0:c1] += 15.0
+    for name, arr in (("intensity", inten), ("dtm", dtm), ("dsm", dsm)):
+        (folder / name).mkdir(parents=True, exist_ok=True)
+        with rasterio.open(folder / name / f"{name}_g1.tif", "w", driver="GTiff", width=w,
+                           height=h, count=1, dtype="float32", crs=CRS, transform=transform,
+                           nodata=-9999.0) as dst:
+            dst.write(arr.astype(np.float32)[None])
+    (folder / "lidar_layers.json").write_text(json.dumps({"z_to_m": 1.0,
+                                                          "xy_to_m": 0.3048006096}))
+    return folder
