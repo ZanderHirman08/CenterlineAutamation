@@ -26,10 +26,16 @@ def test_pyt_is_up_to_date():
     assert r.returncode == 0, r.stdout + r.stderr
 
 
+def test_notebook_is_up_to_date():
+    r = subprocess.run([sys.executable, str(ROOT / "scripts" / "build_notebook.py"), "--check"],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
 def test_pyt_uses_only_arcgis_pro_packages():
     import ast
     allowed = {"__future__", "arcpy", "numpy", "scipy", "json", "logging", "os", "re", "time",
-               "math", "dataclasses", "pathlib", "typing", "sys", "types",
+               "math", "dataclasses", "pathlib", "typing", "sys", "types", "shutil",
                "yaml"}  # yaml: CLI-only, lazy
     tree = ast.parse(PYT.read_text())
     used = set()
@@ -550,3 +556,93 @@ def _grid_geoms(arcpy_, scene):
     sr = arcpy_.SpatialReference(synthetic.CRS)
     with arcpy_.da.SearchCursor(str(scene["grids"]), ["SHAPE@"], spatial_reference=sr) as cur:
         return [g for (g,) in cur]
+
+
+def _truth_pieces(tmp_path):
+    """The true road centres cut into short pieces (so a train/validation split by road
+    has both), all checked except one."""
+    from shapely.ops import substring
+    pieces = []
+    for g, _ in synthetic.true_roads():
+        n = 4
+        for i in range(n):
+            pieces.append(substring(g, g.length * i / n, g.length * (i + 1) / n))
+    flags = ["Yes"] * len(pieces)
+    flags[-1] = "No"
+    path = tmp_path / "checked.shp"
+    gpd.GeoDataFrame({"Validated": flags}, geometry=pieces, crs=synthetic.CRS).to_file(path)
+    return path
+
+
+def test_export_training_chips(toolbox, tiled_scene, tmp_path):
+    import json
+    import zipfile
+    truth = _truth_pieces(tmp_path)
+    tool = toolbox.Toolbox().tools[2]()
+    params = tool.getParameterInfo()
+    p = {x.name: x for x in params}
+    p["truth"].value = str(truth)
+    p["imagery"].value = str(tiled_scene["tiles"])
+    p["out_folder"].value = str(tmp_path / "chips")
+    p["local"].value = str(tiled_scene["roads"])
+    p["val_fraction"].value = 0.3
+    p["chip_px"].value = 128
+    fake_arcpy.messages.clear()
+    tool.execute(params, None)
+    out = tmp_path / "chips"
+    man = json.loads((out / "manifest.json").read_text())
+    assert man["counts"]["train"] > 0 and man["counts"]["val"] > 0
+    assert man["channels"] == ["red", "green", "blue", "nir"]
+    shard = np.load(next(out.glob("shard_train_*.npz")))
+    assert shard["image"].shape[1:] == (4, 128, 128) and shard["image"].dtype == np.uint8
+    heat, mask = shard["heat"][0], shard["mask"][0]
+    assert heat.max() > 230 and mask.any() and not mask.all()   # ridge within a pixel
+    # the heat ridge sits on the true road: pixels with heat > 0.9 are pavement-coloured
+    img = shard["image"]
+    ridge = shard["heat"] > 230
+    blue = img[:, 2][ridge]
+    assert np.median(blue) > 90
+    lines = json.loads(next(out.glob("shard_train_*.json")).read_text())
+    assert len(lines) == len(shard["heat"]) and lines[0]
+    base = json.loads((out / "baseline.json").read_text())
+    assert 3.0 < base["val"]["median"] < 9.0      # local roads are 5-7 ft off
+    assert (tmp_path / "chips.zip").exists()
+    assert "manifest.json" in zipfile.ZipFile(tmp_path / "chips.zip").namelist()
+    assert any("the score to beat" in m for m in fake_arcpy.messages)
+
+
+def test_train_on_exported_chips(toolbox, tiled_scene, tmp_path):
+    """The Colab training code runs end to end on exported chips (tiny, on CPU)."""
+    pytest.importorskip("torch")
+    pytest.importorskip("segmentation_models_pytorch")
+    import json
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dl"))
+    import train_centerline as tc
+    truth = _truth_pieces(tmp_path)
+    tool = toolbox.Toolbox().tools[2]()
+    params = tool.getParameterInfo()
+    p = {x.name: x for x in params}
+    p["truth"].value = str(truth)
+    p["imagery"].value = str(tiled_scene["tiles"])
+    p["out_folder"].value = str(tmp_path / "chips")
+    p["local"].value = str(tiled_scene["roads"])
+    p["val_fraction"].value = 0.3
+    p["chip_px"].value = 128
+    tool.execute(params, None)
+    info = tc.train(str(tmp_path / "chips"), str(tmp_path / "model"), encoder="resnet18",
+                    encoder_weights=None, epochs=2, batch_size=8, num_workers=0)
+    assert len(info["history"]) == 2 and info["best"]["points"] > 0
+    assert (tmp_path / "model" / "best_model.pt").exists()
+    saved = json.loads((tmp_path / "model" / "model_info.json").read_text())
+    assert saved["channels"] == ["red", "green", "blue", "nir"]
+    # a perfect prediction scores ~0 error
+    _, data = tc.load_chips(str(tmp_path / "chips"))
+    errs = np.concatenate([tc.crest_errors(h / 255.0, ln, 0.5)
+                           for h, ln in zip(data["val"]["heat"], data["val"]["lines"])])
+    s = tc.summarize(errs)
+    assert s["found"] > 0.9 and s["median"] < 0.2
+    # resuming after the last epoch does nothing more
+    again = tc.train(str(tmp_path / "chips"), str(tmp_path / "model"), encoder="resnet18",
+                     encoder_weights=None, epochs=2, batch_size=8, num_workers=0)
+    assert len(again["history"]) == 2 and again["best"] == info["best"]

@@ -1702,6 +1702,100 @@ def eval_report(errors: dict, cover: np.ndarray, units: str = "ft") -> list[str]
 
 
 # ======================================================================
+# chips.py
+# ======================================================================
+
+"""Training chips for a deep-learning centreline model.
+
+Each chip is an imagery block (bands, H, W) around a hand-checked road, with:
+
+* ``heat`` - the target: 1 on the checked centreline, falling off as a Gaussian
+  (``sigma`` map units) across it. The model learns to draw this ridge; the
+  ridge's crest is the centreline.
+* ``mask`` - where the loss is counted: near the checked road only, and not near
+  roads that haven't been checked (their true centre is unknown, so the model
+  must not be told "no road here").
+
+Roads are split into training and validation by road id, so a road is never
+in both: the validation score is on roads the model has not seen.
+"""
+
+import numpy as np
+
+
+
+def pixel_centres(x0: float, y0: float, res: float, h: int, w: int):
+    xs = x0 + (np.arange(w) + 0.5) * res
+    ys = y0 - (np.arange(h) + 0.5) * res
+    return np.meshgrid(xs, ys)
+
+
+def distance_to_lines(x0, y0, res, shape, lines, max_dist=np.inf) -> np.ndarray:
+    """Exact distance (map units) from each pixel centre to the nearest segment."""
+    h, w = shape
+    X, Y = pixel_centres(x0, y0, res, h, w)
+    out = np.full((h, w), np.inf)
+    bx0, by1 = x0, y0
+    bx1, by0 = x0 + w * res, y0 - h * res
+    for c in lines:
+        c = as_coords(c)
+        if len(c) < 2:
+            continue
+        a, b = c[:-1], c[1:]
+        # segments that can come within max_dist of the chip
+        lo = np.minimum(a, b) - max_dist
+        hi = np.maximum(a, b) + max_dist
+        keep = (hi[:, 0] >= bx0) & (lo[:, 0] <= bx1) & (hi[:, 1] >= by0) & (lo[:, 1] <= by1)
+        for (ax, ay), (qx, qy) in zip(a[keep], b[keep]):
+            dx, dy = qx - ax, qy - ay
+            ll = dx * dx + dy * dy
+            if ll == 0:
+                d = np.hypot(X - ax, Y - ay)
+            else:
+                t = np.clip(((X - ax) * dx + (Y - ay) * dy) / ll, 0, 1)
+                d = np.hypot(X - (ax + t * dx), Y - (ay + t * dy))
+            np.minimum(out, d, out=out)
+    return out
+
+
+def make_labels(x0, y0, res, shape, truth, unchecked, sigma=1.0, corridor=30.0,
+                unknown_radius=15.0):
+    """(heat uint8 0-255, mask uint8 0/1) for one chip."""
+    d_true = distance_to_lines(x0, y0, res, shape, truth, corridor + 3 * sigma)
+    heat = np.exp(-0.5 * (d_true / sigma) ** 2)
+    mask = d_true <= corridor
+    if unchecked:
+        d_other = distance_to_lines(x0, y0, res, shape, unchecked, unknown_radius)
+        mask &= ~((d_other <= unknown_radius) & (d_true > 3 * sigma))
+    return np.round(heat * 255).astype(np.uint8), mask.astype(np.uint8)
+
+
+def is_validation(road_id, fraction: float, seed: int = 0) -> bool:
+    """Deterministic train/validation split by road id."""
+    h = (hash_id(road_id) + seed * 7919) % 10007
+    return h < fraction * 10007
+
+
+def hash_id(road_id) -> int:
+    s = str(road_id)
+    v = 2166136261
+    for ch in s.encode("utf-8"):
+        v = ((v ^ ch) * 16777619) % (2 ** 32)
+    return v
+
+
+def lines_in_pixels(x0, y0, res, lines, pad: float = 0.0):
+    """Line coords converted to chip pixel coords (col, row) - for evaluation."""
+    out = []
+    for c in lines:
+        c = densify(as_coords(c), 2 * res)
+        col = (c[:, 0] - x0) / res - 0.5
+        row = (y0 - c[:, 1]) / res - 0.5
+        out.append(np.column_stack([col, row]).round(2).tolist())
+    return out
+
+
+# ======================================================================
 # arcgis_impl.py
 # ======================================================================
 
@@ -2423,6 +2517,147 @@ def _write_check_points(arcpy, out_fc, sr, pts, cover, oids, errors):
                           + [arcpy.PointGeometry(arcpy.Point(float(x), float(y)), sr)])
 
 
+# --------------------------------------------------------------------------- training chips
+
+def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_folder,
+                          grids_fc=None, local_fc=None, chip_px=256, step=100.0,
+                          val_fraction=0.2, sigma=1.0, corridor=30.0, min_valid=0.8,
+                          shard_size=200, seed=0, make_zip=True):
+    """Chips around hand-checked roads, for training a centreline model elsewhere
+    (see ``chips.py`` and ``dl/train_centerline.py``). Only reads the inputs."""
+    import shutil
+    msg = arcpy.AddMessage
+    reader = ArcTileReader(arcpy, imagery, list(bands))
+    sr, res = reader.sr, reader.res
+    rng = np.random.default_rng(seed)
+
+    truth, other = [], []
+    with arcpy.da.SearchCursor(truth_fc, ["OID@", "SHAPE@"], spatial_reference=sr) as cur:
+        everything = [(oid, _parts(g)) for oid, g in cur if g is not None]
+    try:
+        with arcpy.da.SearchCursor(truth_fc, ["OID@"], where_clause=truth_where or None) as cur:
+            checked = {oid for (oid,) in cur}
+    except Exception as e:
+        raise ValueError(f"Could not read the checked roads with the filter {truth_where!r}: {e}")
+    for oid, parts in everything:
+        (truth if oid in checked else other).extend((oid, c) for c in parts)
+    if not truth:
+        raise ValueError(f"No checked roads match {truth_where!r}. "
+                         + _value_hint(arcpy, truth_fc, truth_where))
+    grid_polys = [g for _, g, _ in read_grids(arcpy, grids_fc, "OID@", sr)] if grids_fc else None
+
+    os.makedirs(out_folder, exist_ok=True)
+    for f in os.listdir(out_folder):  # a fresh export replaces an old one
+        if f.startswith("shard_") or f in ("manifest.json", "baseline.json"):
+            os.remove(os.path.join(out_folder, f))
+
+    def ext(c):
+        return (c[:, 0].min(), c[:, 1].min(), c[:, 0].max(), c[:, 1].max())
+    truth_ext = [ext(c) for _, c in truth]
+    other_ext = [ext(c) for _, c in other]
+    half = chip_px * res / 2
+    split_of = {oid: ("val" if is_validation(oid, val_fraction, seed) else "train")
+                for oid, _ in truth}
+    buffers = {"train": [], "val": []}
+    counts = {"train": 0, "val": 0}
+    shards = {"train": 0, "val": 0}
+
+    def flush(split):
+        items = buffers[split]
+        if not items:
+            return
+        k = shards[split]
+        np.savez_compressed(
+            os.path.join(out_folder, f"shard_{split}_{k:03d}.npz"),
+            image=np.stack([i["image"] for i in items]),
+            heat=np.stack([i["heat"] for i in items]),
+            mask=np.stack([i["mask"] for i in items]),
+            x0=np.array([i["x0"] for i in items]), y0=np.array([i["y0"] for i in items]),
+            road=np.array([str(i["road"]) for i in items]))
+        with open(os.path.join(out_folder, f"shard_{split}_{k:03d}.json"), "w") as f:
+            json.dump([i["lines"] for i in items], f)
+        shards[split] += 1
+        buffers[split] = []
+
+    centres = []
+    for oid, c in truth:
+        pts, _, _ = sample_lines([c], step)
+        centres += [(oid, p) for p in pts]
+    if grid_polys is not None:
+        inside = _points_in_polygons(np.array([p for _, p in centres]), grid_polys)
+        centres = [cp for cp, ok in zip(centres, inside) if ok]
+    msg(f"{len(set(oid for oid, _ in truth))} checked roads, {len(other)} unchecked road parts; "
+        f"{len(centres)} chip positions every {step:g} {sr.linearUnitName}")
+    arcpy.SetProgressor("step", "Exporting training chips...", 0, max(1, len(centres)), 1)
+    skipped = 0
+    for k, (oid, p) in enumerate(centres):
+        arcpy.SetProgressorPosition(k)
+        jx, jy = rng.uniform(-0.25, 0.25, 2) * chip_px * res   # the road isn't always centred
+        x0, y0 = reader.snap(p[0] - half + jx, p[1] + half + jy)
+        chip = reader.read(x0, y0, chip_px, chip_px)
+        if chip.valid.mean() < min_valid:
+            skipped += 1
+            continue
+        b = chip.bounds
+        pad = corridor + 20
+        box = (b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad)
+        t_lines = [c for (_, c), e in zip(truth, truth_ext) if _overlaps(e, box)]
+        o_lines = [c for (_, c), e in zip(other, other_ext) if _overlaps(e, box)]
+        heat, mask = make_labels(x0, y0, res, chip.shape, t_lines, o_lines, sigma, corridor)
+        split = split_of[oid]
+        buffers[split].append(dict(
+            image=np.clip(chip.data, 0, 255).astype(np.uint8), heat=heat, mask=mask,
+            x0=x0, y0=y0, road=oid, lines=lines_in_pixels(x0, y0, res, t_lines)))
+        counts[split] += 1
+        if len(buffers[split]) >= shard_size:
+            flush(split)
+    for s in ("train", "val"):
+        flush(s)
+    arcpy.ResetProgressor()
+    if not counts["train"] or not counts["val"]:
+        raise ValueError(f"Too few chips (train {counts['train']}, validation {counts['val']}): "
+                         "check that the checked roads are inside the grids and the imagery")
+
+    names = ["red", "green", "blue", "nir"][:len(bands)]
+    manifest = dict(channels=names, bands=list(bands), res=res, units=sr.linearUnitName,
+                    crs=sr.name, chip_px=chip_px, sigma=sigma, corridor=corridor,
+                    counts=counts, val_roads=sorted(str(o) for o, s in split_of.items()
+                                                    if s == "val"),
+                    created=time.strftime("%Y-%m-%d %H:%M"))
+    with open(os.path.join(out_folder, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+    msg(f"{counts['train']} training and {counts['val']} validation chips "
+        f"({skipped} skipped for missing imagery) in {out_folder}")
+
+    if local_fc:  # how far the local roads are from the checked ones, on validation roads
+        local = [c for _, _, parts, _ in read_lines(arcpy, local_fc, "OID@", sr) for c in parts]
+        idx = SegmentIndex(local)
+        base = {}
+        for split in ("train", "val"):
+            lines = [c for oid, c in truth if split_of[oid] == split]
+            pts, tans, _ = sample_lines(lines, 5.0)
+            if grid_polys is not None and len(pts):
+                ok = _points_in_polygons(pts, grid_polys)
+                pts, tans = pts[ok], tans[ok]
+            e = idx.distances(pts, tans)
+            e = e[~np.isnan(e)]
+            if len(e):
+                base[split] = dict(points=int(len(e)), median=float(np.median(e)),
+                                   mean=float(e.mean()), p90=float(np.percentile(e, 90)),
+                                   within1=float((e <= 1).mean()), within2=float((e <= 2).mean()))
+        with open(os.path.join(out_folder, "baseline.json"), "w") as f:
+            json.dump(dict(layer=str(local_fc), **base), f, indent=1)
+        if "val" in base:
+            v = base["val"]
+            msg(f"Local roads on the validation roads: median {v['median']:.2f}, worst 10% "
+                f"{v['p90']:.2f}, within 1 {v['within1']:.0%}, within 2 {v['within2']:.0%} "
+                "- the score to beat")
+    if make_zip:
+        z = shutil.make_archive(out_folder.rstrip("\\/"), "zip", out_folder)
+        msg(f"Zipped for upload: {z} ({os.path.getsize(z) / 1024 ** 2:,.0f} MB)")
+    return dict(counts=counts, manifest=manifest)
+
+
 # ======================================================================
 # arcgis_toolbox.py
 # ======================================================================
@@ -2436,7 +2671,7 @@ class Toolbox:
     def __init__(self):
         self.label = "Centerline Alignment"
         self.alias = "centerline"
-        self.tools = [AlignCenterlines, EvaluateAlignment]
+        self.tools = [AlignCenterlines, EvaluateAlignment, ExportTrainingChips]
 
 
 def _param(name, label, datatype, direction="Input", required=True, category=None, value=None):
@@ -2611,6 +2846,64 @@ class EvaluateAlignment:
                  out_points=p["out_points"].valueAsText,
                  spacing=float(p["spacing"].value or 5.0),
                  max_dist=float(p["max_dist"].value or 40.0))
+
+    def postExecute(self, parameters):
+        return
+
+
+class ExportTrainingChips:
+    def __init__(self):
+        self.label = "Export Training Chips (deep learning)"
+        self.description = (
+            "Cuts imagery chips around roads you checked by hand and labels where their true "
+            "centreline is, for training a centreline model in Google Colab (see "
+            "dl/README.md). Writes a zip to upload. Only reads the inputs.")
+        self.canRunInBackground = True
+
+    def getParameterInfo(self):
+        truth = _param("truth", "Checked roads (truth)", "GPFeatureLayer")
+        truth.filter.list = ["Polyline"]
+        where = _param("truth_where", "Only checked roads where (SQL)", "GPString",
+                       value="Validated = 'Yes'")
+        imagery = _param("imagery", "Imagery (raster, mosaic dataset, or folder of .tif tiles)",
+                         ["GPRasterLayer", "DERasterDataset", "DEMosaicDataset", "DEFolder"])
+        out = _param("out_folder", "Output folder for the chips", "DEFolder", direction="Output")
+        local = _param("local", "Local roads, to measure the score to beat (optional)",
+                       "GPFeatureLayer", required=False)
+        grids = _param("grids", "Only inside these grids (optional)", "GPFeatureLayer",
+                       required=False)
+        bands = _param("bands", "Imagery bands R,G,B,NIR", "GPString", category="Advanced",
+                       value="1,2,3,4")
+        chip = _param("chip_px", "Chip size (pixels)", "GPLong", category="Advanced", value=256)
+        step = _param("step", "Distance between chips along a road (map units)", "GPDouble",
+                      category="Advanced", value=100.0)
+        val = _param("val_fraction", "Share of roads kept for validation (0-1)", "GPDouble",
+                     category="Advanced", value=0.2)
+        return [truth, where, imagery, out, local, grids, bands, chip, step, val]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        p = {x.name: x for x in parameters}
+        export_training_chips(
+            arcpy,
+            truth_fc=p["truth"].valueAsText,
+            truth_where=p["truth_where"].valueAsText,
+            imagery=p["imagery"].valueAsText,
+            bands=[int(b) for b in (p["bands"].valueAsText or "1,2,3,4").split(",")],
+            out_folder=p["out_folder"].valueAsText,
+            local_fc=p["local"].valueAsText,
+            grids_fc=p["grids"].valueAsText,
+            chip_px=int(p["chip_px"].value or 256),
+            step=float(p["step"].value or 100.0),
+            val_fraction=float(p["val_fraction"].value or 0.2))
 
     def postExecute(self, parameters):
         return

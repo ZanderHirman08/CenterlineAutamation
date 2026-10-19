@@ -16,6 +16,7 @@ import numpy as np
 from scipy import ndimage
 
 from .chip import Chip
+from .chips import is_validation, lines_in_pixels, make_labels
 from .classifier import RoadClassifier, distance_to_roads
 from .config import ClassifierConfig, RefineConfig
 from .engine import (find_junctions, pick_spread, reconnect, refine_pieces,
@@ -723,3 +724,144 @@ def _write_check_points(arcpy, out_fc, sr, pts, cover, oids, errors):
             vals = [None if np.isnan(e[i]) else round(float(e[i]), 2) for e in errs]
             cur.insertRow([int(oids[i]), str(cover[i])] + vals
                           + [arcpy.PointGeometry(arcpy.Point(float(x), float(y)), sr)])
+
+
+# --------------------------------------------------------------------------- training chips
+
+def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_folder,
+                          grids_fc=None, local_fc=None, chip_px=256, step=100.0,
+                          val_fraction=0.2, sigma=1.0, corridor=30.0, min_valid=0.8,
+                          shard_size=200, seed=0, make_zip=True):
+    """Chips around hand-checked roads, for training a centreline model elsewhere
+    (see ``chips.py`` and ``dl/train_centerline.py``). Only reads the inputs."""
+    import shutil
+    msg = arcpy.AddMessage
+    reader = ArcTileReader(arcpy, imagery, list(bands))
+    sr, res = reader.sr, reader.res
+    rng = np.random.default_rng(seed)
+
+    truth, other = [], []
+    with arcpy.da.SearchCursor(truth_fc, ["OID@", "SHAPE@"], spatial_reference=sr) as cur:
+        everything = [(oid, _parts(g)) for oid, g in cur if g is not None]
+    try:
+        with arcpy.da.SearchCursor(truth_fc, ["OID@"], where_clause=truth_where or None) as cur:
+            checked = {oid for (oid,) in cur}
+    except Exception as e:
+        raise ValueError(f"Could not read the checked roads with the filter {truth_where!r}: {e}")
+    for oid, parts in everything:
+        (truth if oid in checked else other).extend((oid, c) for c in parts)
+    if not truth:
+        raise ValueError(f"No checked roads match {truth_where!r}. "
+                         + _value_hint(arcpy, truth_fc, truth_where))
+    grid_polys = [g for _, g, _ in read_grids(arcpy, grids_fc, "OID@", sr)] if grids_fc else None
+
+    os.makedirs(out_folder, exist_ok=True)
+    for f in os.listdir(out_folder):  # a fresh export replaces an old one
+        if f.startswith("shard_") or f in ("manifest.json", "baseline.json"):
+            os.remove(os.path.join(out_folder, f))
+
+    def ext(c):
+        return (c[:, 0].min(), c[:, 1].min(), c[:, 0].max(), c[:, 1].max())
+    truth_ext = [ext(c) for _, c in truth]
+    other_ext = [ext(c) for _, c in other]
+    half = chip_px * res / 2
+    split_of = {oid: ("val" if is_validation(oid, val_fraction, seed) else "train")
+                for oid, _ in truth}
+    buffers = {"train": [], "val": []}
+    counts = {"train": 0, "val": 0}
+    shards = {"train": 0, "val": 0}
+
+    def flush(split):
+        items = buffers[split]
+        if not items:
+            return
+        k = shards[split]
+        np.savez_compressed(
+            os.path.join(out_folder, f"shard_{split}_{k:03d}.npz"),
+            image=np.stack([i["image"] for i in items]),
+            heat=np.stack([i["heat"] for i in items]),
+            mask=np.stack([i["mask"] for i in items]),
+            x0=np.array([i["x0"] for i in items]), y0=np.array([i["y0"] for i in items]),
+            road=np.array([str(i["road"]) for i in items]))
+        with open(os.path.join(out_folder, f"shard_{split}_{k:03d}.json"), "w") as f:
+            json.dump([i["lines"] for i in items], f)
+        shards[split] += 1
+        buffers[split] = []
+
+    centres = []
+    for oid, c in truth:
+        pts, _, _ = sample_lines([c], step)
+        centres += [(oid, p) for p in pts]
+    if grid_polys is not None:
+        inside = _points_in_polygons(np.array([p for _, p in centres]), grid_polys)
+        centres = [cp for cp, ok in zip(centres, inside) if ok]
+    msg(f"{len(set(oid for oid, _ in truth))} checked roads, {len(other)} unchecked road parts; "
+        f"{len(centres)} chip positions every {step:g} {sr.linearUnitName}")
+    arcpy.SetProgressor("step", "Exporting training chips...", 0, max(1, len(centres)), 1)
+    skipped = 0
+    for k, (oid, p) in enumerate(centres):
+        arcpy.SetProgressorPosition(k)
+        jx, jy = rng.uniform(-0.25, 0.25, 2) * chip_px * res   # the road isn't always centred
+        x0, y0 = reader.snap(p[0] - half + jx, p[1] + half + jy)
+        chip = reader.read(x0, y0, chip_px, chip_px)
+        if chip.valid.mean() < min_valid:
+            skipped += 1
+            continue
+        b = chip.bounds
+        pad = corridor + 20
+        box = (b[0] - pad, b[1] - pad, b[2] + pad, b[3] + pad)
+        t_lines = [c for (_, c), e in zip(truth, truth_ext) if _overlaps(e, box)]
+        o_lines = [c for (_, c), e in zip(other, other_ext) if _overlaps(e, box)]
+        heat, mask = make_labels(x0, y0, res, chip.shape, t_lines, o_lines, sigma, corridor)
+        split = split_of[oid]
+        buffers[split].append(dict(
+            image=np.clip(chip.data, 0, 255).astype(np.uint8), heat=heat, mask=mask,
+            x0=x0, y0=y0, road=oid, lines=lines_in_pixels(x0, y0, res, t_lines)))
+        counts[split] += 1
+        if len(buffers[split]) >= shard_size:
+            flush(split)
+    for s in ("train", "val"):
+        flush(s)
+    arcpy.ResetProgressor()
+    if not counts["train"] or not counts["val"]:
+        raise ValueError(f"Too few chips (train {counts['train']}, validation {counts['val']}): "
+                         "check that the checked roads are inside the grids and the imagery")
+
+    names = ["red", "green", "blue", "nir"][:len(bands)]
+    manifest = dict(channels=names, bands=list(bands), res=res, units=sr.linearUnitName,
+                    crs=sr.name, chip_px=chip_px, sigma=sigma, corridor=corridor,
+                    counts=counts, val_roads=sorted(str(o) for o, s in split_of.items()
+                                                    if s == "val"),
+                    created=time.strftime("%Y-%m-%d %H:%M"))
+    with open(os.path.join(out_folder, "manifest.json"), "w") as f:
+        json.dump(manifest, f, indent=1)
+    msg(f"{counts['train']} training and {counts['val']} validation chips "
+        f"({skipped} skipped for missing imagery) in {out_folder}")
+
+    if local_fc:  # how far the local roads are from the checked ones, on validation roads
+        local = [c for _, _, parts, _ in read_lines(arcpy, local_fc, "OID@", sr) for c in parts]
+        idx = SegmentIndex(local)
+        base = {}
+        for split in ("train", "val"):
+            lines = [c for oid, c in truth if split_of[oid] == split]
+            pts, tans, _ = sample_lines(lines, 5.0)
+            if grid_polys is not None and len(pts):
+                ok = _points_in_polygons(pts, grid_polys)
+                pts, tans = pts[ok], tans[ok]
+            e = idx.distances(pts, tans)
+            e = e[~np.isnan(e)]
+            if len(e):
+                base[split] = dict(points=int(len(e)), median=float(np.median(e)),
+                                   mean=float(e.mean()), p90=float(np.percentile(e, 90)),
+                                   within1=float((e <= 1).mean()), within2=float((e <= 2).mean()))
+        with open(os.path.join(out_folder, "baseline.json"), "w") as f:
+            json.dump(dict(layer=str(local_fc), **base), f, indent=1)
+        if "val" in base:
+            v = base["val"]
+            msg(f"Local roads on the validation roads: median {v['median']:.2f}, worst 10% "
+                f"{v['p90']:.2f}, within 1 {v['within1']:.0%}, within 2 {v['within2']:.0%} "
+                "- the score to beat")
+    if make_zip:
+        z = shutil.make_archive(out_folder.rstrip("\\/"), "zip", out_folder)
+        msg(f"Zipped for upload: {z} ({os.path.getsize(z) / 1024 ** 2:,.0f} MB)")
+    return dict(counts=counts, manifest=manifest)

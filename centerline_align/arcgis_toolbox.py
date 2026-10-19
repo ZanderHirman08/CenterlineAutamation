@@ -1,7 +1,7 @@
 """ArcGIS Pro Python toolbox definition (becomes ``arcgis/CenterlineAlign.pyt``)."""
 import arcpy
 
-from .arcgis_impl import evaluate, run
+from .arcgis_impl import evaluate, export_training_chips, run
 from .config import ClassifierConfig, RefineConfig
 
 
@@ -9,7 +9,7 @@ class Toolbox:
     def __init__(self):
         self.label = "Centerline Alignment"
         self.alias = "centerline"
-        self.tools = [AlignCenterlines, EvaluateAlignment]
+        self.tools = [AlignCenterlines, EvaluateAlignment, ExportTrainingChips]
 
 
 def _param(name, label, datatype, direction="Input", required=True, category=None, value=None):
@@ -184,6 +184,64 @@ class EvaluateAlignment:
                  out_points=p["out_points"].valueAsText,
                  spacing=float(p["spacing"].value or 5.0),
                  max_dist=float(p["max_dist"].value or 40.0))
+
+    def postExecute(self, parameters):
+        return
+
+
+class ExportTrainingChips:
+    def __init__(self):
+        self.label = "Export Training Chips (deep learning)"
+        self.description = (
+            "Cuts imagery chips around roads you checked by hand and labels where their true "
+            "centreline is, for training a centreline model in Google Colab (see "
+            "dl/README.md). Writes a zip to upload. Only reads the inputs.")
+        self.canRunInBackground = True
+
+    def getParameterInfo(self):
+        truth = _param("truth", "Checked roads (truth)", "GPFeatureLayer")
+        truth.filter.list = ["Polyline"]
+        where = _param("truth_where", "Only checked roads where (SQL)", "GPString",
+                       value="Validated = 'Yes'")
+        imagery = _param("imagery", "Imagery (raster, mosaic dataset, or folder of .tif tiles)",
+                         ["GPRasterLayer", "DERasterDataset", "DEMosaicDataset", "DEFolder"])
+        out = _param("out_folder", "Output folder for the chips", "DEFolder", direction="Output")
+        local = _param("local", "Local roads, to measure the score to beat (optional)",
+                       "GPFeatureLayer", required=False)
+        grids = _param("grids", "Only inside these grids (optional)", "GPFeatureLayer",
+                       required=False)
+        bands = _param("bands", "Imagery bands R,G,B,NIR", "GPString", category="Advanced",
+                       value="1,2,3,4")
+        chip = _param("chip_px", "Chip size (pixels)", "GPLong", category="Advanced", value=256)
+        step = _param("step", "Distance between chips along a road (map units)", "GPDouble",
+                      category="Advanced", value=100.0)
+        val = _param("val_fraction", "Share of roads kept for validation (0-1)", "GPDouble",
+                     category="Advanced", value=0.2)
+        return [truth, where, imagery, out, local, grids, bands, chip, step, val]
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        p = {x.name: x for x in parameters}
+        export_training_chips(
+            arcpy,
+            truth_fc=p["truth"].valueAsText,
+            truth_where=p["truth_where"].valueAsText,
+            imagery=p["imagery"].valueAsText,
+            bands=[int(b) for b in (p["bands"].valueAsText or "1,2,3,4").split(",")],
+            out_folder=p["out_folder"].valueAsText,
+            local_fc=p["local"].valueAsText,
+            grids_fc=p["grids"].valueAsText,
+            chip_px=int(p["chip_px"].value or 256),
+            step=float(p["step"].value or 100.0),
+            val_fraction=float(p["val_fraction"].value or 0.2))
 
     def postExecute(self, parameters):
         return
