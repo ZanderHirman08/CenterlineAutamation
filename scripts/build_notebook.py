@@ -73,30 +73,57 @@ ax[1].set_title("validation median error (ft)"); ax[1].set_xlabel("epoch"); ax[1
 plt.show()
 """),
         md("""
-## Look at a few validation chips
+## Look at validation chips
 
-Left: imagery. Middle: predicted ridge. Right: the checked line (red) on the prediction.
+Left: imagery with your checked line (red). Middle: the model's prediction
+(bright = centreline). Right: your line on the prediction. First 4 spread
+through the validation set, then the 4 where the model is furthest off.
 """),
         code("""
-import json, numpy as np
+import numpy as np
 _, data = tc.load_chips("/content/chips")
+val = data["val"]
 model = tc.build_model(len(info["mean"]), info["config"]["encoder"], None)
 model.load_state_dict(torch.load(MODEL_FOLDER + "/best_model.pt", map_location="cpu"))
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 model.to(dev)
-pick = np.linspace(0, len(data["val"]["image"]) - 1, 4).astype(int)
-probs = tc.predict_probs(model, data["val"]["image"][pick], info["mean"], info["std"], dev)
-for k, i in enumerate(pick):
-    fig, ax = plt.subplots(1, 3, figsize=(12, 4))
-    ax[0].imshow(np.moveaxis(data["val"]["image"][i][:3], 0, -1))
-    ax[1].imshow(probs[k], vmin=0, vmax=1)
-    ax[2].imshow(probs[k], vmin=0, vmax=1, cmap="gray")
-    for ln in data["val"]["lines"][i]:
+res = info["res"]
+chip_err = []
+for i in range(0, len(val["image"]), 64):
+    probs = tc.predict_probs(model, val["image"][i:i + 64], info["mean"], info["std"], dev)
+    for k, p in enumerate(probs):
+        e = tc.crest_errors(p, val["lines"][i + k], res, mask=val["mask"][i + k])
+        e = e[~np.isnan(e)]
+        chip_err.append(np.median(e) if len(e) else np.nan)
+chip_err = np.array(chip_err)
+has = np.flatnonzero(~np.isnan(chip_err))
+spread = has[np.linspace(0, len(has) - 1, 4).astype(int)]
+worst = has[np.argsort(chip_err[has])[-4:][::-1]]
+
+def show(i):
+    p = tc.predict_probs(model, val["image"][i:i + 1], info["mean"], info["std"], dev)[0]
+    h, w = p.shape
+    fig, ax = plt.subplots(1, 3, figsize=(13, 4.3))
+    ax[0].imshow(np.moveaxis(val["image"][i][:3], 0, -1))
+    ax[1].imshow(p, vmin=0, vmax=1)
+    ax[2].imshow(p, vmin=0, vmax=1, cmap="gray")
+    for ln in val["lines"][i]:
         ln = np.asarray(ln)
-        ax[2].plot(ln[:, 0], ln[:, 1], "r-", lw=0.8)
+        for a in (ax[0], ax[2]):
+            a.plot(ln[:, 0], ln[:, 1], "r-", lw=1)
     for a in ax:
+        a.set_xlim(-0.5, w - 0.5)
+        a.set_ylim(h - 0.5, -0.5)
         a.axis("off")
+    fig.suptitle(f"chip {i}: median error {chip_err[i]:.2f} ft")
     plt.show()
+
+print("Spread through the validation set:")
+for i in spread:
+    show(i)
+print("Where the model is furthest from your line:")
+for i in worst:
+    show(i)
 """),
     ]
     nb = dict(cells=cells, nbformat=4, nbformat_minor=5,
