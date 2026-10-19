@@ -16,6 +16,8 @@ so the classifier is trained with them).
 
 * Needs ArcGIS Pro only (any licence): Create LAS Dataset, LAS Dataset To
   Raster and Project Raster.
+* GRID_IDS limits the run to a few grids (their OBJECTIDs), to try LiDAR on
+  the test grids first (a few minutes); set it to None for every grid.
 * Grids already done are skipped, so it can be stopped and run again. With
   DRY_RUN = True it only checks the inputs and reports what it would make.
 * Takes a while (roughly half a minute per grid): run it overnight.
@@ -32,6 +34,7 @@ LAZ_FOLDER = r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\LAZ"
 GRIDS = r"C:\Users\zhirman\Desktop\Centerline\Glynn\data\Inputs.gdb\Glynn_Grid_1mi"
 IMAGERY = r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\tiles"  # tile or folder
 OUT_FOLDER = r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\lidar_layers"
+GRID_IDS = [7, 11, 16, 92, 284, 285]  # grid OBJECTIDs to make; None = every grid
 CELL = 3.0          # cell size, in the imagery's units (feet)
 MARGIN = 150.0      # extra around each grid, in the imagery's units
 DRY_RUN = True      # True: only check the inputs and count the grids to do
@@ -61,7 +64,7 @@ def grid_paths(out_folder, oid):
 
 
 def make_lidar_layers(laz_folder, grids, imagery, out_folder, cell=3.0, margin=150.0,
-                      dry_run=False):
+                      dry_run=False, grid_ids=None):
     sr_img = arcpy.Describe(first_raster(imagery)).spatialReference
     if sr_img is None or sr_img.type != "Projected":
         raise ValueError("The imagery must be in a projected coordinate system")
@@ -71,6 +74,12 @@ def make_lidar_layers(laz_folder, grids, imagery, out_folder, cell=3.0, margin=1
         raise ValueError(f"No .laz / .las files in {laz_folder}")
     with arcpy.da.SearchCursor(grids, ["OID@", "SHAPE@"], spatial_reference=sr_img) as cur:
         cells = [(oid, g) for oid, g in cur if g is not None]
+    if grid_ids is not None:
+        wanted = {int(i) for i in grid_ids}
+        missing = sorted(wanted - {oid for oid, _ in cells})
+        if missing:
+            raise ValueError(f"Grid OBJECTID(s) not found in {grids}: {missing}")
+        cells = [(oid, g) for oid, g in cells if oid in wanted]
     todo = [(oid, g) for oid, g in cells
             if not all(os.path.exists(p) for p in grid_paths(out_folder, oid).values())]
     say(f"{n_laz} LiDAR files, {len(cells)} grids; {len(cells) - len(todo)} already done, "
@@ -161,4 +170,4 @@ def make_lidar_layers(laz_folder, grids, imagery, out_folder, cell=3.0, margin=1
     return dict(todo=[o for o, _ in todo], done=done, failed=failed)
 
 
-make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN)
+make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN, GRID_IDS)

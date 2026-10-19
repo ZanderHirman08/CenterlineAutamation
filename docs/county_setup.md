@@ -175,7 +175,10 @@ pavement width, then every grid is refined again.
 2. Edit and run `make_lidar_layers.py` in Pro's Python window: first with
    `DRY_RUN = True`, then `False`. It makes three rasters per grid (ground
    intensity, ground elevation, surface elevation) in the imagery's coordinate
-   system, and skips grids already done if stopped and restarted. Plan an
-   overnight run.
+   system, and skips grids already done if stopped and restarted. Set
+   `GRID_IDS` to the grids with checked roads to try it in a few minutes
+   first; `GRID_IDS = None` makes every grid (plan an overnight run).
 3. In the toolbox, set *LiDAR layers folder* to its output folder and use a
    **new** work folder, so the classifier is trained with the LiDAR.
+4. Evaluate it against the run without LiDAR on the same grids (section 4).
+   It should help most in the PARTIAL and CANOPY rows.

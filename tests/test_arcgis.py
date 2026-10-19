@@ -432,7 +432,8 @@ def test_make_lidar_layers_flow(monkeypatch, tiled_scene, tmp_path):
     import types
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
     src = (ROOT / "arcgis" / "make_lidar_layers.py").read_text()
-    call = "make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN)"
+    call = ("make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN, "
+            "GRID_IDS)")
     assert src.rstrip().endswith(call)
     ns = {"__name__": "make_lidar_layers"}
     exec(compile(src.rstrip()[: -len(call)], "make_lidar_layers.py", "exec"), ns)
@@ -477,6 +478,12 @@ def test_make_lidar_layers_flow(monkeypatch, tiled_scene, tmp_path):
     dry = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out),
                dry_run=True)
     assert dry["todo"] == [1, 2] and not out.exists()
+    some = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out),
+                dry_run=True, grid_ids=[2])
+    assert some["todo"] == [2]
+    with pytest.raises(ValueError, match="not found"):
+        make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out),
+             dry_run=True, grid_ids=[2, 99])
     r = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out))
     assert r["done"] == [1] and [o for o, _ in r["failed"]] == [2]
     assert sorted(p.name for p in (out / "dtm").iterdir()) == ["g1.tif"]
