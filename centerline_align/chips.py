@@ -121,3 +121,39 @@ def lines_in_pixels(x0, y0, res, lines, pad: float = 0.0):
         row = (y0 - c[:, 1]) / res - 0.5
         out.append(np.column_stack([col, row]).round(2).tolist())
     return out
+
+
+def self_crossings(c) -> list:
+    """Where a line crosses or touches itself: [(point, length of the loop between)].
+    A closed line (start = end) counts as one crossing at its start."""
+    c = as_coords(c)
+    out = []
+    if len(c) < 3:
+        return out
+    seglen = np.hypot(*np.diff(c, axis=0).T)
+    s = np.concatenate([[0.0], np.cumsum(seglen)])
+    if np.hypot(*(c[-1] - c[0])) < 1.0:
+        out.append((c[0].copy(), float(s[-1])))
+    a, b = c[:-1], c[1:]
+    d = b - a
+    n = len(a)
+    for i in range(n - 2):
+        j = np.arange(i + 2, n)
+        if i == 0 and out:
+            j = j[j < n - 1]  # the closing segment meets the first by design
+        if not len(j):
+            continue
+        p, r = a[i], d[i]
+        q, sv = a[j], d[j]
+        den = r[0] * sv[:, 1] - r[1] * sv[:, 0]
+        ok = np.abs(den) > 1e-12
+        qp = q - p
+        t = np.where(ok, (qp[:, 0] * sv[:, 1] - qp[:, 1] * sv[:, 0]) / np.where(ok, den, 1), -1)
+        u = np.where(ok, (qp[:, 0] * r[1] - qp[:, 1] * r[0]) / np.where(ok, den, 1), -1)
+        hit = ok & (t >= 0) & (t <= 1) & (u >= 0) & (u <= 1)
+        for k in np.flatnonzero(hit):
+            jj = j[k]
+            pos_i = s[i] + t[k] * seglen[i]
+            pos_j = s[jj] + u[k] * seglen[jj]
+            out.append((p + t[k] * r, float(pos_j - pos_i)))
+    return out

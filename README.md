@@ -144,7 +144,8 @@ Google Drive\Centerline\
 | **Align Centerlines to Imagery** | The current imagery-classifier method. It is accurate to about 1.5 ft, which is no better than the county layer. It will be switched to the model once the model wins. |
 
 What the export does with your roads:
-* **Ends of lines:** 40 ft at each end is left out, because lines bend through junctions (manual Examples 2–4).
+* **Ends of lines:** 40 ft at each end is left out, because lines bend through junctions (manual Examples 2–4). Where a road crosses itself (a "P" shape) the crossing is treated the same way.
+* **Manual rules:** roads with AbandonedRoad/PrivateRoad = 'Yes', roads whose RC_Comments mention construction, and existing cul-de-sacs left as circles (loops under 400 ft) are left out of training and of Evaluate. Roundabouts (ROUTE_ID with TEMP) follow the pavement and are kept. Missing roads you add are included, since they are set to Validated = 'Yes'.
 * **Roads you haven't checked:** pixels near them are left out, so the model is never told "no road" there.
 * **Validation:** 20% of the ground (1000 ft blocks) is kept for testing and never trained on, so the score is honest.
 * **Traced roads:** used for training but not scored, since the county layer would win there by default.

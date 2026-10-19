@@ -549,3 +549,52 @@ def test_training_day_cycle(toolbox, tiled_scene, tmp_path):
     store = json.loads((folder / "training_roads.json").read_text())["roads"]
     assert store["2"]["changed"] == 0 and store["2"]["shift_max"] < 0.5
     assert store["6"]["day"] == "2026-10-19" and store["6"]["original_known"]
+
+
+def test_manual_rules_in_export_and_evaluate(toolbox, tiled_scene, tmp_path):
+    """Construction notes, abandoned roads and circular cul-de-sacs are left out of training
+    and scoring; roundabouts (TEMP route id) are kept (REVAMP manual 3.2 and FAQ)."""
+    import json
+    from shapely.geometry import LineString
+    df = gpd.read_file(_truth_pieces(tmp_path))
+    df["ROUTE_ID"] = [f"R{i}" for i in range(len(df))]
+    df["RC_Comments"] = ""
+    df["AbandonedRoad"] = "No"
+    df.loc[0, "RC_Comments"] = "Road under Construction"
+    df.loc[1, "AbandonedRoad"] = "Yes"
+    t = np.linspace(0, 2 * np.pi, 33)
+    x, y = synthetic.X0 + 1300, synthetic.MID + 250
+    ring = LineString(np.column_stack([x + 25 * np.cos(t), y + 25 * np.sin(t)]))
+    extra = gpd.GeoDataFrame(
+        {"Validated": ["Yes", "Yes"], "ROUTE_ID": ["CULDESAC1", "TEMP-1"],
+         "RC_Comments": ["", ""], "AbandonedRoad": ["No", "No"]},
+        geometry=[ring, LineString(np.column_stack([x - 200 + 25 * np.cos(t),
+                                                    y + 25 * np.sin(t)]))], crs=df.crs)
+    roads = tmp_path / "rules.gpkg"
+    pd.concat([df, extra], ignore_index=True).to_file(roads)
+
+    tool, params, p = _tool(toolbox, "ExportTrainingChips")
+    p["truth"].value = str(roads)
+    p["imagery"].value = str(tiled_scene["tiles"])
+    p["out_folder"].value = str(tmp_path / "chips")
+    p["val_fraction"].value = 0.3
+    p["block"].value = 300.0
+    p["chip_px"].value = 128
+    fake_arcpy.messages.clear()
+    tool.execute(params, None)
+    text = "\n".join(fake_arcpy.messages)
+    assert ("Left out by the REVAMP manual rules: 1 abandoned, 1 construction, "
+            "1 cul-de-sac circle") in text, text
+    man = json.loads((tmp_path / "chips" / "manifest.json").read_text())
+    checked = int((pd.concat([df, extra]).Validated == "Yes").sum())
+    assert man["roads"] == checked - 3          # the roundabout stays in
+
+    tool = _by_name(toolbox, "EvaluateAlignment")
+    params = tool.getParameterInfo()
+    q = {x.name: x for x in params}
+    q["truth"].value = str(roads)
+    q["candidates"].value = str(tiled_scene["roads"])
+    fake_arcpy.messages.clear()
+    tool.execute(params, None)
+    text = "\n".join(fake_arcpy.messages)
+    assert "1 cul-de-sac circle" in text and f"{checked - 3} checked roads" in text

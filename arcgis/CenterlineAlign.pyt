@@ -1419,6 +1419,42 @@ def lines_in_pixels(x0, y0, res, lines, pad: float = 0.0):
     return out
 
 
+def self_crossings(c) -> list:
+    """Where a line crosses or touches itself: [(point, length of the loop between)].
+    A closed line (start = end) counts as one crossing at its start."""
+    c = as_coords(c)
+    out = []
+    if len(c) < 3:
+        return out
+    seglen = np.hypot(*np.diff(c, axis=0).T)
+    s = np.concatenate([[0.0], np.cumsum(seglen)])
+    if np.hypot(*(c[-1] - c[0])) < 1.0:
+        out.append((c[0].copy(), float(s[-1])))
+    a, b = c[:-1], c[1:]
+    d = b - a
+    n = len(a)
+    for i in range(n - 2):
+        j = np.arange(i + 2, n)
+        if i == 0 and out:
+            j = j[j < n - 1]  # the closing segment meets the first by design
+        if not len(j):
+            continue
+        p, r = a[i], d[i]
+        q, sv = a[j], d[j]
+        den = r[0] * sv[:, 1] - r[1] * sv[:, 0]
+        ok = np.abs(den) > 1e-12
+        qp = q - p
+        t = np.where(ok, (qp[:, 0] * sv[:, 1] - qp[:, 1] * sv[:, 0]) / np.where(ok, den, 1), -1)
+        u = np.where(ok, (qp[:, 0] * r[1] - qp[:, 1] * r[0]) / np.where(ok, den, 1), -1)
+        hit = ok & (t >= 0) & (t <= 1) & (u >= 0) & (u <= 1)
+        for k in np.flatnonzero(hit):
+            jj = j[k]
+            pos_i = s[i] + t[k] * seglen[i]
+            pos_j = s[jj] + u[k] * seglen[jj]
+            out.append((p + t[k] * r, float(pos_j - pos_i)))
+    return out
+
+
 # ======================================================================
 # arcgis_impl.py
 # ======================================================================
@@ -1876,6 +1912,13 @@ def evaluate(arcpy, *, truth_fc, truth_where, candidates, imagery=None, bands=(1
     if not truth:
         raise ValueError(f"No checked roads match {truth_where!r}. "
                          + _value_hint(arcpy, truth_fc, truth_where))
+    reasons, temp, _ = road_rules(arcpy, truth_fc)
+    small, crossings = loop_rules(list(zip(oids, truth)), temp)
+    _summarize_rules(msg, reasons, small, set(oids))
+    keep = [k for k, o in enumerate(oids) if o not in reasons and o not in small]
+    truth, oids = [truth[k] for k in keep], [oids[k] for k in keep]
+    if not truth:
+        raise ValueError("Every checked road was left out by the manual rules")
     msg(f"{len(set(oids))} checked roads ({len(truth)} parts) from {truth_fc}"
         + (f" where {truth_where}" if truth_where else ""))
 
@@ -1898,6 +1941,8 @@ def evaluate(arcpy, *, truth_fc, truth_where, candidates, imagery=None, bands=(1
     if reader is not None:
         cover = _cover_classes(reader, pts, line_idx)
     junctions = find_junctions(every)
+    if crossings:  # a road crossing itself is an intersection too
+        junctions = np.vstack([junctions.reshape(-1, 2), np.array(crossings)])
     cover[near_junctions(pts, junctions, junction_dist)] = "intersection"
     for line in eval_report(errors, cover,
                             "ft" if "foot" in units.lower() or "feet" in units.lower() else ""):
@@ -1906,6 +1951,71 @@ def evaluate(arcpy, *, truth_fc, truth_where, candidates, imagery=None, bands=(1
         _write_check_points(arcpy, out_points, sr, pts, cover, np.asarray(oids)[line_idx], errors)
         msg(f"Check points written to {out_points}")
     return dict(errors=errors, cover=cover)
+
+
+# --------------------------------------------------------------------------- manual rules
+
+def _norm(name) -> str:
+    return str(name).lower().replace("_", "").replace(" ", "")
+
+
+def road_rules(arcpy, fc):
+    """Roads the REVAMP manual says not to learn from or score on, and roundabouts.
+
+    Returns ({oid: reason}, {oids with a TEMP route id (roundabouts)}, [fields used]):
+    AbandonedRoad / PrivateRoad = 'Yes' (there may be no pavement) and RC_Comments
+    mentioning construction (the imagery may not show the road as validated).
+    Field names are matched ignoring case, underscores and spaces."""
+    names = {_norm(f.name): f.name for f in arcpy.ListFields(fc)}
+    yes_fields = [(names[k], why) for k, why in (("abandonedroad", "abandoned"),
+                                                 ("privateroad", "private")) if k in names]
+    comment = names.get("rccomments")
+    route = names.get("routeid")
+    fields = [f for f, _ in yes_fields] + [f for f in (comment, route) if f]
+    reasons, temp = {}, set()
+    if not fields:
+        return reasons, temp, fields
+    with arcpy.da.SearchCursor(fc, ["OID@"] + fields) as cur:
+        for row in cur:
+            oid, vals = int(row[0]), dict(zip(fields, row[1:]))
+            for f, why in yes_fields:
+                if str(vals[f]).strip().lower() == "yes":
+                    reasons.setdefault(oid, why)
+            if comment and "construct" in str(vals[comment] or "").lower():
+                reasons.setdefault(oid, "construction")
+            if route and "temp" in str(vals[route] or "").lower():
+                temp.add(oid)
+    return reasons, temp, fields
+
+
+LOOP_MAX = 400.0   # a loop shorter than this (map units) is a cul-de-sac circle, not a road
+
+
+def loop_rules(lines, temp, loop_max=LOOP_MAX):
+    """(oids that are small loops - circular cul-de-sacs left as circles, manual 3.2 -
+    and points where longer roads cross themselves). Roundabouts (``temp``) are kept
+    and their crossings ignored. ``lines``: [(oid, coords)]."""
+    small, points = set(), []
+    for oid, c in lines:
+        if oid in temp:
+            continue
+        for pt, loop_len in self_crossings(c):
+            if loop_len < loop_max:
+                small.add(oid)
+            else:
+                points.append(pt)
+    return small, points
+
+
+def _summarize_rules(msg, reasons, small, checked):
+    counts = {}
+    for o in checked:
+        why = "cul-de-sac circle" if o in small else reasons.get(o)
+        if why:
+            counts[why] = counts.get(why, 0) + 1
+    if counts:
+        msg("Left out by the REVAMP manual rules: " + ", ".join(
+            f"{n} {why}" for why, n in sorted(counts.items())))
 
 
 def _value_hint(arcpy, fc, where) -> str:
@@ -2030,6 +2140,12 @@ Following the REVAMP Phase 6 manual:
 
 * Roads marked abandoned or private (``AbandonedRoad`` / ``PrivateRoad`` = 'Yes',
   when the layer has those fields) are never used: there may be no pavement.
+  Neither are roads whose ``RC_Comments`` mention construction (the imagery may
+  not show the road as validated), nor existing cul-de-sacs left as circles
+  (loops under 400 ft): a circle around the bulb is not a pavement centreline.
+  Roundabouts (``ROUTE_ID`` with TEMP) follow the pavement and are kept.
+* Where a road crosses itself (a "P"-shaped road) the crossing is treated like
+  an intersection.
 * The ends of every line are left out of the training targets: lines are split
   at intersections, and the manual snaps them simply and bends T-intersections
   along the turn, so near a junction a line is not a pavement centre.
@@ -2109,15 +2225,9 @@ def _read_roads(arcpy, roads_fc, where=None, sr=None):
 
 def _excluded(arcpy, roads_fc):
     """OIDs marked abandoned or private ('Yes'), and the fields that said so."""
-    fields = [f.name for f in arcpy.ListFields(roads_fc)
-              if f.name.lower().replace("_", "").replace(" ", "") in EXCLUDE_FIELDS]
-    out = set()
-    if fields:
-        with arcpy.da.SearchCursor(roads_fc, ["OID@"] + fields) as cur:
-            for row in cur:
-                if any(str(v).strip().lower() == "yes" for v in row[1:]):
-                    out.add(int(row[0]))
-    return out, fields
+    reasons, _, fields = road_rules(arcpy, roads_fc)
+    out = {o for o, why in reasons.items() if why in ("abandoned", "private")}
+    return out, [f for f in fields if _norm(f) in EXCLUDE_FIELDS]
 
 
 def snapshot(arcpy, *, roads_fc, checked_where, training_folder, today=None):
@@ -2335,9 +2445,11 @@ def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_f
     if not checked:
         raise ValueError(f"No checked roads match {truth_where!r}. "
                          + _value_hint(arcpy, truth_fc, truth_where))
-    excluded, ex_fields = _excluded(arcpy, truth_fc)
-    if excluded & checked:
-        msg(f"{len(excluded & checked)} checked road(s) left out: {', '.join(ex_fields)} = 'Yes'")
+    reasons, temp, _ = road_rules(arcpy, truth_fc)
+    small, crossings = loop_rules([(o, c) for o, parts in everything if o in checked
+                                   for c in parts], temp)
+    _summarize_rules(msg, reasons, small, checked)
+    excluded = set(reasons) | small
     info = {}
     if training_folder:
         info = {int(k): v for k, v in _load(training_folder, TRAINING).get("roads", {}).items()}
@@ -2364,7 +2476,7 @@ def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_f
 
     truth_ext = [_ext(c) for _, c in truth]
     other_ext = [_ext(c) for _, c in other]
-    ends = np.array([p for _, c in truth for p in (c[0], c[-1])])
+    ends = np.array([p for _, c in truth for p in (c[0], c[-1])] + list(crossings))
     scored = [(o, trim_ends(c, end_trim)) for o, c in truth if o not in traced]
     scored = [(o, c) for o, c in scored if c is not None]
     scored_ext = [_ext(c) for _, c in scored]

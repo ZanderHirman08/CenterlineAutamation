@@ -21,6 +21,7 @@ from .engine import (find_junctions, pick_spread, reconnect, refine_pieces,
                      region_probability, summarize, train_classifier)
 from .evaluate import (SegmentIndex, cover_from_chip, eval_report, near_junctions,
                        sample_lines)
+from .chips import self_crossings
 from .geom import cumlen, interpolate
 
 TILE_EXTS = (".tif", ".tiff", ".img", ".jp2", ".sid")
@@ -460,6 +461,13 @@ def evaluate(arcpy, *, truth_fc, truth_where, candidates, imagery=None, bands=(1
     if not truth:
         raise ValueError(f"No checked roads match {truth_where!r}. "
                          + _value_hint(arcpy, truth_fc, truth_where))
+    reasons, temp, _ = road_rules(arcpy, truth_fc)
+    small, crossings = loop_rules(list(zip(oids, truth)), temp)
+    _summarize_rules(msg, reasons, small, set(oids))
+    keep = [k for k, o in enumerate(oids) if o not in reasons and o not in small]
+    truth, oids = [truth[k] for k in keep], [oids[k] for k in keep]
+    if not truth:
+        raise ValueError("Every checked road was left out by the manual rules")
     msg(f"{len(set(oids))} checked roads ({len(truth)} parts) from {truth_fc}"
         + (f" where {truth_where}" if truth_where else ""))
 
@@ -482,6 +490,8 @@ def evaluate(arcpy, *, truth_fc, truth_where, candidates, imagery=None, bands=(1
     if reader is not None:
         cover = _cover_classes(reader, pts, line_idx)
     junctions = find_junctions(every)
+    if crossings:  # a road crossing itself is an intersection too
+        junctions = np.vstack([junctions.reshape(-1, 2), np.array(crossings)])
     cover[near_junctions(pts, junctions, junction_dist)] = "intersection"
     for line in eval_report(errors, cover,
                             "ft" if "foot" in units.lower() or "feet" in units.lower() else ""):
@@ -490,6 +500,71 @@ def evaluate(arcpy, *, truth_fc, truth_where, candidates, imagery=None, bands=(1
         _write_check_points(arcpy, out_points, sr, pts, cover, np.asarray(oids)[line_idx], errors)
         msg(f"Check points written to {out_points}")
     return dict(errors=errors, cover=cover)
+
+
+# --------------------------------------------------------------------------- manual rules
+
+def _norm(name) -> str:
+    return str(name).lower().replace("_", "").replace(" ", "")
+
+
+def road_rules(arcpy, fc):
+    """Roads the REVAMP manual says not to learn from or score on, and roundabouts.
+
+    Returns ({oid: reason}, {oids with a TEMP route id (roundabouts)}, [fields used]):
+    AbandonedRoad / PrivateRoad = 'Yes' (there may be no pavement) and RC_Comments
+    mentioning construction (the imagery may not show the road as validated).
+    Field names are matched ignoring case, underscores and spaces."""
+    names = {_norm(f.name): f.name for f in arcpy.ListFields(fc)}
+    yes_fields = [(names[k], why) for k, why in (("abandonedroad", "abandoned"),
+                                                 ("privateroad", "private")) if k in names]
+    comment = names.get("rccomments")
+    route = names.get("routeid")
+    fields = [f for f, _ in yes_fields] + [f for f in (comment, route) if f]
+    reasons, temp = {}, set()
+    if not fields:
+        return reasons, temp, fields
+    with arcpy.da.SearchCursor(fc, ["OID@"] + fields) as cur:
+        for row in cur:
+            oid, vals = int(row[0]), dict(zip(fields, row[1:]))
+            for f, why in yes_fields:
+                if str(vals[f]).strip().lower() == "yes":
+                    reasons.setdefault(oid, why)
+            if comment and "construct" in str(vals[comment] or "").lower():
+                reasons.setdefault(oid, "construction")
+            if route and "temp" in str(vals[route] or "").lower():
+                temp.add(oid)
+    return reasons, temp, fields
+
+
+LOOP_MAX = 400.0   # a loop shorter than this (map units) is a cul-de-sac circle, not a road
+
+
+def loop_rules(lines, temp, loop_max=LOOP_MAX):
+    """(oids that are small loops - circular cul-de-sacs left as circles, manual 3.2 -
+    and points where longer roads cross themselves). Roundabouts (``temp``) are kept
+    and their crossings ignored. ``lines``: [(oid, coords)]."""
+    small, points = set(), []
+    for oid, c in lines:
+        if oid in temp:
+            continue
+        for pt, loop_len in self_crossings(c):
+            if loop_len < loop_max:
+                small.add(oid)
+            else:
+                points.append(pt)
+    return small, points
+
+
+def _summarize_rules(msg, reasons, small, checked):
+    counts = {}
+    for o in checked:
+        why = "cul-de-sac circle" if o in small else reasons.get(o)
+        if why:
+            counts[why] = counts.get(why, 0) + 1
+    if counts:
+        msg("Left out by the REVAMP manual rules: " + ", ".join(
+            f"{n} {why}" for why, n in sorted(counts.items())))
 
 
 def _value_hint(arcpy, fc, where) -> str:

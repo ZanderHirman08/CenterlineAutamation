@@ -85,3 +85,19 @@ def test_flagged_lines_keep_original_geometry():
     assert np.array_equal(r.coords, line)
     r2 = refine_line(line, nothing, RefineConfig(keep_flagged=False), 0.5)
     assert r2.moved
+
+
+def test_self_crossings():
+    """Closed cul-de-sac circles and P-shaped roads are found, with their loop length."""
+    from centerline_align.chips import self_crossings
+    t = np.linspace(0, 2 * np.pi, 41)
+    circle = np.column_stack([30 * np.cos(t), 30 * np.sin(t)])          # closed, ~188 ft
+    (pt, length), = self_crossings(circle)
+    assert np.allclose(pt, [30, 0]) and 180 < length < 190
+    # a "P": stem up, then a 600 ft loop back across the stem
+    loop = np.column_stack([100 * np.cos(t[::-1] + np.pi) + 100, 100 * np.sin(t[::-1] + np.pi)
+                            + 300])
+    p_road = np.vstack([[[0.0, 0.0]], loop[:30], [[-20.0, 300.0]]])
+    hits = self_crossings(p_road)
+    assert len(hits) == 1 and hits[0][1] > 400
+    assert self_crossings(np.array([[0.0, 0.0], [100.0, 0.0], [200.0, 50.0]])) == []
