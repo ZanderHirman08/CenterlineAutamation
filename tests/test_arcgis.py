@@ -433,7 +433,7 @@ def test_make_lidar_layers_flow(monkeypatch, tiled_scene, tmp_path):
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
     src = (ROOT / "arcgis" / "make_lidar_layers.py").read_text()
     call = ("make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN, "
-            "CONVERT_LAZ,\n                  ZLAS_FOLDER)")
+            "CONVERT_LAZ,\n                  ZLAS_FOLDER, LIDAR_WKID, LIDAR_VERT_WKID)")
     assert src.rstrip().endswith(call)
     ns = {"__name__": "make_lidar_layers"}
     exec(compile(src.rstrip()[: -len(call)], "make_lidar_layers.py", "exec"), ns)
@@ -529,7 +529,17 @@ def test_make_lidar_layers_converts_nearby_laz(monkeypatch, tiled_scene, tmp_pat
     assert sorted(ns["near_grids"]([str(laz / f) for f in near + [far]],
                                    [(1, g) for g in _grid_geoms(fake_arcpy, tiled_scene)],
                                    150.0)) == sorted(str(laz / f) for f in near)
-    assert ns["convert_to_zlas"]([str(laz / f) for f in near], str(zl)) == []
+    monkeypatch.setattr(fake_arcpy, "SpatialReference",
+                        lambda *a: types.SimpleNamespace(wkids=a))
+    seen = []
+    real_convert = convert
+
+    def convert_sr(path, folder, **k):
+        seen.append((k.get("define_coordinate_system"), k["in_coordinate_system"].wkids))
+        real_convert(path, folder, compression=k["compression"])
+    monkeypatch.setattr(fake_arcpy.conversion, "ConvertLas", convert_sr)
+    assert ns["convert_to_zlas"]([str(laz / f) for f in near], str(zl), 6350, 5703) == []
+    assert set(seen) == {("ALL_FILES", (6350, 5703))}
     assert sorted(converted) == sorted(near)
     converted.clear()
     ns["convert_to_zlas"]([str(laz / f) for f in near], str(zl))

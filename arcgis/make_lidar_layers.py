@@ -41,6 +41,10 @@ OUT_FOLDER = r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\lidar_laye
 CELL = 3.0          # cell size, in the imagery's units (feet)
 MARGIN = 150.0      # extra around each grid, in the imagery's units
 CONVERT_LAZ = True  # convert the .laz tiles near the grids to .zlas first (see above)
+# Coordinate system of the LiDAR files, assigned while converting (ArcGIS can't read the
+# one stored in these files). GA_Statewide_2018_B18_DRRA: NAD83(2011) / CONUS Albers
+# (6350) + NAVD88 height, metres (5703), per the USGS index (.vpc) for the project.
+LIDAR_WKID, LIDAR_VERT_WKID = 6350, 5703
 ZLAS_FOLDER = r"C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\USGS\LAZ_zlas"
 DRY_RUN = True      # True: only check the inputs and count the grids to do
 # -----------------------------------------------------------------------------
@@ -97,7 +101,7 @@ def near_grids(paths, cells, margin):
     return keep
 
 
-def convert_to_zlas(paths, zlas_folder):
+def convert_to_zlas(paths, zlas_folder, wkid=None, vert_wkid=None):
     """Convert .laz files to .zlas (skipping ones already converted). Returns failures."""
     os.makedirs(zlas_folder, exist_ok=True)
     failed = []
@@ -105,7 +109,14 @@ def convert_to_zlas(paths, zlas_folder):
         os.path.join(zlas_folder, os.path.splitext(os.path.basename(p))[0] + ".zlas"))]
     for i, p in enumerate(todo, 1):
         try:
-            arcpy.conversion.ConvertLas(p, zlas_folder, compression="ZLAS")
+            if wkid:  # assign the coordinate system the files should have
+                sr = (arcpy.SpatialReference(wkid, vert_wkid) if vert_wkid
+                      else arcpy.SpatialReference(wkid))
+                arcpy.conversion.ConvertLas(p, zlas_folder, compression="ZLAS",
+                                            define_coordinate_system="ALL_FILES",
+                                            in_coordinate_system=sr)
+            else:
+                arcpy.conversion.ConvertLas(p, zlas_folder, compression="ZLAS")
         except Exception as err:
             msg = str(err).strip().splitlines()
             failed.append((p, msg[0] if msg else "error"))
@@ -116,7 +127,8 @@ def convert_to_zlas(paths, zlas_folder):
 
 
 def make_lidar_layers(laz_folder, grids, imagery, out_folder, cell=3.0, margin=150.0,
-                      dry_run=False, convert_laz=False, zlas_folder=None):
+                      dry_run=False, convert_laz=False, zlas_folder=None, wkid=None,
+                      vert_wkid=None):
     sr_img = arcpy.Describe(first_raster(imagery)).spatialReference
     if sr_img is None or sr_img.type != "Projected":
         raise ValueError("The imagery must be in a projected coordinate system")
@@ -150,7 +162,7 @@ def make_lidar_layers(laz_folder, grids, imagery, out_folder, cell=3.0, margin=1
     source = laz_folder
     if convert_laz:
         say("Converting LiDAR files near the grids to zLAS (Convert LAS tool)...")
-        bad = convert_to_zlas(need, zlas_folder)
+        bad = convert_to_zlas(need, zlas_folder, wkid, vert_wkid)
         if bad and len(bad) == len([p for p in need if p.lower().endswith(".laz")]):
             raise ValueError(f"No file could be converted (first: {bad[0][1]}). This ArcGIS "
                              "Pro may not read .laz at all; tell whoever maintains the tool.")
@@ -234,4 +246,4 @@ def make_lidar_layers(laz_folder, grids, imagery, out_folder, cell=3.0, margin=1
 
 
 make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN, CONVERT_LAZ,
-                  ZLAS_FOLDER)
+                  ZLAS_FOLDER, LIDAR_WKID, LIDAR_VERT_WKID)
