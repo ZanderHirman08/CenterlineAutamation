@@ -43,17 +43,41 @@ DEFAULTS = dict(
 # --------------------------------------------------------------------------- data
 
 def load_chips(folder: str):
-    """{'train': dict, 'val': dict} with image (N,C,H,W) uint8, heat, mask, lines.
-    Arrays are filled shard by shard, so memory holds one copy of the chips."""
-    with open(os.path.join(folder, "manifest.json")) as f:
-        manifest = json.load(f)
+    """(manifest, {'train': dict, 'val': dict}) for one chips folder."""
+    manifests, data = load_sources([folder])
+    return manifests[0], data
+
+
+def load_sources(folders):
+    """Chips from one or more export folders (e.g. one per county) as one set:
+    (manifests, {'train': d, 'val': d}) where each d has image (N,C,H,W) uint8,
+    heat, mask, road, x0, y0, lines, plus ``source`` (index into ``folders``) and
+    ``trust`` (per chip, from each manifest; 1 if missing). Arrays are filled
+    shard by shard, so memory holds one copy of the chips."""
+    if isinstance(folders, str):
+        folders = [folders]
+    manifests = []
+    for folder in folders:
+        with open(os.path.join(folder, "manifest.json")) as f:
+            m = json.load(f)
+        m.setdefault("source", os.path.basename(os.path.normpath(folder)))
+        m.setdefault("trust", 1.0)
+        manifests.append(m)
+    if len({(m["chip_px"], len(m["channels"]), m["res"]) for m in manifests}) > 1:
+        raise ValueError("The chips folders differ in chip size, bands or pixel size: "
+                         + ", ".join(f"{m['source']}: {m['chip_px']} px, "
+                                     f"{len(m['channels'])} bands, {m['res']}"
+                                     for m in manifests))
     out = {}
     for split in ("train", "val"):
-        files = sorted(glob.glob(os.path.join(folder, f"shard_{split}_*.npz")))
-        if not files:
-            raise FileNotFoundError(f"No {split} shards in {folder}")
+        files = []
+        for k, folder in enumerate(folders):
+            found = sorted(glob.glob(os.path.join(folder, f"shard_{split}_*.npz")))
+            if not found:
+                raise FileNotFoundError(f"No {split} shards in {folder}")
+            files += [(k, p) for p in found]
         sizes, lines = [], []
-        for p in files:
+        for _, p in files:
             with open(p[:-4] + ".json") as f:
                 lines += json.load(f)
             with np.load(p) as q:
@@ -62,20 +86,43 @@ def load_chips(folder: str):
                     shapes = {k: q[k].shape[1:] for k in ("image", "heat", "mask")}
         n = sum(sizes)
         d = {k: np.empty((n,) + shapes[k], np.uint8) for k in shapes}
+        d["source"] = np.empty(n, np.int16)
+        d["trust"] = np.empty(n, np.float32)
         d["road"], d["x0"], d["y0"], start = [], [], [], 0
-        for p, size in zip(files, sizes):
+        for (k, p), size in zip(files, sizes):
             with np.load(p) as q:
-                for k in shapes:
-                    d[k][start:start + size] = q[k]
+                for key in shapes:
+                    d[key][start:start + size] = q[key]
                 d["road"] += q["road"].tolist()
                 d["x0"] += q["x0"].tolist()
                 d["y0"] += q["y0"].tolist()
+            d["source"][start:start + size] = k
+            d["trust"][start:start + size] = manifests[k]["trust"]
             start += size
-        for k in ("road", "x0", "y0"):
-            d[k] = np.array(d[k])
+        for key in ("road", "x0", "y0"):
+            d[key] = np.array(d[key])
         d["lines"] = lines
         out[split] = d
-    return manifest, out
+    return manifests, out
+
+
+def subset(d, sel):
+    """The chips of ``d`` where the boolean ``sel`` is True."""
+    idx = np.flatnonzero(sel)
+    return {k: ([v[i] for i in idx] if isinstance(v, list) else v[idx]) for k, v in d.items()}
+
+
+def baselines(folders):
+    """The local roads' validation score per folder ({} where none was measured)."""
+    out = []
+    for folder in folders:
+        path = os.path.join(folder, "baseline.json")
+        b = {}
+        if os.path.exists(path):
+            with open(path) as f:
+                b = json.load(f).get("val", {})
+        out.append(b)
+    return out
 
 
 def channel_stats(images: np.ndarray, sample: int = 500):
@@ -88,14 +135,14 @@ def to_device(data, device):
     """Chips as uint8 tensors on the GPU (about 0.4 MB each), so batches need no CPU
     work: free Colab has 2 CPU cores, which would otherwise leave the GPU idle."""
     keep = device if data["image"].nbytes < 6e9 else "cpu"
-    return tuple(torch.from_numpy(data[k]).to(keep) for k in ("image", "heat", "mask"))
+    return tuple(torch.from_numpy(data[k]).to(keep) for k in ("image", "heat", "mask", "trust"))
 
 
 def make_batch(tensors, idx, mean, std, device, augment):
     """Normalised images, targets and masks for chips ``idx``; with ``augment``, a
     random rotation / mirror (the ridge turns with the image, so labels stay right)
     and a small brightness / contrast change per chip."""
-    images, heat, mask = tensors
+    images, heat, mask, trust = tensors
     idx = idx.to(images.device)
     x = images[idx].to(device).float() / 255.0
     y = heat[idx].to(device).float()[:, None] / 255.0
@@ -115,7 +162,7 @@ def make_batch(tensors, idx, mean, std, device, augment):
             + 0.05 * (torch.rand(b, 1, 1, 1, device=device) - 0.5)
     mean_t = torch.tensor(mean, device=device).view(1, -1, 1, 1)
     std_t = torch.tensor(std, device=device).view(1, -1, 1, 1)
-    return (x - mean_t) / std_t, y, m
+    return (x - mean_t) / std_t, y, m, trust[idx].to(device).float()
 
 
 # --------------------------------------------------------------------------- model
@@ -126,9 +173,13 @@ def build_model(in_channels, encoder="resnet34", encoder_weights="imagenet"):
                     in_channels=in_channels, classes=1)
 
 
-def masked_loss(logits, target, mask, pos_weight):
+def masked_loss(logits, target, mask, pos_weight, trust=None):
+    """Ridge-weighted cross-entropy over the mask. ``trust`` (per chip) scales each
+    chip's share; the total is divided by the untrusted weight, so a batch of
+    low-trust chips counts less, not the same."""
     w = mask * (1.0 + pos_weight * target)
-    loss = F.binary_cross_entropy_with_logits(logits, target, weight=w, reduction="sum")
+    tw = w if trust is None else w * trust.view(-1, 1, 1, 1)
+    loss = F.binary_cross_entropy_with_logits(logits, target, weight=tw, reduction="sum")
     return loss / w.sum().clamp(min=1.0)
 
 
@@ -210,23 +261,35 @@ def evaluate(model, val, mean, std, res, device, cfg, batch=64):
 
 # --------------------------------------------------------------------------- training
 
-def train(chips_folder, out_folder, **overrides):
+def score_sources(model, val, manifests, mean, std, res, device, cfg):
+    """Validation score per source (county)."""
+    return [evaluate(model, subset(val, val["source"] == k), mean, std, res, device, cfg)
+            if (val["source"] == k).any() else {} for k in range(len(manifests))]
+
+
+def train(chips_folders, out_folder, **overrides):
+    """Train on one chips folder or several (one per county). The best model is
+    chosen by the validation score of the FIRST folder: put your own hand-checked
+    county first."""
     cfg = dict(DEFAULTS, **overrides)
     torch.manual_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
     os.makedirs(out_folder, exist_ok=True)
-    manifest, data = load_chips(chips_folder)
-    res = float(manifest["res"])
+    folders = [chips_folders] if isinstance(chips_folders, str) else list(chips_folders)
+    manifests, data = load_sources(folders)
+    names = [m["source"] for m in manifests]
+    res = float(manifests[0]["res"])
     mean, std = channel_stats(data["train"]["image"])
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"{len(data['train']['image'])} training / {len(data['val']['image'])} validation "
           f"chips, {len(mean)} channels, device {device}")
-    baseline = {}
-    bpath = os.path.join(chips_folder, "baseline.json")
-    if os.path.exists(bpath):
-        with open(bpath) as f:
-            baseline = json.load(f).get("val", {})
-        print(f"Score to beat (local roads in the validation blocks): median "
+    for k, m in enumerate(manifests):
+        print(f"  {m['source']}: {(data['train']['source'] == k).sum()} training, "
+              f"{(data['val']['source'] == k).sum()} validation chips, trust {m['trust']:g}")
+    bases = baselines(folders)
+    baseline = bases[0]
+    if baseline:
+        print(f"Score to beat ({names[0]}, local roads in the validation blocks): median "
               f"{baseline.get('median', float('nan')):.2f}, within 1: "
               f"{baseline.get('within1', float('nan')):.0%}")
 
@@ -253,11 +316,11 @@ def train(chips_folder, out_folder, **overrides):
         t0, total, n = time.time(), 0.0, 0
         order = torch.randperm(n_train)
         for i in range(0, n_train, cfg["batch_size"]):
-            x, y, m = make_batch(tensors, order[i:i + cfg["batch_size"]], mean, std, device,
-                                 augment=True)
+            x, y, m, tr = make_batch(tensors, order[i:i + cfg["batch_size"]], mean, std, device,
+                                     augment=True)
             with torch.autocast(device_type=device, enabled=device == "cuda"):
                 logits = model(x)
-            loss = masked_loss(logits.float(), y, m, cfg["pos_weight"])
+            loss = masked_loss(logits.float(), y, m, cfg["pos_weight"], tr)
             opt.zero_grad()
             scaler.scale(loss).backward()
             scaler.step(opt)
@@ -266,27 +329,70 @@ def train(chips_folder, out_folder, **overrides):
             total, n = total + loss.item() * len(x), n + len(x)
         line = f"epoch {epoch + 1}/{cfg['epochs']}: loss {total / max(n, 1):.4f}"
         last = epoch == cfg["epochs"] - 1
+        score, per = {}, []
         if last or (epoch + 1) % cfg["eval_every"] == 0:
-            score = evaluate(model, data["val"], mean, std, res, device, cfg)
+            per = score_sources(model, data["val"], manifests, mean, std, res, device, cfg)
+            score = per[0]
             line += (f", validation median {score.get('median', float('nan')):.2f} ft, within "
                      f"1 ft {score.get('within1', 0):.0%}, crest found "
-                     f"{score.get('found', 0):.0%}")
+                     f"{score.get('found', 0):.0%}" + (f" ({names[0]})" if len(per) > 1 else ""))
+            for name, sc in zip(names[1:], per[1:]):
+                line += (f"; {name} {sc.get('median', float('nan')):.2f} ft, "
+                         f"{sc.get('within1', 0):.0%}")
             if best is None or score.get("median", 1e9) < best.get("median", 1e9):
                 best = dict(epoch=epoch, **score)
+                best["per_source"] = dict(zip(names, per))
                 torch.save(model.state_dict(), os.path.join(out_folder, "best_model.pt"))
-        else:
-            score = {}
-        history.append(dict(epoch=epoch, loss=total / max(n, 1), **score))
+        history.append(dict(epoch=epoch, loss=total / max(n, 1), **score,
+                            per_source=dict(zip(names, per)) if per else {}))
         print(line + f" ({time.time() - t0:.0f}s)")
         torch.save(dict(model=model.state_dict(), opt=opt.state_dict(),
                         sched=sched.state_dict(), epoch=epoch, best=best,
                         history=history), ckpt)
-    info = dict(config=cfg, mean=mean, std=std, res=res, channels=manifest["channels"],
-                chip_px=manifest["chip_px"], best=best, baseline=baseline, history=history)
+    info = dict(config=cfg, mean=mean, std=std, res=res, channels=manifests[0]["channels"],
+                chip_px=manifests[0]["chip_px"], sources=names, best=best, baseline=baseline,
+                baselines=dict(zip(names, bases)), history=history)
     with open(os.path.join(out_folder, "model_info.json"), "w") as f:
         json.dump(info, f, indent=1)
     report(best, baseline)
+    if best and len(names) > 1:
+        report_sources(best.get("per_source", {}), dict(zip(names, bases)))
     return info
+
+
+def test(chips_folders, model_folder, **overrides):
+    """Score an already-trained model on chips it was not trained on (e.g. a new
+    county), per source, against each source's local roads. Trains nothing."""
+    cfg = dict(DEFAULTS, **overrides)
+    folders = [chips_folders] if isinstance(chips_folders, str) else list(chips_folders)
+    with open(os.path.join(model_folder, "model_info.json")) as f:
+        info = json.load(f)
+    manifests, data = load_sources(folders)
+    names = [m["source"] for m in manifests]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = build_model(len(info["mean"]), info["config"]["encoder"], None)
+    model.load_state_dict(torch.load(os.path.join(model_folder, "best_model.pt"),
+                                     map_location="cpu"))
+    model.to(device)
+    both = {k: np.concatenate([data["train"][k], data["val"][k]])
+            if isinstance(data["val"][k], np.ndarray) else data["train"][k] + data["val"][k]
+            for k in data["val"]}  # every chip: none of this was trained on
+    per = [evaluate(model, subset(both, both["source"] == k), info["mean"], info["std"],
+                    float(manifests[k]["res"]), device, cfg) for k in range(len(folders))]
+    report_sources(dict(zip(names, per)), dict(zip(names, baselines(folders))),
+                   title="Model tested on chips it was NOT trained on (all chips of each "
+                         "source; the local-roads figure covers the validation blocks only):")
+    return dict(zip(names, per))
+
+
+def report_sources(per, bases, title="Best model, per source (validation blocks):"):
+    print("\n" + title)
+    for name, sc in per.items():
+        b = bases.get(name) or {}
+        print(f"  {name:<20} model median {sc.get('median', float('nan')):5.2f} ft, within 1 ft "
+              f"{sc.get('within1', 0):4.0%}, crest found {sc.get('found', 0):4.0%}"
+              + (f"  | local roads median {b['median']:.2f} ft, within 1 ft "
+                 f"{b['within1']:.0%}" if b else ""))
 
 
 def report(best, baseline):

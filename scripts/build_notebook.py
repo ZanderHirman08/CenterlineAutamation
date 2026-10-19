@@ -33,13 +33,21 @@ def build():
 
 Expects `chips.zip` (from the toolbox tool **Export Training Chips**) in the Drive
 folder set below. Results go to the `model` folder next to it.
+
+**Several counties:** export each county to its own zip (e.g. `chips_camden.zip`),
+upload them next to `chips.zip` and list them in `CHIPS_ZIPS`, your own county
+first: the best model is picked by the first county's score.
+
+**Test only:** set `TEST_ONLY = True` to score the model already in `model` on the
+listed zips without training (e.g. a county it has never seen).
 """),
         code("""
-# Settings: where chips.zip is on your Google Drive
+# Settings
 DRIVE_FOLDER = "/content/drive/MyDrive/Centerline"
-CHIPS_ZIP = DRIVE_FOLDER + "/chips.zip"
+CHIPS_ZIPS = ["chips.zip"]   # your own county first, e.g. ["chips.zip", "chips_camden.zip"]
 MODEL_FOLDER = DRIVE_FOLDER + "/model"
 EPOCHS = 40
+TEST_ONLY = False            # True: score the model in MODEL_FOLDER, don't train
 """),
         code("""
 from google.colab import drive
@@ -48,7 +56,11 @@ drive.mount("/content/drive")
 import os, shutil, zipfile
 if os.path.exists("/content/chips"):
     shutil.rmtree("/content/chips")
-zipfile.ZipFile(CHIPS_ZIP).extractall("/content/chips")
+FOLDERS = []
+for name in CHIPS_ZIPS:
+    folder = "/content/chips/" + os.path.splitext(name)[0]
+    zipfile.ZipFile(DRIVE_FOLDER + "/" + name).extractall(folder)
+    FOLDERS.append(folder)
 import torch
 print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available()
       else "NONE - set Runtime > Change runtime type > T4 GPU")
@@ -58,19 +70,26 @@ print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available()
         code("""
 import sys
 sys.path.insert(0, "/content")
-import train_centerline as tc
-info = tc.train("/content/chips", MODEL_FOLDER, epochs=EPOCHS)
+import train_centerline as tc, json
+if TEST_ONLY:
+    tc.test(FOLDERS, MODEL_FOLDER)
+    info = json.load(open(MODEL_FOLDER + "/model_info.json"))
+else:
+    info = tc.train(FOLDERS, MODEL_FOLDER, epochs=EPOCHS)
 """),
         code("""
 import matplotlib.pyplot as plt
-h = info["history"]
+h = [] if TEST_ONLY else info["history"]
 fig, ax = plt.subplots(1, 2, figsize=(11, 3.5))
 ax[0].plot([r["loss"] for r in h]); ax[0].set_title("training loss"); ax[0].set_xlabel("epoch")
 ax[1].plot([r.get("median", float("nan")) for r in h], label="model")
 if info["baseline"]:
     ax[1].axhline(info["baseline"]["median"], color="r", ls="--", label="local roads")
 ax[1].set_title("validation median error (ft)"); ax[1].set_xlabel("epoch"); ax[1].legend()
-plt.show()
+if h:
+    plt.show()
+else:
+    plt.close(fig)
 """),
         md("""
 ## Look at validation chips
@@ -83,7 +102,8 @@ the validation set, then the 4 where the model is furthest off.
 """),
         code("""
 import numpy as np
-_, data = tc.load_chips("/content/chips")
+manifests, data = tc.load_sources(FOLDERS)
+county = [m["source"] for m in manifests]
 val = data["val"]
 model = tc.build_model(len(info["mean"]), info["config"]["encoder"], None)
 model.load_state_dict(torch.load(MODEL_FOLDER + "/best_model.pt", map_location="cpu"))
@@ -105,8 +125,9 @@ def chip_errors(d):
 
 def by_road(d, err, name):
     half = d["image"].shape[-1] * res / 2
-    df = pd.DataFrame(dict(road_oid=d["road"], err=err, x=d["x0"] + half, y=d["y0"] - half))
-    t = (df.dropna().groupby("road_oid")
+    df = pd.DataFrame(dict(county=[county[k] for k in d["source"]], road_oid=d["road"],
+                           err=err, x=d["x0"] + half, y=d["y0"] - half))
+    t = (df.dropna().groupby(["county", "road_oid"])
          .agg(chips=("err", "size"), median_error_ft=("err", "median"),
               x=("x", "median"), y=("y", "median")))
     t.insert(0, "set", name)
@@ -122,19 +143,21 @@ worst = has[np.argsort(chip_err[has])[-4:][::-1]]
 # checked line is. Zoom to the coordinates in Pro (same coordinate system as the
 # imagery) and look. 15.00 means "15 ft or more" (the edge of the search).
 # Training roads were learned from, so a bad line there shows a smaller gap:
-# their threshold is lower.
+# their threshold is lower (in TEST_ONLY mode nothing was trained on).
+train_set = "not trained on" if TEST_ONLY else "training"
 roads = pd.concat([by_road(val, chip_err, "validation"),
-                   by_road(data["train"], train_err, "training")])
-suspect = roads[((roads.set == "validation") & (roads.median_error_ft > 3))
+                   by_road(data["train"], train_err, train_set)])
+suspect = roads[(roads.set != "training") & (roads.median_error_ft > 3)
                 | ((roads.set == "training") & (roads.median_error_ft > 2))]
 suspect = suspect.sort_values("median_error_ft", ascending=False)
 print(f"{len(suspect)} of {len(roads)} checked roads where the model and the line disagree "
       "(over 3 ft on validation roads, over 2 ft on training roads). Check these in Pro:")
 print(suspect.round(2).to_string() if len(suspect) else "  none")
-oids = ", ".join(dict.fromkeys(str(o) for o in suspect.index))
-if oids:
-    print()
-    print(f"Select By Attributes on Roads_working:  OBJECTID IN ({oids})")
+for name in county:
+    oids = ", ".join(dict.fromkeys(str(o) for c, o in suspect.index if c == name))
+    if oids:
+        print()
+        print(f"{name} - Select By Attributes on Roads_working:  OBJECTID IN ({oids})")
 
 def show(i):
     p = tc.predict_probs(model, val["image"][i:i + 1], info["mean"], info["std"], dev)[0]
@@ -151,7 +174,7 @@ def show(i):
         a.set_xlim(-0.5, w - 0.5)
         a.set_ylim(h - 0.5, -0.5)
         a.axis("off")
-    fig.suptitle(f"chip {i}: median error {chip_err[i]:.2f} ft")
+    fig.suptitle(f"{county[val['source'][i]]} chip {i}: median error {chip_err[i]:.2f} ft")
     plt.show()
 
 print("Spread through the validation set:")

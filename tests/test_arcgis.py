@@ -599,3 +599,45 @@ def test_manual_rules_in_export_and_evaluate(toolbox, tiled_scene, tmp_path):
     tool.execute(params, None)
     text = "\n".join(fake_arcpy.messages)
     assert "1 cul-de-sac circle" in text and f"{checked - 4} checked roads" in text
+
+
+def test_finished_county_export_and_multi_county_training(toolbox, tiled_scene, tmp_path):
+    """Another county's finished data: moved roads found from the pre-validation data,
+    a chip limit, and source/trust in the manifest; training on two exports at once
+    reports each, and test-only mode scores without training."""
+    pytest.importorskip("torch")
+    pytest.importorskip("segmentation_models_pytorch")
+    import json
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "dl"))
+    import train_centerline as tc
+    (tmp_path / "a").mkdir()
+    gold = _export(toolbox, tiled_scene, tmp_path / "a")[1]
+    tool, params, p = _tool(toolbox, "ExportTrainingChips")
+    p["truth"].value = str(_truth_pieces(tmp_path))
+    p["imagery"].value = str(tiled_scene["tiles"])
+    p["out_folder"].value = str(tmp_path / "other")
+    p["val_fraction"].value = 0.3
+    p["block"].value = 300.0
+    p["chip_px"].value = 128
+    p["original_fc"].value = str(tiled_scene["roads"])    # 5-7 ft off: every road was moved
+    p["source"].value = "camden"
+    p["trust"].value = 0.5
+    p["max_chips"].value = 12
+    p["only_moved"].value = True
+    fake_arcpy.messages.clear()
+    tool.execute(params, None)
+    text = "\n".join(fake_arcpy.messages)
+    man = json.loads((tmp_path / "other" / "manifest.json").read_text())
+    assert man["source"] == "camden" and man["trust"] == 0.5
+    assert sum(man["counts"].values()) <= 12 and "chip limit" in text
+    checked = len(gpd.read_file(_truth_pieces(tmp_path)).query("Validated == 'Yes'"))
+    assert f"{checked} of {checked} checked roads were moved" in text, text
+
+    manifests, data = tc.load_sources([str(gold), str(tmp_path / "other")])
+    assert set(data["train"]["trust"]) <= {1.0, 0.5} and 0.5 in set(data["train"]["trust"])
+    info = tc.train([str(gold), str(tmp_path / "other")], str(tmp_path / "model"),
+                    encoder="resnet18", encoder_weights=None, epochs=1, batch_size=8)
+    assert info["sources"] == [manifests[0]["source"], "camden"]
+    assert set(info["best"]["per_source"]) == set(info["sources"])
+    per = tc.test(str(tmp_path / "other"), str(tmp_path / "model"))
+    assert per["camden"]["points"] > 0

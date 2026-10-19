@@ -113,6 +113,48 @@ The final "model vs. local roads" block it prints, and a screenshot of the examp
 
 ---
 
+## 4b. Adding a county someone else finished
+
+Finished counties have every road validated, which is a lot more training data. Other
+editors' lines are less exact than yours, so they count for less (trust), and the
+best model is still picked by your Glynn score.
+
+**What you need for the county** (e.g. Camden):
+* its finished `Roads_working`, from that county's Phase6Working.gdb
+* its original ITOS-provided roads, from the OneDrive zip. These show what each road looked like before validation.
+* its GIO imagery tiles, copied with `copy_aoi_tiles.py` to e.g. `C:\Users\zhirman\Desktop\Centerline\Camden\imagery\tiles`
+* its local roads layer, optional; it gives that county's score to beat
+
+**1. Export (in Pro): 3. Export Training Chips**
+
+| Setting | Value |
+|---|---|
+| Checked roads | Camden's finished `Roads_working` |
+| Only checked roads where | `Validated = 'Yes'` |
+| Imagery | Camden's tiles folder |
+| Output folder | `...\Centerline\Camden\d1\chips_camden` (makes `chips_camden.zip`) |
+| Local roads | Camden's local roads (optional) |
+| Training folder from 'End of Day' | leave empty |
+| Only roads I moved | **checked**: only roads the editor actually moved, which are more likely carefully drawn |
+| *Another county's finished data* → Original roads before validation | Camden's ITOS-provided roads |
+| → County name | `camden` |
+| → Trust | `0.5` |
+| → Chip limit | `3000`, so a whole county fits in Colab |
+
+**2. Test the current model on it first (Colab)**
+1. Upload `chips_camden.zip` to Drive → Centerline.
+2. In the notebook settings, set `CHIPS_ZIPS = ["chips_camden.zip"]` and `TEST_ONLY = True`, then **Run all**.
+3. It scores your current model on Camden without training, against Camden's local roads.
+
+The **suspect roads list** works here too. It flags Camden lines the model strongly disagrees with: lines marked Yes that may never have been checked.
+
+**3. Train on both**
+1. Set `CHIPS_ZIPS = ["chips.zip", "chips_camden.zip"]` (**Glynn first**) and `TEST_ONLY = False`.
+2. Delete the `model` folder in Drive (or set `MODEL_FOLDER` to a new folder to keep the old model), then **Run all**.
+3. Each epoch line shows Glynn's score and Camden's. The final table compares each county with its local roads.
+
+**Is it helping?** Compare Glynn's score with the previous Glynn-only run. If Glynn got better or stayed the same, keep Camden in. If Glynn got worse, lower Camden's trust (e.g. 0.3) or leave it out.
+
 ## 5. Where everything lives
 
 ```

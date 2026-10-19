@@ -294,8 +294,20 @@ class ExportTrainingChips:
                      category="Advanced", value=0.2)
         block = _param("block", "Validation block size (map units)", "GPDouble",
                        category="Advanced", value=1000.0)
+        original = _param("original_fc", "Original roads before validation (ITOS-provided "
+                          "data; optional)", "GPFeatureLayer", required=False,
+                          category="Another county's finished data")
+        original.filter.list = ["Polyline"]
+        source = _param("source", "County name (optional)", "GPString", required=False,
+                        category="Another county's finished data")
+        trust = _param("trust", "Trust (1 = roads you checked yourself; e.g. 0.5 for another "
+                       "editor's)", "GPDouble", category="Another county's finished data",
+                       value=1.0)
+        max_chips = _param("max_chips", "Chip limit (0 = no limit; e.g. 3000 for a whole "
+                           "county)", "GPLong", category="Another county's finished data",
+                           value=0)
         return [truth, where, imagery, out, local, grids, folder, moved, bands, chip, step, val,
-                block]
+                block, original, source, trust, max_chips]
 
     def isLicensed(self):
         return True
@@ -322,7 +334,11 @@ class ExportTrainingChips:
             val_fraction=float(p["val_fraction"].value or 0.2),
             block=float(p["block"].value or 1000.0),
             training_folder=p["training_folder"].valueAsText,
-            only_moved=bool(p["only_moved"].value))
+            only_moved=bool(p["only_moved"].value),
+            original_fc=p["original_fc"].valueAsText,
+            source=p["source"].valueAsText,
+            trust=float(p["trust"].value if p["trust"].value is not None else 1.0),
+            max_chips=int(p["max_chips"].value or 0))
 
     def postExecute(self, parameters):
         return

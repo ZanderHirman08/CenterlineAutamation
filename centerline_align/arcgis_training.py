@@ -53,7 +53,8 @@ SAMPLE_SPACING = 5.0   # how often lines are compared (map units)
 MATCH_DIST = 40.0      # an original farther than this from the edited line isn't its match
 END_TRIM = 40.0        # line ends left out of the road labels (intersections)
 TRACE_TOL = 0.5        # a road this close to the reference layer along...
-TRACE_SHARE = 0.8      # ...this share of its length was traced from it
+TRACE_SHARE = 0.8
+MIN_CHANGE = 1.0       # a road moved at least this far from its original counts as moved      # ...this share of its length was traced from it
 EXCLUDE_FIELDS = ("abandonedroad", "privateroad")   # 'Yes' = not used (no pavement)
 
 
@@ -299,19 +300,48 @@ def trim_ends(c, d: float):
     return np.vstack([ends[:1], c[inner], ends[1:]])
 
 
+def _moved_from_original(arcpy, original_fc, everything, use, sr, info):
+    """Per checked road: how far it lies from the nearest original (pre-validation)
+    line. OIDs needn't match: the pre-validation steps split and appended the data."""
+    original = [c for _, _, parts, _ in read_lines(arcpy, original_fc, "OID@", sr)
+                for c in parts]
+    if not original:
+        raise ValueError(f"No lines in {original_fc}")
+    idx = SegmentIndex(original)
+    out = dict(info)
+    for oid, parts in everything:
+        if oid not in use:
+            continue
+        pts, tans, _ = sample_lines(parts, SAMPLE_SPACING)
+        d = idx.distances(pts, tans, MATCH_DIST) if len(pts) else np.zeros(0)
+        d = d[~np.isnan(d)]
+        shift = float(d.mean()) if len(d) else None
+        rec = dict(out.get(oid, {}))
+        rec.update(changed=bool(shift is None or shift >= MIN_CHANGE), shift_avg=shift)
+        out[oid] = rec
+    return out
+
+
 # --------------------------------------------------------------------------- deep learning
 
 def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_folder,
                           grids_fc=None, local_fc=None, training_folder=None, only_moved=False,
                           chip_px=256, step=100.0, val_fraction=0.2, block=1000.0, sigma=1.0,
                           corridor=30.0, end_trim=END_TRIM, min_valid=0.8, shard_size=200,
-                          seed=0, make_zip=True):
+                          seed=0, make_zip=True, original_fc=None, source=None, trust=1.0,
+                          max_chips=0):
     """Chips around hand-checked roads, for training a centreline model elsewhere
     (see ``chips.py`` and ``dl/train_centerline.py``). Only reads the inputs.
 
     With ``training_folder`` (End of Day's output), roads traced from a reference
     layer are kept for training but not scored, and ``only_moved`` keeps only the
-    roads you moved."""
+    roads you moved.
+
+    For a county someone else finished: ``original_fc`` is the road layer as it was
+    before validation (the ITOS-provided data); roads the editor moved at least 1 ft
+    from it count as moved (for ``only_moved``). ``source`` names the county and
+    ``trust`` (0-1) is how much training counts its roads (your own: 1). ``max_chips``
+    caps the number of chips (0 = no cap) so a whole county fits in Colab."""
     import shutil
     msg = arcpy.AddMessage
     reader = ArcTileReader(arcpy, imagery, list(bands))
@@ -339,6 +369,10 @@ def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_f
         if not info:
             raise ValueError(f"No {TRAINING} in {training_folder}: run 'End of Day' first")
     use = checked - excluded
+    if original_fc:
+        info = _moved_from_original(arcpy, original_fc, everything, use, sr, info)
+        msg(f"{sum(1 for o in use if info.get(o, {}).get('changed'))} of {len(use)} checked "
+            f"roads were moved at least {MIN_CHANGE:g} {sr.linearUnitName} from {original_fc}")
     if only_moved:
         use = {o for o in use if info.get(o, {}).get("changed")}
         msg(f"Using only the {len(use)} checked road(s) you moved")
@@ -392,6 +426,10 @@ def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_f
     if grid_polys is not None:
         inside = _points_in_polygons(np.array([p for _, p in centres]), grid_polys)
         centres = [cp for cp, ok in zip(centres, inside) if ok]
+    if max_chips and len(centres) > max_chips:  # a spread-out sample of the positions
+        pick = np.sort(rng.choice(len(centres), max_chips, replace=False))
+        msg(f"Keeping {max_chips} of {len(centres)} chip positions (chip limit)")
+        centres = [centres[i] for i in pick]
     msg(f"{len(use)} checked roads, {len(other)} other road parts; {len(centres)} chip "
         f"positions every {step:g} {sr.linearUnitName}; validation = {val_fraction:.0%} of "
         f"{block:g} {sr.linearUnitName} blocks")
@@ -438,7 +476,8 @@ def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_f
                     crs=sr.name, chip_px=chip_px, sigma=sigma, corridor=corridor,
                     end_trim=end_trim, block=block, val_fraction=val_fraction, seed=seed,
                     counts=counts, roads=len(use), traced=len(traced), only_moved=only_moved,
-                    created=time.strftime("%Y-%m-%d %H:%M"))
+                    source=source or os.path.basename(os.path.normpath(out_folder)),
+                    trust=float(trust), created=time.strftime("%Y-%m-%d %H:%M"))
     with open(os.path.join(out_folder, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=1)
     msg(f"{counts['train']} training and {counts['val']} validation chips "
