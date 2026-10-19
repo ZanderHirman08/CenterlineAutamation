@@ -7,7 +7,7 @@ Model: U-Net with an ImageNet-pretrained ResNet encoder (segmentation_models_pyt
 taking R, G, B, NIR and drawing a ridge on the road centreline (the "heat" target).
 The loss only counts pixels near hand-checked roads (the chip "mask").
 
-Score: on validation roads (never trained on), cross-sections are taken across
+Score: in validation blocks (ground never trained on), cross-sections are taken across
 each checked line; the distance from the checked line to the crest of the
 predicted ridge is the error. Compare it with baseline.json, the local roads'
 error on the same roads.
@@ -107,9 +107,10 @@ def masked_loss(logits, target, mask, pos_weight):
 
 # --------------------------------------------------------------------------- scoring
 
-def crest_errors(prob, lines, res, search_ft=15.0, min_peak=0.3, border=8):
+def crest_errors(prob, lines, res, search_ft=15.0, min_peak=0.3, border=8, mask=None):
     """Distance (map units) from each checked line to the predicted ridge crest,
-    measured across the line; NaN where no crest is found."""
+    measured across the line; NaN where no crest is found. With ``mask``, only
+    points on mask pixels count (validation ground, away from line ends)."""
     h, w = prob.shape
     reach = search_ft / res
     offs = np.arange(-reach, reach + 0.25, 0.25)
@@ -123,6 +124,10 @@ def crest_errors(prob, lines, res, search_ft=15.0, min_peak=0.3, border=8):
         n = np.column_stack([-t[:, 1], t[:, 0]])
         ok = ((c[:, 0] > border) & (c[:, 0] < w - 1 - border)
               & (c[:, 1] > border) & (c[:, 1] < h - 1 - border))
+        if mask is not None:
+            r = np.clip(np.round(c[:, 1]).astype(int), 0, h - 1)
+            q = np.clip(np.round(c[:, 0]).astype(int), 0, w - 1)
+            ok &= mask[r, q] > 0
         for (cx, cy), (nx, ny) in zip(c[ok][::2], n[ok][::2]):  # every ~4 px (2 ft)
             cols, rows = cx + offs * nx, cy + offs * ny
             v = ndimage.map_coordinates(prob, [rows, cols], order=1, mode="constant")
@@ -164,8 +169,8 @@ def predict_probs(model, images, mean, std, device, batch=16):
 
 def evaluate(model, val, mean, std, res, device, cfg):
     probs = predict_probs(model, val["image"], mean, std, device)
-    errs = [crest_errors(p, ln, res, cfg["search_ft"], cfg["min_peak"])
-            for p, ln in zip(probs, val["lines"])]
+    errs = [crest_errors(p, ln, res, cfg["search_ft"], cfg["min_peak"], mask=m)
+            for p, ln, m in zip(probs, val["lines"], val["mask"])]
     return summarize(np.concatenate(errs) if errs else np.zeros(0))
 
 
@@ -187,7 +192,7 @@ def train(chips_folder, out_folder, **overrides):
     if os.path.exists(bpath):
         with open(bpath) as f:
             baseline = json.load(f).get("val", {})
-        print(f"Score to beat (local roads on the validation roads): median "
+        print(f"Score to beat (local roads in the validation blocks): median "
               f"{baseline.get('median', float('nan')):.2f}, within 1: "
               f"{baseline.get('within1', float('nan')):.0%}")
 

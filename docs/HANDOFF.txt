@@ -151,6 +151,40 @@ CURRENT RECOMMENDATION / OPEN ITEMS
    export of validated roads (Truth_Validated_YYYY_MM_DD) for stable comparisons
    if allowed.
 
+TRAINING FROM DAILY EDITS (added 2026-10-19)
+--------------------------------------------
+- User can only change Validated (Yes/No) and geometry on the federal layer;
+  no new fields. So everything is kept in a training folder (JSON), and the
+  road layer is only read. Guide: docs/daily_training.md.
+- Toolbox tools (centerline_align/arcgis_training.py):
+  1. Start of Day: Snapshot Roads -> originals.json (first-seen shape per OID,
+     never overwritten; checked_before flag for roads already Validated).
+  2. End of Day: Collect My Edits -> training_roads.json (every Validated='Yes'
+     road: parts, CHANGED (moved >= 1 ft vs original), SHIFT_AVG/MAX, DAY,
+     original_known); optional Training_Roads feature class.
+  3. Overnight: Train From My Edits -> models/road_classifier_<day>.json;
+     holdout = grids with crc32(grid id) % 5 == 0 (stable across nights);
+     labels = pixels within 4 ft of checked lines (trusted with half_width
+     None); scores tool-on-original-lines vs checked lines in holdout grids,
+     new vs current model (+ optional compare layers); promotes to
+     models/road_classifier.json if median <= current; models/history.csv.
+- Align tool: new "Trained classifier" parameter (classifier_file).
+- Follows the REVAMP Phase 6 manual (user's PDF, version 2026-05-01-01):
+  AbandonedRoad/PrivateRoad = 'Yes' excluded automatically (field names
+  matched case/underscore-insensitively); 40 ft line ends left out of road
+  labels and of the keep/move comparison (lines split at intersections, simple
+  snapping, T's bend along the turn); unedited Yes = "within pavement" (meets
+  standard), not exact centre; optional reference layer in End of Day marks
+  TRACED roads, nightly test adds a non-traced table; GIO imagery is primary.
+- Keep/move model (engine.fit_move_model / move_probability): logistic
+  regression on shift_avg, shift_max, conf, pct_valid, width_med of moved
+  lines in the training grids; label = move brought line >= 0.5 closer to
+  the checked line; threshold chosen to maximise total gain. Stored in
+  RoadClassifier.move_model; Align applies it (MOVE_P field, reason
+  move_unlikely_to_help). Needs >= 20 moved lines with both outcomes.
+  Fitted on the same grids the classifier trained on (slightly optimistic);
+  the held-back grids judge it.
+
 HOW THE USER WORKS
 ------------------
 - Runs toolbox tools in ArcGIS Pro and pastes the geoprocessing messages back;

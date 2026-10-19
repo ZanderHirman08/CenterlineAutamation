@@ -17,7 +17,7 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from .classifier import (RoadClassifier, distance_to_roads, extract_samples, fit,
-                         sample_training_pixels)
+                         logistic_regression, sample_training_pixels)
 from .features import pixel_feature_names, pixel_features, scale_bands
 from .geom import as_coords, cumlen, densify, interpolate
 from .refine import refine_line
@@ -311,8 +311,56 @@ def _crossings(lines, tol: float, seg: float = 10.0) -> list:
     return out
 
 
-def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):
-    """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts."""
+# what the keep/move model looks at for each refined line
+MOVE_FEATURES = ("shift_avg", "shift_max", "conf", "pct_valid", "width_med")
+MOVE_MIN_GAIN = 0.5   # a move "helps" when it brings the line at least this much closer
+
+
+def move_probability(model: dict, rec: dict) -> float:
+    """Chance (0-1) that applying a refined line's move brings it closer to where a
+    person would put it, from the line's own QA values."""
+    x = np.array([float(rec[k]) for k in MOVE_FEATURES])
+    z = float(np.dot((x - np.asarray(model["mean"])) / np.asarray(model["std"]),
+                     np.asarray(model["coef"])) + model["intercept"])
+    return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
+
+
+def fit_move_model(recs: list[dict], gains, min_rows: int = 20):
+    """Learn when a move is worth applying.
+
+    recs: refined records whose move was applied (``moved`` = 1); gains: for each,
+    how much closer the move brought the line to the hand-checked line (negative =
+    farther). Fits a logistic regression for "helps by at least MOVE_MIN_GAIN", then
+    picks the probability threshold that maximises the total gain on these lines.
+    Returns None when there are too few lines of either kind to learn from.
+    """
+    gains = np.asarray(gains, float)
+    y = (gains >= MOVE_MIN_GAIN).astype(float)
+    if len(recs) < min_rows or y.sum() < 5 or (1 - y).sum() < 5:
+        return None
+    X = np.array([[float(r[k]) for k in MOVE_FEATURES] for r in recs])
+    mean, std = X.mean(axis=0), X.std(axis=0)
+    std[std < 1e-9] = 1.0
+    coef, intercept = logistic_regression((X - mean) / std, y, C=1.0)
+    model = dict(features=list(MOVE_FEATURES), mean=mean.tolist(), std=std.tolist(),
+                 coef=coef.tolist(), intercept=float(intercept), threshold=0.5)
+    p = np.array([move_probability(model, r) for r in recs])
+    cands = np.unique(np.concatenate([p, [0.0, 1.01]]))
+    total = [gains[p >= t].sum() for t in cands]
+    model["threshold"] = float(cands[int(np.argmax(total))])
+    model["rows"] = len(recs)
+    model["gain_all"] = float(gains.sum())          # applying every move
+    model["gain_chosen"] = float(max(total))        # applying the chosen ones
+    return model
+
+
+def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False,
+                  move_model: dict | None = None):
+    """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts.
+
+    move_model: optional keep/move model (``fit_move_model``); a move it judges
+    unlikely to help is not applied (the original line is kept, reason
+    ``move_unlikely_to_help``)."""
     records, stations = [], []
     junctions = find_junctions([c for _, c in pieces])
     for src_id, coords in pieces:
@@ -328,6 +376,13 @@ def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations
             o_sx=float(c[0, 0]), o_sy=float(c[0, 1]), o_ex=float(c[-1, 0]), o_ey=float(c[-1, 1]),
             coords=r.coords,
         ))
+        rec = records[-1]
+        if move_model is not None and rec["moved"]:
+            p = move_probability(move_model, rec)
+            rec["move_p"] = round(p, 3)
+            if p < move_model["threshold"]:
+                rec["coords"], rec["moved"] = c.copy(), 0
+                rec["reason"] = ";".join(r.reasons + ["move_unlikely_to_help"])
         if r.stations is not None:
             s = r.stations
             for i in range(len(s["x"])):

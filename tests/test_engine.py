@@ -89,3 +89,23 @@ def test_flagged_lines_keep_original_geometry():
     assert np.array_equal(r.coords, line)
     r2 = refine_line(line, nothing, RefineConfig(keep_flagged=False), 0.5)
     assert r2.moved
+
+
+def test_fit_move_model_keeps_unhelpful_moves():
+    """Big confident moves helped, small ones made lines worse: the model learns to skip
+    the small ones."""
+    from centerline_align.engine import fit_move_model, move_probability
+    rng = np.random.default_rng(0)
+    recs, gains = [], []
+    for k in range(60):
+        big = k % 2 == 0
+        shift = rng.uniform(4, 8) if big else rng.uniform(0.3, 1.5)
+        recs.append(dict(shift_avg=shift, shift_max=shift + 1, conf=rng.uniform(0.3, 0.6),
+                         pct_valid=rng.uniform(0.6, 1.0), width_med=rng.uniform(18, 26)))
+        gains.append(shift - 0.5 if big else -rng.uniform(0.5, 1.0))
+    model = fit_move_model(recs, gains)
+    assert model is not None
+    keep = [move_probability(model, r) >= model["threshold"] for r in recs]
+    assert keep == [k % 2 == 0 for k in range(60)]
+    assert model["gain_chosen"] > model["gain_all"]
+    assert fit_move_model(recs[:10], gains[:10]) is None      # too few lines

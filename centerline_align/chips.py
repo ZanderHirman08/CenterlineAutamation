@@ -9,8 +9,14 @@ Each chip is an imagery block (bands, H, W) around a hand-checked road, with:
   roads that haven't been checked (their true centre is unknown, so the model
   must not be told "no road here").
 
-Roads are split into training and validation by road id, so a road is never
-in both: the validation score is on roads the model has not seen.
+Training and validation are split by square blocks of ground, not by road: roads
+join, so one road's chip shows its neighbours. Training chips have the loss
+switched off inside validation blocks, and validation chips are scored only
+inside them, so the validation score is on pavement the model has not seen.
+
+Line ends are left out of the mask (``end_trim``): lines are split at junctions
+and bent through them (REVAMP manual), so near an end a line is not a pavement
+centre.
 """
 from __future__ import annotations
 
@@ -54,15 +60,42 @@ def distance_to_lines(x0, y0, res, shape, lines, max_dist=np.inf) -> np.ndarray:
 
 
 def make_labels(x0, y0, res, shape, truth, unchecked, sigma=1.0, corridor=30.0,
-                unknown_radius=15.0):
-    """(heat uint8 0-255, mask uint8 0/1) for one chip."""
+                unknown_radius=15.0, ends=None, end_trim=0.0, keep=None):
+    """(heat uint8 0-255, mask uint8 0/1) for one chip. ``ends``: line end points
+    whose surroundings (``end_trim``) are left out; ``keep``: bool (h, w), where
+    the mask may be on at all."""
     d_true = distance_to_lines(x0, y0, res, shape, truth, corridor + 3 * sigma)
     heat = np.exp(-0.5 * (d_true / sigma) ** 2)
     mask = d_true <= corridor
     if unchecked:
         d_other = distance_to_lines(x0, y0, res, shape, unchecked, unknown_radius)
         mask &= ~((d_other <= unknown_radius) & (d_true > 3 * sigma))
+    if ends is not None and len(ends) and end_trim > 0:
+        X, Y = pixel_centres(x0, y0, res, *shape)
+        for ex, ey in np.asarray(ends, float):
+            mask &= (X - ex) ** 2 + (Y - ey) ** 2 > end_trim ** 2
+    if keep is not None:
+        mask &= keep
     return np.round(heat * 255).astype(np.uint8), mask.astype(np.uint8)
+
+
+def block_of(x, y, block: float):
+    return f"{int(np.floor(x / block))}_{int(np.floor(y / block))}"
+
+
+def in_validation(x, y, block: float, fraction: float, seed: int = 0) -> bool:
+    return is_validation(block_of(x, y, block), fraction, seed)
+
+
+def validation_pixels(x0, y0, res, shape, block: float, fraction: float, seed: int = 0):
+    """bool (h, w): pixels inside validation blocks."""
+    h, w = shape
+    xs = x0 + (np.arange(w) + 0.5) * res
+    ys = y0 - (np.arange(h) + 0.5) * res
+    bx, by = np.floor(xs / block).astype(int), np.floor(ys / block).astype(int)
+    vx, vy = np.unique(bx), np.unique(by)
+    table = np.array([[is_validation(f"{i}_{j}", fraction, seed) for i in vx] for j in vy])
+    return table[np.searchsorted(vy, by)][:, np.searchsorted(vx, bx)]
 
 
 def is_validation(road_id, fraction: float, seed: int = 0) -> bool:
