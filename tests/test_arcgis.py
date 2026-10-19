@@ -562,6 +562,7 @@ def test_manual_rules_in_export_and_evaluate(toolbox, tiled_scene, tmp_path):
     df["AbandonedRoad"] = "No"
     df.loc[0, "RC_Comments"] = "Road under Construction"
     df.loc[1, "AbandonedRoad"] = "Yes"
+    df.loc[2, "RC_Comments"] = "Gated community - private"
     t = np.linspace(0, 2 * np.pi, 33)
     x, y = synthetic.X0 + 1300, synthetic.MID + 250
     ring = LineString(np.column_stack([x + 25 * np.cos(t), y + 25 * np.sin(t)]))
@@ -584,10 +585,10 @@ def test_manual_rules_in_export_and_evaluate(toolbox, tiled_scene, tmp_path):
     tool.execute(params, None)
     text = "\n".join(fake_arcpy.messages)
     assert ("Left out by the REVAMP manual rules: 1 abandoned, 1 construction, "
-            "1 cul-de-sac circle") in text, text
+            "1 cul-de-sac circle, 1 private (comment)") in text, text
     man = json.loads((tmp_path / "chips" / "manifest.json").read_text())
     checked = int((pd.concat([df, extra]).Validated == "Yes").sum())
-    assert man["roads"] == checked - 3          # the roundabout stays in
+    assert man["roads"] == checked - 4          # the roundabout stays in
 
     tool = _by_name(toolbox, "EvaluateAlignment")
     params = tool.getParameterInfo()
@@ -597,4 +598,4 @@ def test_manual_rules_in_export_and_evaluate(toolbox, tiled_scene, tmp_path):
     fake_arcpy.messages.clear()
     tool.execute(params, None)
     text = "\n".join(fake_arcpy.messages)
-    assert "1 cul-de-sac circle" in text and f"{checked - 3} checked roads" in text
+    assert "1 cul-de-sac circle" in text and f"{checked - 4} checked roads" in text

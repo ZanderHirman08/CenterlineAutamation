@@ -145,12 +145,15 @@ Google Drive\Centerline\
 
 What the export does with your roads:
 * **Ends of lines:** 40 ft at each end is left out, because lines bend through junctions (manual Examples 2–4). Where a road crosses itself (a "P" shape) the crossing is treated the same way.
-* **Manual rules:** roads with AbandonedRoad/PrivateRoad = 'Yes', roads whose RC_Comments mention construction, and existing cul-de-sacs left as circles (loops under 400 ft) are left out of training and of Evaluate. Roundabouts (ROUTE_ID with TEMP) follow the pavement and are kept. Missing roads you add are included, since they are set to Validated = 'Yes'.
+* **Manual rules:** roads with AbandonedRoad/PrivateRoad = 'Yes', roads whose RC_Comments mention construction, a private/gated road or abandonment, and existing cul-de-sacs left as circles (loops under 400 ft) are left out of training and of Evaluate. Roundabouts (ROUTE_ID with TEMP) follow the pavement and are kept. Missing roads you add are included, since they are set to Validated = 'Yes'.
 * **Roads you haven't checked:** pixels near them are left out, so the model is never told "no road" there.
 * **Validation:** 20% of the ground (1000 ft blocks) is kept for testing and never trained on, so the score is honest.
 * **Traced roads:** used for training but not scored, since the county layer would win there by default.
 
 ## 7. Manual rules the project keeps
+
+Every rule in the manual, and how each one is handled: [docs/MANUAL_COMPLIANCE.md](docs/MANUAL_COMPLIANCE.md).
+
 
 * No Attribute Transfer, and line direction is never changed.
 * No curve tools; new cul-de-sacs are straight.

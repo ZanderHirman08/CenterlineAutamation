@@ -508,12 +508,20 @@ def _norm(name) -> str:
     return str(name).lower().replace("_", "").replace(" ", "")
 
 
+# RC_Comments notes that mean "don't learn from this road" (manual FAQ: private and
+# gated roads and roads under construction are noted there)
+COMMENT_RULES = ((("construct",), "construction"),
+                 (("private", "gated", "gate "), "private (comment)"),
+                 (("abandon",), "abandoned (comment)"))
+
+
 def road_rules(arcpy, fc):
     """Roads the REVAMP manual says not to learn from or score on, and roundabouts.
 
     Returns ({oid: reason}, {oids with a TEMP route id (roundabouts)}, [fields used]):
-    AbandonedRoad / PrivateRoad = 'Yes' (there may be no pavement) and RC_Comments
-    mentioning construction (the imagery may not show the road as validated).
+    AbandonedRoad / PrivateRoad = 'Yes' (there may be no pavement), and RC_Comments
+    mentioning construction (the imagery may not show the road as validated), a
+    private or gated road, or abandonment (see ``COMMENT_RULES``).
     Field names are matched ignoring case, underscores and spaces."""
     names = {_norm(f.name): f.name for f in arcpy.ListFields(fc)}
     yes_fields = [(names[k], why) for k, why in (("abandonedroad", "abandoned"),
@@ -530,8 +538,10 @@ def road_rules(arcpy, fc):
             for f, why in yes_fields:
                 if str(vals[f]).strip().lower() == "yes":
                     reasons.setdefault(oid, why)
-            if comment and "construct" in str(vals[comment] or "").lower():
-                reasons.setdefault(oid, "construction")
+            note = str(vals[comment] or "").lower() if comment else ""
+            for words, why in COMMENT_RULES:
+                if any(w in note for w in words):
+                    reasons.setdefault(oid, why)
             if route and "temp" in str(vals[route] or "").lower():
                 temp.add(oid)
     return reasons, temp, fields
