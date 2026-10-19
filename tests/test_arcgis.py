@@ -451,7 +451,7 @@ def test_train_on_exported_chips(toolbox, tiled_scene, tmp_path):
     import train_centerline as tc
     _export(toolbox, tiled_scene, tmp_path)
     info = tc.train(str(tmp_path / "chips"), str(tmp_path / "model"), encoder="resnet18",
-                    encoder_weights=None, epochs=2, batch_size=8, num_workers=0)
+                    encoder_weights=None, epochs=2, batch_size=8, eval_every=1)
     assert len(info["history"]) == 2 and info["best"]["points"] > 0
     assert (tmp_path / "model" / "best_model.pt").exists()
     saved = json.loads((tmp_path / "model" / "model_info.json").read_text())
@@ -464,7 +464,7 @@ def test_train_on_exported_chips(toolbox, tiled_scene, tmp_path):
     assert s["found"] > 0.9 and s["median"] < 0.2
     # resuming after the last epoch does nothing more
     again = tc.train(str(tmp_path / "chips"), str(tmp_path / "model"), encoder="resnet18",
-                     encoder_weights=None, epochs=2, batch_size=8, num_workers=0)
+                     encoder_weights=None, epochs=2, batch_size=8, eval_every=1)
     assert len(again["history"]) == 2 and again["best"] == info["best"]
 
 

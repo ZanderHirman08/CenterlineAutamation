@@ -35,7 +35,7 @@ DEFAULTS = dict(
     pos_weight=10.0,              # extra weight on the ridge, which is a thin target
     search_ft=15.0,               # look this far each side of the line for the crest
     min_peak=0.3,                 # a crest weaker than this counts as "not found"
-    num_workers=2,
+    eval_every=5,                 # score the validation chips every this many epochs (and last)
     seed=0,
 )
 
@@ -43,7 +43,8 @@ DEFAULTS = dict(
 # --------------------------------------------------------------------------- data
 
 def load_chips(folder: str):
-    """{'train': dict, 'val': dict} with image (N,C,H,W) uint8, heat, mask, lines."""
+    """{'train': dict, 'val': dict} with image (N,C,H,W) uint8, heat, mask, lines.
+    Arrays are filled shard by shard, so memory holds one copy of the chips."""
     with open(os.path.join(folder, "manifest.json")) as f:
         manifest = json.load(f)
     out = {}
@@ -51,44 +52,67 @@ def load_chips(folder: str):
         files = sorted(glob.glob(os.path.join(folder, f"shard_{split}_*.npz")))
         if not files:
             raise FileNotFoundError(f"No {split} shards in {folder}")
-        parts = [np.load(p) for p in files]
-        lines = []
+        sizes, lines = [], []
         for p in files:
             with open(p[:-4] + ".json") as f:
                 lines += json.load(f)
-        out[split] = dict(image=np.concatenate([q["image"] for q in parts]),
-                          heat=np.concatenate([q["heat"] for q in parts]),
-                          mask=np.concatenate([q["mask"] for q in parts]),
-                          road=np.concatenate([q["road"] for q in parts]),
-                          lines=lines)
+            with np.load(p) as q:
+                sizes.append(len(q["road"]))
+                if len(sizes) == 1:
+                    shapes = {k: q[k].shape[1:] for k in ("image", "heat", "mask")}
+        n = sum(sizes)
+        d = {k: np.empty((n,) + shapes[k], np.uint8) for k in shapes}
+        d["road"], start = [], 0
+        for p, size in zip(files, sizes):
+            with np.load(p) as q:
+                for k in shapes:
+                    d[k][start:start + size] = q[k]
+                d["road"] += q["road"].tolist()
+            start += size
+        d["road"] = np.array(d["road"])
+        d["lines"] = lines
+        out[split] = d
     return manifest, out
 
 
-def channel_stats(images: np.ndarray):
-    x = images.astype(np.float32) / 255.0
+def channel_stats(images: np.ndarray, sample: int = 500):
+    pick = np.linspace(0, len(images) - 1, min(sample, len(images))).astype(int)
+    x = images[pick].astype(np.float32) / 255.0
     return x.mean(axis=(0, 2, 3)).tolist(), (x.std(axis=(0, 2, 3)) + 1e-6).tolist()
 
 
-class ChipDataset(torch.utils.data.Dataset):
-    def __init__(self, data, mean, std, augment=False):
-        self.d, self.augment = data, augment
-        self.mean = torch.tensor(mean).view(-1, 1, 1)
-        self.std = torch.tensor(std).view(-1, 1, 1)
+def to_device(data, device):
+    """Chips as uint8 tensors on the GPU (about 0.4 MB each), so batches need no CPU
+    work: free Colab has 2 CPU cores, which would otherwise leave the GPU idle."""
+    keep = device if data["image"].nbytes < 6e9 else "cpu"
+    return tuple(torch.from_numpy(data[k]).to(keep) for k in ("image", "heat", "mask"))
 
-    def __len__(self):
-        return len(self.d["image"])
 
-    def __getitem__(self, i):
-        x = torch.from_numpy(self.d["image"][i]).float() / 255.0
-        y = torch.from_numpy(self.d["heat"][i]).float()[None] / 255.0
-        m = torch.from_numpy(self.d["mask"][i]).float()[None]
-        if self.augment:  # the ridge rotates with the image, so these are free labels
-            k = int(torch.randint(0, 4, (1,)))
-            x, y, m = (torch.rot90(t, k, (1, 2)) for t in (x, y, m))
-            if torch.rand(1) < 0.5:
-                x, y, m = (torch.flip(t, (2,)) for t in (x, y, m))
-            x = x * (0.9 + 0.2 * torch.rand(1)) + 0.05 * (torch.rand(1) - 0.5)  # light/contrast
-        return (x - self.mean) / self.std, y, m
+def make_batch(tensors, idx, mean, std, device, augment):
+    """Normalised images, targets and masks for chips ``idx``; with ``augment``, a
+    random rotation / mirror (the ridge turns with the image, so labels stay right)
+    and a small brightness / contrast change per chip."""
+    images, heat, mask = tensors
+    idx = idx.to(images.device)
+    x = images[idx].to(device).float() / 255.0
+    y = heat[idx].to(device).float()[:, None] / 255.0
+    m = mask[idx].to(device).float()[:, None]
+    if augment:
+        b = len(idx)
+        k = torch.randint(0, 4, (b,), device=device)
+        flip = torch.rand(b, device=device) < 0.5
+        for t in (x, y, m):
+            for kk in range(1, 4):
+                sel = k == kk
+                if sel.any():
+                    t[sel] = torch.rot90(t[sel], kk, (2, 3))
+            if flip.any():
+                t[flip] = torch.flip(t[flip], (3,))
+        x = x * (0.9 + 0.2 * torch.rand(b, 1, 1, 1, device=device)) \
+            + 0.05 * (torch.rand(b, 1, 1, 1, device=device) - 0.5)
+    mean_t = torch.tensor(mean, device=device).view(1, -1, 1, 1)
+    std_t = torch.tensor(std, device=device).view(1, -1, 1, 1)
+    return (x - mean_t) / std_t, y, m
 
 
 # --------------------------------------------------------------------------- model
@@ -128,20 +152,25 @@ def crest_errors(prob, lines, res, search_ft=15.0, min_peak=0.3, border=8, mask=
             r = np.clip(np.round(c[:, 1]).astype(int), 0, h - 1)
             q = np.clip(np.round(c[:, 0]).astype(int), 0, w - 1)
             ok &= mask[r, q] > 0
-        for (cx, cy), (nx, ny) in zip(c[ok][::2], n[ok][::2]):  # every ~4 px (2 ft)
-            cols, rows = cx + offs * nx, cy + offs * ny
-            v = ndimage.map_coordinates(prob, [rows, cols], order=1, mode="constant")
-            i = int(np.argmax(v))
-            if v[i] < min_peak:
-                errs.append(np.nan)
-                continue
-            sub = 0.0
-            if 0 < i < len(v) - 1:  # parabola through the top three samples
-                den = v[i - 1] - 2 * v[i] + v[i + 1]
-                if den < 0:
-                    sub = 0.5 * (v[i - 1] - v[i + 1]) / den
-            errs.append(abs(offs[i] + sub * 0.25) * res)
-    return np.array(errs)
+        c, n = c[ok][::2], n[ok][::2]  # every ~4 px (2 ft)
+        if not len(c):
+            continue
+        cols = c[:, :1] + offs[None] * n[:, :1]
+        rows = c[:, 1:] + offs[None] * n[:, 1:]
+        v = ndimage.map_coordinates(prob, [rows.ravel(), cols.ravel()], order=1,
+                                    mode="constant").reshape(rows.shape)
+        i = np.argmax(v, axis=1)
+        k = np.arange(len(v))
+        top = v[k, i]
+        inner = (i > 0) & (i < len(offs) - 1)
+        lo, hi = v[k, np.maximum(i - 1, 0)], v[k, np.minimum(i + 1, len(offs) - 1)]
+        den = lo - 2 * top + hi
+        use = inner & (den < 0)  # parabola through the top three samples
+        sub = np.where(use, 0.5 * (lo - hi) / np.where(use, den, -1.0), 0.0)
+        e = np.abs(offs[i] + sub * 0.25) * res
+        e[top < min_peak] = np.nan
+        errs.append(e)
+    return np.concatenate(errs) if errs else np.zeros(0)
 
 
 def summarize(errs):
@@ -167,10 +196,12 @@ def predict_probs(model, images, mean, std, device, batch=16):
     return np.concatenate(out)
 
 
-def evaluate(model, val, mean, std, res, device, cfg):
-    probs = predict_probs(model, val["image"], mean, std, device)
-    errs = [crest_errors(p, ln, res, cfg["search_ft"], cfg["min_peak"], mask=m)
-            for p, ln, m in zip(probs, val["lines"], val["mask"])]
+def evaluate(model, val, mean, std, res, device, cfg, batch=64):
+    errs = []
+    for i in range(0, len(val["image"]), batch):  # in parts: 448+ chips of floats is big
+        probs = predict_probs(model, val["image"][i:i + batch], mean, std, device)
+        errs += [crest_errors(p, ln, res, cfg["search_ft"], cfg["min_peak"], mask=m)
+                 for p, ln, m in zip(probs, val["lines"][i:i + batch], val["mask"][i:i + batch])]
     return summarize(np.concatenate(errs) if errs else np.zeros(0))
 
 
@@ -201,9 +232,8 @@ def train(chips_folder, out_folder, **overrides):
     sched = torch.optim.lr_scheduler.OneCycleLR(
         opt, max_lr=cfg["lr"], total_steps=cfg["epochs"] * math.ceil(
             len(data["train"]["image"]) / cfg["batch_size"]))
-    loader = torch.utils.data.DataLoader(
-        ChipDataset(data["train"], mean, std, augment=True), batch_size=cfg["batch_size"],
-        shuffle=True, num_workers=cfg["num_workers"], drop_last=False)
+    tensors = to_device(data["train"], device)
+    n_train = len(data["train"]["image"])
     scaler = torch.amp.GradScaler("cuda", enabled=device == "cuda")
 
     ckpt = os.path.join(out_folder, "checkpoint.pt")
@@ -218,8 +248,10 @@ def train(chips_folder, out_folder, **overrides):
     for epoch in range(start, cfg["epochs"]):
         model.train()
         t0, total, n = time.time(), 0.0, 0
-        for x, y, m in loader:
-            x, y, m = x.to(device), y.to(device), m.to(device)
+        order = torch.randperm(n_train)
+        for i in range(0, n_train, cfg["batch_size"]):
+            x, y, m = make_batch(tensors, order[i:i + cfg["batch_size"]], mean, std, device,
+                                 augment=True)
             with torch.autocast(device_type=device, enabled=device == "cuda"):
                 logits = model(x)
             loss = masked_loss(logits.float(), y, m, cfg["pos_weight"])
@@ -229,16 +261,20 @@ def train(chips_folder, out_folder, **overrides):
             scaler.update()
             sched.step()
             total, n = total + loss.item() * len(x), n + len(x)
-        score = evaluate(model, data["val"], mean, std, res, device, cfg)
+        line = f"epoch {epoch + 1}/{cfg['epochs']}: loss {total / max(n, 1):.4f}"
+        last = epoch == cfg["epochs"] - 1
+        if last or (epoch + 1) % cfg["eval_every"] == 0:
+            score = evaluate(model, data["val"], mean, std, res, device, cfg)
+            line += (f", validation median {score.get('median', float('nan')):.2f} ft, within "
+                     f"1 ft {score.get('within1', 0):.0%}, crest found "
+                     f"{score.get('found', 0):.0%}")
+            if best is None or score.get("median", 1e9) < best.get("median", 1e9):
+                best = dict(epoch=epoch, **score)
+                torch.save(model.state_dict(), os.path.join(out_folder, "best_model.pt"))
+        else:
+            score = {}
         history.append(dict(epoch=epoch, loss=total / max(n, 1), **score))
-        print(f"epoch {epoch + 1}/{cfg['epochs']}: loss {total / max(n, 1):.4f}, validation "
-              f"median {score.get('median', float('nan')):.2f} ft, within 1 ft "
-              f"{score.get('within1', 0):.0%}, crest found {score.get('found', 0):.0%} "
-              f"({time.time() - t0:.0f}s)")
-        is_best = best is None or score.get("median", 1e9) < best.get("median", 1e9)
-        if is_best:
-            best = dict(epoch=epoch, **score)
-            torch.save(model.state_dict(), os.path.join(out_folder, "best_model.pt"))
+        print(line + f" ({time.time() - t0:.0f}s)")
         torch.save(dict(model=model.state_dict(), opt=opt.state_dict(),
                         sched=sched.state_dict(), epoch=epoch, best=best,
                         history=history), ckpt)
