@@ -359,6 +359,9 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
                              f"{'4' if clf.has_nir else '3'} bands; set the same bands here.")
         if clf.lidar and not lidar_folder:
             raise ValueError("The trained classifier uses LiDAR: give the LiDAR folder.")
+        if clf.move_model:
+            msg("It includes a keep/move model: moves it judges unlikely to help keep the "
+                "original line (REASON move_unlikely_to_help; MOVE_P = its estimate).")
     elif os.path.exists(model_path):
         clf = RoadClassifier.load(model_path)
         msg(f"Using saved classifier {model_path}")
@@ -424,7 +427,8 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
                     h = pmap.prob.shape[0]
                     _save_raster(arcpy, pmap.prob, pmap.x0, pmap.y0 - h * pmap.res, pmap.res,
                                  os.path.join(prob_dir, f"road_prob_{_safe(gid)}.tif"), sr)
-                records, _ = refine_pieces(pmap, pieces, rcfg, reader.res)
+                records, _ = refine_pieces(pmap, pieces, rcfg, reader.res,
+                                           move_model=clf.move_model)
             for r in records:
                 r["grid_id"] = gid
                 r["coords"] = np.asarray(r["coords"]).tolist()
@@ -542,7 +546,7 @@ def _id_field_type(arcpy, fc, field):
 OUT_FIELDS = [("SRC_ID", None), ("GRID_ID", "TEXT"), ("SHIFT_AVG", "DOUBLE"),
               ("SHIFT_MAX", "DOUBLE"), ("CONF", "DOUBLE"), ("PCT_VALID", "DOUBLE"),
               ("WIDTH_MED", "DOUBLE"), ("REVIEW", "SHORT"), ("REASON", "TEXT"),
-              ("MOVED", "SHORT")]
+              ("MOVED", "SHORT"), ("MOVE_P", "DOUBLE")]
 
 
 def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
@@ -564,7 +568,7 @@ def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
             src = r["src_id"] if id_type != "TEXT" else str(r["src_id"])
             cur.insertRow([src, str(r["grid_id"]), r["shift_avg"], r["shift_max"], r["conf"],
                            r["pct_valid"], r["width_med"], int(r["review"]), r["reason"],
-                           int(r.get("moved", 1)), line])
+                           int(r.get("moved", 1)), r.get("move_p"), line])
 
 
 # --------------------------------------------------------------------------- evaluation

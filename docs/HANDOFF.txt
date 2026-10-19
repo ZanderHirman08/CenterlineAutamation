@@ -169,8 +169,21 @@ TRAINING FROM DAILY EDITS (added 2026-10-19)
      new vs current model (+ optional compare layers); promotes to
      models/road_classifier.json if median <= current; models/history.csv.
 - Align tool: new "Trained classifier" parameter (classifier_file).
-- Not built yet: a per-road keep/move/flag model from CHANGED + tool
-  confidence/shift/cover (targets the ~1 ft noise on already-right lines).
+- Follows the REVAMP Phase 6 manual (user's PDF, version 2026-05-01-01):
+  AbandonedRoad/PrivateRoad = 'Yes' excluded automatically (field names
+  matched case/underscore-insensitively); 40 ft line ends left out of road
+  labels and of the keep/move comparison (lines split at intersections, simple
+  snapping, T's bend along the turn); unedited Yes = "within pavement" (meets
+  standard), not exact centre; optional reference layer in End of Day marks
+  TRACED roads, nightly test adds a non-traced table; GIO imagery is primary.
+- Keep/move model (engine.fit_move_model / move_probability): logistic
+  regression on shift_avg, shift_max, conf, pct_valid, width_med of moved
+  lines in the training grids; label = move brought line >= 0.5 closer to
+  the checked line; threshold chosen to maximise total gain. Stored in
+  RoadClassifier.move_model; Align applies it (MOVE_P field, reason
+  move_unlikely_to_help). Needs >= 20 moved lines with both outcomes.
+  Fitted on the same grids the classifier trained on (slightly optimistic);
+  the held-back grids judge it.
 
 HOW THE USER WORKS
 ------------------

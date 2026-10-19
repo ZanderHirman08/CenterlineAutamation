@@ -15,6 +15,19 @@ Three toolbox buttons, used in this order:
    off), then measures on grids held back from training how close the tool gets
    the original lines to your edits, and whether the new model beats the last.
 
+Following the REVAMP Phase 6 manual:
+
+* Roads marked abandoned or private (``AbandonedRoad`` / ``PrivateRoad`` = 'Yes',
+  when the layer has those fields) are never used: there may be no pavement.
+* The ends of every line are left out of the road labels: lines are split at
+  intersections, and the manual snaps them simply and bends T-intersections along
+  the turn, so near a junction a line is not a pavement centre.
+* Roads traced from a reference layer (the manual's Replace Geometry > Trace) are
+  marked, so the nightly test can also report on the roads drawn from the imagery.
+* A road checked without an edit means "meets the standard" (the line falls
+  within the pavement), not "on the exact centre". Such roads teach the keep/move
+  model to leave good lines alone.
+
 Nothing is ever written to the road layer. Everything lives in the training
 folder: ``originals.json``, ``training_roads.json`` and ``models\\``.
 """
@@ -33,8 +46,8 @@ from .arcgis_impl import (ArcTileReader, _ArcHandler, _cover_classes, _overlaps,
                           read_lines)
 from .classifier import RoadClassifier
 from .config import ClassifierConfig, RefineConfig
-from .engine import (find_junctions, pick_spread, refine_pieces, region_probability,
-                     train_classifier)
+from .engine import (find_junctions, fit_move_model, move_probability, pick_spread,
+                     refine_pieces, region_probability, train_classifier)
 from .evaluate import SegmentIndex, eval_report, near_junctions, sample_lines
 from .geom import cumlen, interpolate
 
@@ -45,6 +58,10 @@ CURRENT_MODEL = "road_classifier.json"
 HOLDOUT_EVERY = 5      # about 1 grid in 5 with checked roads is kept for testing
 SAMPLE_SPACING = 5.0   # how often lines are compared (map units)
 MATCH_DIST = 40.0      # an original farther than this from the edited line isn't its match
+END_TRIM = 40.0        # line ends left out of the road labels (intersections)
+TRACE_TOL = 0.5        # a road this close to the reference layer along...
+TRACE_SHARE = 0.8      # ...this share of its length was traced from it
+EXCLUDE_FIELDS = ("abandonedroad", "privateroad")   # 'Yes' = not used (no pavement)
 
 
 def _today() -> str:
@@ -94,6 +111,19 @@ def _read_roads(arcpy, roads_fc, where=None, sr=None):
                          f"field name and value (text values need quotes, e.g. "
                          f"Validated = 'Yes').")
     return out
+
+
+def _excluded(arcpy, roads_fc):
+    """OIDs marked abandoned or private ('Yes'), and the fields that said so."""
+    fields = [f.name for f in arcpy.ListFields(roads_fc)
+              if f.name.lower().replace("_", "").replace(" ", "") in EXCLUDE_FIELDS]
+    out = set()
+    if fields:
+        with arcpy.da.SearchCursor(roads_fc, ["OID@"] + fields) as cur:
+            for row in cur:
+                if any(str(v).strip().lower() == "yes" for v in row[1:]):
+                    out.add(int(row[0]))
+    return out, fields
 
 
 def _with_log(arcpy, fn, *a, **k):
@@ -147,7 +177,7 @@ def snapshot(arcpy, *, roads_fc, checked_where, training_folder, today=None):
 # --------------------------------------------------------------------------- 2. collect
 
 def collect(arcpy, *, roads_fc, checked_where, training_folder, out_fc=None,
-            min_change=1.0, today=None):
+            min_change=1.0, reference_fc=None, today=None):
     """End of day: refresh the training roads from every checked road."""
     msg = arcpy.AddMessage
     today = today or _today()
@@ -163,12 +193,24 @@ def collect(arcpy, *, roads_fc, checked_where, training_folder, out_fc=None,
     if not checked:
         raise ValueError(f"No roads match {checked_where!r}. "
                          + _value_hint(arcpy, roads_fc, checked_where))
+    skip, fields = _excluded(arcpy, roads_fc)
+    skipped = len(set(checked) & skip)
+    checked = {k: v for k, v in checked.items() if k not in skip}
+    if fields:
+        msg(f"Roads with {' or '.join(fields)} = 'Yes' are not used ({skipped} checked "
+            "road(s) left out).")
+    if not checked:
+        raise ValueError("Every checked road is marked abandoned or private.")
+    ref = None
+    if reference_fc:
+        ref = SegmentIndex([c for _, _, parts, _ in read_lines(arcpy, reference_fc, "OID@", sr)
+                            for c in parts])
     prev = (_load(training_folder, TRAINING) or {}).get("roads", {})
     originals = {int(k): [np.asarray(c) for c in v["parts"]] for k, v in orig["roads"].items()}
     every = None   # all originals, for roads split or added since their snapshot
 
     roads = {}
-    counts = dict(new_moved=0, new_same=0, re_edited=0, kept=0, no_original=0)
+    counts = dict(new_moved=0, new_same=0, re_edited=0, kept=0, no_original=0, traced=0)
     for oid, parts in checked.items():
         pts, tans, _ = sample_lines(parts, SAMPLE_SPACING)
         if oid in originals:
@@ -188,6 +230,13 @@ def collect(arcpy, *, roads_fc, checked_where, training_folder, out_fc=None,
             changed = int(shift_max >= min_change)
         if oid not in originals:
             known = False   # split or added: compared with the nearest originals only
+        traced = 0
+        if ref is not None and len(pts):
+            dr = ref.distances(pts, tans, MATCH_DIST)
+            traced = int(np.mean(dr <= TRACE_TOL) >= TRACE_SHARE)   # NaN counts as no
+        elif str(oid) in prev:
+            traced = prev[str(oid)].get("traced", 0)
+        counts["traced"] += traced
         old = prev.get(str(oid))
         parts_r = _round(parts)
         if old is not None and _same(old["parts"], parts_r):
@@ -204,7 +253,8 @@ def collect(arcpy, *, roads_fc, checked_where, training_folder, out_fc=None,
         if shift_avg is None:
             counts["no_original"] += 1
         roads[str(oid)] = dict(day=day, parts=parts_r, changed=changed, shift_avg=shift_avg,
-                               shift_max=shift_max, original_known=bool(known))
+                               shift_max=shift_max, original_known=bool(known),
+                               traced=traced)
     dropped = len(set(prev) - set(roads))
     _save(training_folder, TRAINING, {"sr": sr.exportToString(), "updated": today,
                                       "roads": roads})
@@ -221,17 +271,20 @@ def collect(arcpy, *, roads_fc, checked_where, training_folder, out_fc=None,
         arcpy.AddWarning(f"{counts['no_original']} checked road(s) are more than "
                          f"{MATCH_DIST:g} map units from any original line; they are kept but "
                          "not used for measuring.")
+    if ref is not None:
+        msg(f"{counts['traced']} checked road(s) follow {reference_fc} within {TRACE_TOL:g} "
+            "(traced); the nightly test also reports on the others separately.")
     moved = [r["shift_avg"] for r in roads.values() if r["changed"] and r["shift_avg"] is not None]
     if moved:
         msg(f"Roads you moved were off by a median of {np.median(moved):.1f} on average.")
     if out_fc:
         _write_training_fc(arcpy, out_fc, roads, sr)
         msg(f"Training roads written to {out_fc}")
-    return dict(counts, total=len(roads), changed=n_changed, dropped=dropped)
+    return dict(counts, total=len(roads), changed=n_changed, dropped=dropped, skipped=skipped)
 
 
 TRAIN_FIELDS = [("ROAD_OID", "LONG"), ("DAY", "TEXT"), ("CHANGED", "SHORT"),
-                ("SHIFT_AVG", "DOUBLE"), ("SHIFT_MAX", "DOUBLE")]
+                ("SHIFT_AVG", "DOUBLE"), ("SHIFT_MAX", "DOUBLE"), ("TRACED", "SHORT")]
 
 
 def _write_training_fc(arcpy, out_fc, roads, sr):
@@ -249,7 +302,7 @@ def _write_training_fc(arcpy, out_fc, roads, sr):
             for c in r["parts"]:
                 line = arcpy.Polyline(arcpy.Array([arcpy.Point(x, y) for x, y in c]), sr)
                 cur.insertRow([int(oid), r["day"], r["changed"], r["shift_avg"],
-                               r["shift_max"], line])
+                               r["shift_max"], r.get("traced", 0), line])
 
 
 # --------------------------------------------------------------------------- 3. train
@@ -276,6 +329,16 @@ def _ext(c):
 
 def _grow(e, d):
     return (e[0] - d, e[1] - d, e[2] + d, e[3] + d)
+
+
+def trim_ends(c, d: float):
+    """The part of a line more than ``d`` from both ends, or None if too short."""
+    s = cumlen(c)
+    if s[-1] <= 2 * d + 10.0:
+        return None
+    inner = (s > d) & (s < s[-1] - d)
+    ends = interpolate(c, np.array([d, s[-1] - d]), s)
+    return np.vstack([ends[:1], c[inner], ends[1:]])
 
 
 def train(arcpy, *, imagery, training_folder, grids_fc, grid_id_field, bands,
@@ -332,26 +395,34 @@ def _train(arcpy, imagery, training_folder, grids_fc, grid_id_field, bands, comp
 
     ccfg = ClassifierConfig(training_grids=training_grids)
     train_on = pick_spread(learn, training_grids)
-    cells = [[c for (_, c, _, _), h in zip(truth, home) if h == gi] for gi in train_on]
     test_set = set(holdout)
-    learn_truth = [(c, e) for (_, c, e, _), h in zip(truth, home) if h not in test_set]
+    learn_truth = []   # (trimmed coords, ext, home grid): road labels, ends left out
+    for (_, c, _, _), h in zip(truth, home):
+        t = trim_ends(c, END_TRIM)
+        if t is not None and h not in test_set:
+            learn_truth.append((t, _ext(t), h))
+    cells = [[c for c, _, h in learn_truth if h == gi] for gi in train_on]
+    if not any(cells):
+        raise ValueError("The training grids have no checked roads longer than "
+                         f"{2 * END_TRIM:g} to learn from yet.")
 
     def lines_near(b):
-        return ([c for c, e in learn_truth if _overlaps(e, b)]
+        return ([c for _, c, e, _ in truth if _overlaps(e, b)]
                 + [c for _, c, e in originals if _overlaps(e, b)])
 
     def trusted_near(b):
         # road labels on your lines only; the originals (and roads in the test grids)
         # just keep road pixels out of the not-road labels
-        return ([(c, None) for c, e in learn_truth if _overlaps(e, b)],
+        return ([(c, None) for c, e, _ in learn_truth if _overlaps(e, b)],
                 [c for _, c, e in originals if _overlaps(e, b)]
-                + [c for (_, c, e, _), h in zip(truth, home) if h in test_set
-                   and _overlaps(e, b)])
+                + [c for _, c, e, _ in truth if _overlaps(e, b)])
 
     msg("Training the road classifier on grid(s): "
         + ", ".join(str(grids[g][0]) for g in train_on))
     clf = train_classifier(reader, cells, lines_near, ccfg, None, trusted_near=trusted_near)
     clf.trained_from = f"{len(learn_truth)} checked road parts, {today}"
+    clf.move_model = _learn_moves(arcpy, msg, reader, grids, train_on, truth, home,
+                                  originals, clf, rcfg, ccfg, sr)
     models = os.path.join(training_folder, MODELS)
     os.makedirs(models, exist_ok=True)
     dated = os.path.join(models, f"road_classifier_{today}.json")
@@ -385,14 +456,14 @@ def _score(arcpy, msg, reader, grids, holdout, truth, home, originals, clf, prev
            rcfg, ccfg, sr):
     """Align the original lines in the test grids with each model and compare with your
     edits. Roads whose original is unknown (checked before the first snapshot) are skipped."""
-    test = [(c, e) for (_, c, e, r), h in zip(truth, home)
+    test = [(c, e, r.get("traced", 0)) for (_, c, e, r), h in zip(truth, home)
             if h in set(holdout) and r.get("original_known")]
     if not test:
         arcpy.AddWarning("The test grids have no checked roads with a known original yet, so "
                          "the models can't be measured.")
         return {}
     near = [(oid, c, e) for oid, c, e in originals
-            if any(_overlaps(e, _grow(te, MATCH_DIST)) for _, te in test)]
+            if any(_overlaps(e, _grow(te, MATCH_DIST)) for _, te, _ in test)]
     roads = [(oid, arcpy.Polyline(arcpy.Array([arcpy.Point(x, y) for x, y in c]), sr), [c], e)
              for oid, c, e in near]
     models = [("Tool, new model", clf)] + ([("Tool, current model", prev)] if prev else [])
@@ -404,11 +475,12 @@ def _score(arcpy, msg, reader, grids, holdout, truth, home, originals, clf, prev
         lines = [c for _, c in pieces]
         for name, model in models:
             pmap = region_probability(reader, model, None, grids[gi][2], lines, rcfg, ccfg)
-            records, _ = refine_pieces(pmap, pieces, rcfg, reader.res)
+            records, _ = refine_pieces(pmap, pieces, rcfg, reader.res,
+                                       move_model=model.move_model)
             aligned[name] += [np.asarray(r["coords"]) for r in records]
         msg(f"Test grid {grids[gi][0]}: {len(pieces)} road pieces aligned")
 
-    lines = [c for c, _ in test]
+    lines = [c for c, _, _ in test]
     pts, tans, line_idx = sample_lines(lines, SAMPLE_SPACING)
     errors = {"Original lines": SegmentIndex([c for _, c, _ in near]).distances(
         pts, tans, MATCH_DIST)}
@@ -422,13 +494,77 @@ def _score(arcpy, msg, reader, grids, holdout, truth, home, originals, clf, prev
     msg(f"How close each layer is to your edits on {len(lines)} checked road part(s) in the "
         "test grids (smaller is better):")
     units = sr.linearUnitName or ""
-    for line in eval_report(errors, cover,
-                            "ft" if "foot" in units.lower() or "feet" in units.lower() else ""):
+    ft = "ft" if "foot" in units.lower() or "feet" in units.lower() else ""
+    for line in eval_report(errors, cover, ft):
         msg(line)
-    allm = np.all([~np.isnan(e) for e in errors.values()], axis=0)
-    med = {k: float(np.median(e[allm])) if allm.any() else None for k, e in errors.items()}
+    traced = np.array([t for _, _, t in test], bool)[line_idx]
+    if traced.any() and not traced.all():
+        msg("")
+        msg(f"Only roads you did NOT trace from a reference layer ({(~traced).sum()} points): "
+            "the fair test against that layer")
+        for line in eval_report({k: e[~traced] for k, e in errors.items()}, cover[~traced], ft):
+            msg(line)
+    # models are compared away from intersections, where the manual's snapping rules
+    # (not the pavement centre) decide where a line goes
+    use = np.all([~np.isnan(e) for e in errors.values()], axis=0) & (cover != "intersection")
+    med = {k: float(np.median(e[use])) if use.any() else None for k, e in errors.items()}
+    msg(f"Median distance to your edits away from intersections ({int(use.sum())} points): "
+        + ", ".join(f"{k} {v:.2f}" for k, v in med.items() if v is not None))
     return {"original": med["Original lines"], "new": med["Tool, new model"],
-            "previous": med.get("Tool, current model"), "points": int(allm.sum())}
+            "previous": med.get("Tool, current model"), "points": int(use.sum())}
+
+
+def _learn_moves(arcpy, msg, reader, grids, train_on, truth, home, originals, clf, rcfg,
+                 ccfg, sr):
+    """Align the original lines of checked roads in the training grids and learn which
+    moves bring a line closer to the checked line (keep/move model)."""
+    by_oid: dict = {}
+    for (oid, c, _, r), h in zip(truth, home):
+        if r.get("original_known") and h in train_on:
+            by_oid.setdefault(oid, []).append(c)
+    orig = [(oid, c, e) for oid, c, e in originals if oid in by_oid]
+    if not orig:
+        msg("Keep/move model: no checked roads with a known original in the training grids "
+            "yet.")
+        return None
+    roads = [(oid, arcpy.Polyline(arcpy.Array([arcpy.Point(x, y) for x, y in c]), sr), [c], e)
+             for oid, c, e in orig]
+    recs, gains = [], []
+    for gi in train_on:
+        pieces = clip_to_grid(arcpy, roads, grids, gi, sr)
+        if not pieces:
+            continue
+        pmap = region_probability(reader, clf, None, grids[gi][2], [c for _, c in pieces],
+                                  rcfg, ccfg)
+        records, _ = refine_pieces(pmap, pieces, rcfg, reader.res)
+        for (oid, c0), rec in zip([p for p in pieces if len(p[1]) >= 2], records):
+            if not rec["moved"]:
+                continue
+            truth_idx = SegmentIndex(by_oid[oid])
+            # compare away from the ends (intersections follow the manual's snapping rules)
+            before, after = trim_ends(np.asarray(c0), END_TRIM), trim_ends(
+                np.asarray(rec["coords"]), END_TRIM)
+            if before is None or after is None:
+                continue
+            e = []
+            for line in (before, after):
+                p, t, _ = sample_lines([line], SAMPLE_SPACING)
+                d = truth_idx.distances(p, t, MATCH_DIST)
+                e.append(float(np.nanmean(d)) if np.mean(~np.isnan(d)) >= 0.5 else np.nan)
+            if not np.isnan(e).any():
+                recs.append(rec)
+                gains.append(e[0] - e[1])
+    model = fit_move_model(recs, gains)
+    if model is None:
+        msg(f"Keep/move model: {len(recs)} moved line(s) to learn from; need at least 20 with "
+            "moves that helped and moves that didn't. Every move is applied for now.")
+        return None
+    kept = sum(move_probability(model, r) < model["threshold"] for r in recs)
+    msg(f"Keep/move model learned from {len(recs)} moved lines: it keeps the original for "
+        f"{kept} of them. On these lines, applying every move would bring them "
+        f"{model['gain_all']:+.0f} closer in total, applying only the chosen ones "
+        f"{model['gain_chosen']:+.0f}.")
+    return model
 
 
 def _append_history(models, today, n_roads, n_train, n_test, clf, scores, promoted):

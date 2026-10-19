@@ -238,12 +238,17 @@ class EndOfDay:
     def __init__(self):
         self.label = "2. End of Day: Collect My Edits"
         self.description = (
-            "Run when you finish editing. Every checked road becomes training data, with how "
-            "far you moved it from its original. Only reads the road layer.")
+            "Run when you finish editing (save your edits first). Every checked road becomes "
+            "training data, with how far you moved it from its original; abandoned and private "
+            "roads are left out. Only reads the road layer.")
         self.canRunInBackground = True
 
     def getParameterInfo(self):
         params = _checked_params()
+        ref = _param("reference_fc", "Reference road layer you trace from (optional, e.g. the "
+                     "county roads)", "GPFeatureLayer", required=False)
+        ref.filter.list = ["Polyline"]
+        params.append(ref)
         params.append(_param("out_fc", "Training roads to look at (optional)", "DEFeatureClass",
                              direction="Output", required=False))
         params.append(_param("min_change", "Count a road as moved when an edit moved it at "
@@ -265,7 +270,8 @@ class EndOfDay:
                 checked_where=p["checked_where"].valueAsText,
                 training_folder=p["training_folder"].valueAsText,
                 out_fc=p["out_fc"].valueAsText,
-                min_change=float(p["min_change"].value or 1.0))
+                min_change=float(p["min_change"].value or 1.0),
+                reference_fc=p["reference_fc"].valueAsText)
 
     def postExecute(self, parameters):
         return

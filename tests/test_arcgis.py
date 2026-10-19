@@ -517,11 +517,14 @@ def test_training_day_cycle(toolbox, tiled_scene, tmp_path):
             "H3": LineString([(x0 + 900, mid), (x0 + 1600, mid)]),
             "V1": LineString([(x0 + 400, y0), (x0 + 400, mid)]),
             "C1": synthetic.true_roads()[2][0]}
-    roads = tmp_path / "federal.shp"
+    roads = tmp_path / "federal.gpkg"   # long field names, like the real gdb
     fed = synthetic.local_roads()
     fed["Validated"] = "No"
+    fed["AbandonedRoad"] = "No"
     fed.loc[fed.RD_ID == "H2", "geometry"] = true["H2"]     # this one is already right
     fed.to_file(roads)
+    county = tmp_path / "county.shp"                         # the layer H3 is traced from
+    gpd.GeoDataFrame({"N": [1]}, geometry=[true["H3"]], crs=fed.crs).to_file(county)
     folder = tmp_path / "training"
     folder.mkdir()
 
@@ -544,11 +547,18 @@ def test_training_day_cycle(toolbox, tiled_scene, tmp_path):
     # day 1: move four roads onto the pavement and check them
     assert "6 new road(s)" in day("StartOfDay", "2026-10-19")
     _edit(roads, {k: true[k] for k in ("H1", "V1", "H3", "C1")},
-          {k: "Yes" for k in ("H1", "V1", "H3", "C1")})
-    out = day("EndOfDay", "2026-10-19", out_fc=str(tmp_path / "train_roads.shp"))
+          {k: "Yes" for k in ("H1", "V1", "H3", "C1", "V2")})
+    df = gpd.read_file(roads)
+    df.loc[df.RD_ID == "V2", "AbandonedRoad"] = "Yes"        # checked, but abandoned
+    df.to_file(roads)
+    out = day("EndOfDay", "2026-10-19", out_fc=str(tmp_path / "train_roads.shp"),
+              reference_fc=str(county))
     assert "4 newly checked and moved, 0 newly checked and left" in out, out
+    assert "AbandonedRoad = 'Yes' are not used (1 checked road(s) left out)" in out
+    assert "1 checked road(s) follow" in out
     t = gpd.read_file(tmp_path / "train_roads.shp")
     assert sorted(t.ROAD_OID) == [1, 3, 4, 6] and t.CHANGED.all()
+    assert t.set_index("ROAD_OID").TRACED.to_dict() == {1: 0, 3: 1, 4: 0, 6: 0}
     assert t.SHIFT_AVG.between(2.5, 8).all(), t.SHIFT_AVG.tolist()
 
     # day 2: the morning snapshot keeps the true originals; check H2 without moving it,
@@ -578,6 +588,8 @@ def test_training_day_cycle(toolbox, tiled_scene, tmp_path):
     assert len(res["holdout"]) == 1, msgs
     assert res["new"] < 1.0 and res["original"] > 2, res         # tool fixes the held-back roads
     assert res["promoted"] and "local_roads.shp" in msgs
+    assert "Keep/move model" in msgs and "away from intersections" in msgs
+    assert "did NOT trace" in msgs
     models = folder / "models"
     assert (models / "road_classifier.json").exists()
     assert (models / "road_classifier_2026-10-20.json").exists()
@@ -596,3 +608,15 @@ def test_training_day_cycle(toolbox, tiled_scene, tmp_path):
     assert any("Using the trained classifier" in m for m in fake_arcpy.messages)
     assert not (tmp_path / "align" / "work" / "road_classifier.json").exists()
     assert error_to_truth(out.geometry)[0] < 1.0
+
+    # a keep/move model that never trusts a move keeps every original line
+    clf = json.loads((models / "road_classifier.json").read_text())
+    clf["move_model"] = dict(features=["shift_avg", "shift_max", "conf", "pct_valid",
+                                       "width_med"], mean=[0] * 5, std=[1] * 5,
+                             coef=[0] * 5, intercept=0.0, threshold=0.9)
+    (models / "never_move.json").write_text(json.dumps(clf))
+    out = run_tool(toolbox, tiled_scene, tmp_path / "never",
+                   classifier_file=str(models / "never_move.json"))
+    assert (out.MOVED == 0).all() and (out.MOVE_P == 0.5).all()
+    assert out.REASON.str.contains("move_unlikely_to_help").all()
+    assert error_to_truth(out.geometry)[0] > 4

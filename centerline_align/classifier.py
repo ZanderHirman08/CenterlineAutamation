@@ -52,6 +52,7 @@ class RoadClassifier:
     train_accuracy: float | None = None
     trained_from: str | None = None   # second pass: the earlier result it learned from
     lidar: bool = False               # uses LiDAR layers as well as the imagery
+    move_model: dict | None = None    # keep/move model learned from checked roads
 
     def save(self, path):
         with open(path, "w") as f:
