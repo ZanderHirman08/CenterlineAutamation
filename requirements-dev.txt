@@ -1,2 +1,10 @@
--r requirements.txt
+numpy>=1.24
+scipy>=1.10
+shapely>=2.0
+geopandas>=0.14
+pyogrio>=0.7
+rasterio>=1.3
 pytest>=7
+# the Colab training code (dl/); its test is skipped without these
+torch>=2.1
+segmentation-models-pytorch==0.3.3

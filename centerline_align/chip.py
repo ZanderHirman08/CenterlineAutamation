@@ -17,11 +17,6 @@ class Chip:
     x0: float
     y0: float
     res: float
-    # optional LiDAR layers resampled to this chip: (intensity, ground elevation,
-    # surface elevation), heights in metres; aux_valid marks where they exist
-    aux: np.ndarray | None = None
-    aux_valid: np.ndarray | None = None
-    xy_to_m: float = 0.3048006096  # metres per CRS unit (for slopes)
 
     @property
     def shape(self) -> tuple[int, int]:

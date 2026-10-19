@@ -1,4 +1,4 @@
-"""Processing steps shared by the command-line tool and the ArcGIS Pro toolbox.
+"""Processing steps of the Align tool.
 
 Everything here works on plain numpy coordinate arrays and an imagery
 *reader*, so it runs with only numpy + scipy. A reader needs:
@@ -17,7 +17,7 @@ from scipy import ndimage
 from scipy.spatial import cKDTree
 
 from .classifier import (RoadClassifier, distance_to_roads, extract_samples, fit,
-                         logistic_regression, sample_training_pixels)
+                         sample_training_pixels)
 from .features import pixel_feature_names, pixel_features, scale_bands
 from .geom import as_coords, cumlen, densify, interpolate
 from .refine import refine_line
@@ -25,7 +25,7 @@ from .topology import snap_nodes
 
 log = logging.getLogger("centerline_align")
 
-PAD_PX = 64  # context pixels read around each tile so blurs/embeddings have no edge effects
+PAD_PX = 64  # context pixels read around each tile so blurs have no edge effects
 TRAIN_TILES_PER_GRID = 4
 
 
@@ -54,8 +54,7 @@ class ProbabilityMap:
         return v.reshape(np.shape(x)).astype(np.float32)
 
 
-def region_probability(reader, clf: RoadClassifier, embedder, bounds, lines, rcfg, ccfg
-                       ) -> ProbabilityMap:
+def region_probability(reader, clf: RoadClassifier, bounds, lines, rcfg) -> ProbabilityMap:
     """Road probability for ``bounds`` plus a margin, computed only near ``lines``."""
     res = reader.res
     margin = rcfg.search_half_width + rcfg.max_shift + 4 * res
@@ -65,8 +64,7 @@ def region_probability(reader, clf: RoadClassifier, embedder, bounds, lines, rcf
     height = int(np.ceil((y0 - (miny - margin)) / res))
     pmap = ProbabilityMap(x0, y0, res, (height, width))
 
-    tile = ccfg.embedding_tile if embedder is not None else 1024
-    core = max(64, tile - 2 * PAD_PX) if embedder is not None else tile
+    core = 1024
     reach = rcfg.search_half_width + rcfg.max_shift
     pts = np.concatenate([densify(as_coords(c), 5.0) for c in lines]) if lines else np.zeros((0, 2))
     tree = cKDTree(pts) if len(pts) else None
@@ -80,7 +78,7 @@ def region_probability(reader, clf: RoadClassifier, embedder, bounds, lines, rcf
                 continue  # nothing to refine near this tile
             chip = reader.read(tx0 - PAD_PX * res, ty0 + PAD_PX * res,
                                w + 2 * PAD_PX, h + 2 * PAD_PX)
-            p = clf.predict(chip, embedder)[PAD_PX:PAD_PX + h, PAD_PX:PAD_PX + w]
+            p = clf.predict(chip)[PAD_PX:PAD_PX + h, PAD_PX:PAD_PX + w]
             v = chip.valid[PAD_PX:PAD_PX + h, PAD_PX:PAD_PX + w]
             pmap.prob[r0:r0 + h, c0:c0 + w] = np.round(p * 255).astype(np.uint8)
             pmap.valid[r0:r0 + h, c0:c0 + w] = v
@@ -138,18 +136,16 @@ def alignment_check(chip, lines, has_nir: bool, max_shift: float = 60.0,
     return float(dc * chip.res), float(-dr * chip.res), float(sub[i, j]), float(corr[0, 0])
 
 
-def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
-                     seed: int = 0, on_chip=None, trusted_near=None) -> RoadClassifier:
+def train_classifier(reader, cells: list[list], lines_near, ccfg, seed: int = 0,
+                     on_chip=None) -> RoadClassifier:
     """Train from tiles centred on random road points in each training cell.
 
     cells: for each training grid, the road coords inside it.
     lines_near(bounds) -> road coords intersecting ``bounds`` (for labelling).
     on_chip(k, chip, lines) is called for every training tile (for diagnostics).
-    trusted_near(bounds) -> ([(coords, half_width)], [coords]): second pass, label
-    from an earlier run's trusted lines (see ``sample_training_pixels``).
     """
     rng = np.random.default_rng(seed)
-    tile = ccfg.embedding_tile if embedder is not None else 1024
+    tile = 1024
     half = tile * reader.res / 2
     centres = []
     for lines in cells:
@@ -181,7 +177,7 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
 
     # Pass 2: labelled samples.
     per_tile = max(50, ccfg.samples_per_class // len(centres))
-    pix_s, emb_s, lab_s, shifts = [], [], [], []
+    pix_s, lab_s, shifts = [], [], []
     for k, c in enumerate(centres):
         chip = read_at(c)
         bx0, by0, bx1, by1 = chip.bounds
@@ -192,16 +188,11 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
         a = alignment_check(chip, near, reader.has_nir)
         if a is not None:
             shifts.append(a)
-        trusted = trusted_near(chip.bounds) if trusted_near is not None else None
-        rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile, trusted)
+        rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile)
         if len(labels) == 0:
             continue
-        pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder,
-                                   lidar=getattr(reader, "has_lidar", False))
-        pix_s.append(pix)
+        pix_s.append(extract_samples(chip, rows, cols, reader.has_nir, lo, hi))
         lab_s.append(labels)
-        if emb is not None:
-            emb_s.append(emb)
     if not lab_s:
         raise ValueError("No training pixels found; check imagery coverage")
     _report_alignment(shifts)
@@ -212,10 +203,7 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
         means = pix[labels == lab, :nb].mean(axis=0)
         log.info("Average %s training pixel (0-1 scale): %s", what,
                  ", ".join(f"{n} {m:.2f}" for n, m in zip(names, means)))
-    clf = fit(pix, np.concatenate(emb_s) if emb_s else None, labels,
-              feature_mode=ccfg.features, has_nir=reader.has_nir, band_lo=lo, band_hi=hi,
-              embedding_model=ccfg.embedding_model if embedder is not None else None,
-              lidar=getattr(reader, "has_lidar", False))
+    clf = fit(pix, labels, has_nir=reader.has_nir, band_lo=lo, band_hi=hi)
     if clf.train_accuracy is not None and clf.train_accuracy < 0.75:
         log.warning(
             "Training accuracy is only %.2f: the classifier can barely tell road from not-road "
@@ -312,55 +300,8 @@ def _crossings(lines, tol: float, seg: float = 10.0) -> list:
 
 
 # what the keep/move model looks at for each refined line
-MOVE_FEATURES = ("shift_avg", "shift_max", "conf", "pct_valid", "width_med")
-MOVE_MIN_GAIN = 0.5   # a move "helps" when it brings the line at least this much closer
-
-
-def move_probability(model: dict, rec: dict) -> float:
-    """Chance (0-1) that applying a refined line's move brings it closer to where a
-    person would put it, from the line's own QA values."""
-    x = np.array([float(rec[k]) for k in MOVE_FEATURES])
-    z = float(np.dot((x - np.asarray(model["mean"])) / np.asarray(model["std"]),
-                     np.asarray(model["coef"])) + model["intercept"])
-    return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
-
-
-def fit_move_model(recs: list[dict], gains, min_rows: int = 20):
-    """Learn when a move is worth applying.
-
-    recs: refined records whose move was applied (``moved`` = 1); gains: for each,
-    how much closer the move brought the line to the hand-checked line (negative =
-    farther). Fits a logistic regression for "helps by at least MOVE_MIN_GAIN", then
-    picks the probability threshold that maximises the total gain on these lines.
-    Returns None when there are too few lines of either kind to learn from.
-    """
-    gains = np.asarray(gains, float)
-    y = (gains >= MOVE_MIN_GAIN).astype(float)
-    if len(recs) < min_rows or y.sum() < 5 or (1 - y).sum() < 5:
-        return None
-    X = np.array([[float(r[k]) for k in MOVE_FEATURES] for r in recs])
-    mean, std = X.mean(axis=0), X.std(axis=0)
-    std[std < 1e-9] = 1.0
-    coef, intercept = logistic_regression((X - mean) / std, y, C=1.0)
-    model = dict(features=list(MOVE_FEATURES), mean=mean.tolist(), std=std.tolist(),
-                 coef=coef.tolist(), intercept=float(intercept), threshold=0.5)
-    p = np.array([move_probability(model, r) for r in recs])
-    cands = np.unique(np.concatenate([p, [0.0, 1.01]]))
-    total = [gains[p >= t].sum() for t in cands]
-    model["threshold"] = float(cands[int(np.argmax(total))])
-    model["rows"] = len(recs)
-    model["gain_all"] = float(gains.sum())          # applying every move
-    model["gain_chosen"] = float(max(total))        # applying the chosen ones
-    return model
-
-
-def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False,
-                  move_model: dict | None = None):
-    """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts.
-
-    move_model: optional keep/move model (``fit_move_model``); a move it judges
-    unlikely to help is not applied (the original line is kept, reason
-    ``move_unlikely_to_help``)."""
+def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):
+    """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts."""
     records, stations = [], []
     junctions = find_junctions([c for _, c in pieces])
     for src_id, coords in pieces:
@@ -376,13 +317,6 @@ def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations
             o_sx=float(c[0, 0]), o_sy=float(c[0, 1]), o_ex=float(c[-1, 0]), o_ey=float(c[-1, 1]),
             coords=r.coords,
         ))
-        rec = records[-1]
-        if move_model is not None and rec["moved"]:
-            p = move_probability(move_model, rec)
-            rec["move_p"] = round(p, 3)
-            if p < move_model["threshold"]:
-                rec["coords"], rec["moved"] = c.copy(), 0
-                rec["reason"] = ";".join(r.reasons + ["move_unlikely_to_help"])
         if r.stations is not None:
             s = r.stations
             for i in range(len(s["x"])):

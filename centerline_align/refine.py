@@ -1,20 +1,15 @@
 """Move a road line to the middle of the pavement using cross-sections.
 
 At regular stations along the existing line, the road-probability map is
-sampled along a short line perpendicular to the road. Two methods turn those
-profiles into a new line:
-
-* ``ribbon`` (default): the road is a ribbon with a centre offset and a width
-  at every station. The best ribbon for the whole line is found at once
-  (dynamic programming): it should cover the "road" pixels and avoid the rest,
-  while the centre bends gently and the width stays steady. A shadow that hides
-  one edge for a few stations can't drag the centre over, because that would
-  need a sudden change in width; cross-sections at intersections (which see the
-  cross street) are ignored and bridged by the neighbouring stations. This is
-  the "ribbon snake" idea from the road-conflation literature.
-* ``midpoint``: the run of "road" pixels nearest the line gives the two edges
-  at each station; their midpoint is the centre. Outliers are dropped, gaps
-  interpolated and the offsets smoothed.
+sampled along a short line perpendicular to the road. The road is a ribbon
+with a centre offset and a width at every station. The best ribbon for the
+whole line is found at once (dynamic programming): it should cover the "road"
+pixels and avoid the rest, while the centre bends gently and the width stays
+steady. A shadow that hides one edge for a few stations can't drag the centre
+over, because that would need a sudden change in width; cross-sections at
+intersections (which see the cross street) are ignored and bridged by the
+neighbouring stations. This is the "ribbon snake" idea from the
+road-conflation literature.
 
 Where the imagery gives no usable answer (trees, shadows, no data) the line
 keeps its original position and is flagged for review.
@@ -73,59 +68,12 @@ def _tangents(c: np.ndarray, s: np.ndarray, d: np.ndarray, h: float) -> np.ndarr
     return t / norm
 
 
-def measure_profile(offsets: np.ndarray, prob: np.ndarray, cfg: RefineConfig):
-    """Find the pavement run nearest offset 0 in one cross-section profile.
-
-    Returns (centre, width, confidence) or None when no plausible run exists.
-    """
-    above = prob >= cfg.prob_threshold
-    if not above.any():
-        return None
-    labels, n = ndimage.label(above)
-    step = offsets[1] - offsets[0]
-    best = None
-    for k in range(1, n + 1):
-        idx = np.flatnonzero(labels == k)
-        i0, i1 = idx[0], idx[-1]
-        if i0 == 0 or i1 == len(prob) - 1:
-            continue  # edge runs past the search window: width unknown
-        left = _crossing(offsets, prob, i0 - 1, i0, cfg.prob_threshold)
-        right = _crossing(offsets, prob, i1, i1 + 1, cfg.prob_threshold)
-        width = right - left
-        if width < cfg.min_road_width * 0.5:
-            continue
-        centre = 0.5 * (left + right)
-        dist = 0.0 if left <= 0 <= right else min(abs(left), abs(right))
-        if best is None or dist < best[0]:
-            best = (dist, centre, width, i0, i1)
-    if best is None:
-        return None
-    _, centre, width, i0, i1 = best
-    if abs(centre) > cfg.max_shift:
-        return None
-    inside = prob[i0:i1 + 1].mean()
-    pad = max(1, int(round(min(width, 10 * step) / step)))
-    outside = np.concatenate([prob[max(0, i0 - pad):i0], prob[i1 + 1:i1 + 1 + pad]])
-    contrast = float(np.clip(inside - (outside.mean() if len(outside) else 0.0), 0, 1))
-    width_ok = cfg.min_road_width <= width <= cfg.max_road_width
-    conf = contrast * (1.0 if width_ok else 0.4)
-    return centre, width, conf
-
-
-def _crossing(x, p, i, j, thr):
-    """Sub-sample position where the profile crosses ``thr`` between samples i and j."""
-    if p[j] == p[i]:
-        return 0.5 * (x[i] + x[j])
-    t = (thr - p[i]) / (p[j] - p[i])
-    return x[i] + t * (x[j] - x[i])
-
-
 def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
                 valid: Sampler | None = None, keep_stations: bool = False,
                 junctions: np.ndarray | None = None) -> RefineResult:
     """Refine one line given as (N, 2) coords. ``step`` is the cross-section sample
     spacing (normally the pixel size). ``junctions``: (k, 2) intersection points;
-    cross-sections near them are ignored by the ribbon method."""
+    cross-sections near them are ignored."""
     c = as_coords(coords)
     s = cumlen(c)
     d = station_distances(s, cfg.station_spacing)
@@ -146,26 +94,13 @@ def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
         has = valid(pts[:, 0], pts[:, 1]) > 0.5
         no_data = (~has).mean() > 0.5
 
-    if cfg.method == "ribbon":
-        near_junction = np.zeros(n, bool)
-        if junctions is not None and len(junctions) and cfg.junction_mask > 0:
-            jd = np.min(np.hypot(pts[:, None, 0] - junctions[None, :, 0],
-                                 pts[:, None, 1] - junctions[None, :, 1]), axis=1)
-            near_junction = jd < cfg.junction_mask
-        final, width, conf, used = fit_ribbon(offs, profiles, d, has & ~near_junction, cfg)
-        raw = np.where(used, final, np.nan)
-    else:
-        raw = np.full(n, np.nan)
-        width = np.full(n, np.nan)
-        conf = np.zeros(n)
-        for i in range(n):
-            m = measure_profile(offs, profiles[i], cfg)
-            if m is not None and m[2] > 0:
-                raw[i], width[i], conf[i] = m
-        raw[~has] = np.nan
-        conf[~has] = 0.0
-        final, used = _clean_offsets(d, raw, cfg)
-        final = np.clip(final, -cfg.max_shift, cfg.max_shift)
+    near_junction = np.zeros(n, bool)
+    if junctions is not None and len(junctions) and cfg.junction_mask > 0:
+        jd = np.min(np.hypot(pts[:, None, 0] - junctions[None, :, 0],
+                             pts[:, None, 1] - junctions[None, :, 1]), axis=1)
+        near_junction = jd < cfg.junction_mask
+    final, width, conf, used = fit_ribbon(offs, profiles, d, has & ~near_junction, cfg)
+    raw = np.where(used, final, np.nan)
 
     new_line = simplify(pts + normal * final[:, None], cfg.simplify_tolerance)
 
@@ -200,28 +135,6 @@ def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
         stations=stations,
         moved=moved,
     )
-
-
-def _clean_offsets(d: np.ndarray, raw: np.ndarray, cfg: RefineConfig):
-    """Drop outliers, fill gaps along the road, smooth. Returns (offsets, used mask)."""
-    good = ~np.isnan(raw)
-    if not good.any():
-        return np.zeros_like(raw), good
-    w = max(1, cfg.smooth_window)
-    half = w // 2
-    med = np.array([
-        np.nanmedian(raw[max(0, i - half):i + half + 1])
-        if good[max(0, i - half):i + half + 1].any() else np.nan
-        for i in range(len(raw))
-    ])
-    used = good & (np.abs(raw - med) <= cfg.outlier_tolerance)
-    if not used.any():
-        return np.zeros_like(raw), used
-    filled = np.interp(d, d[used], raw[used])
-    if len(filled) >= 3 and w > 1:
-        sigma = max(1.0, w / 3.0)
-        filled = ndimage.gaussian_filter1d(filled, sigma, mode="nearest")
-    return filled, used
 
 
 # --------------------------------------------------------------------------- ribbon

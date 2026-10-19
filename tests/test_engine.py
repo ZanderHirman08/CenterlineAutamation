@@ -33,8 +33,7 @@ def test_alignment_check_finds_offset(chip, dx, dy):
 
 
 def test_ribbon_resists_shadow_and_side_lot():
-    """A shadow over one edge and a grey lot beside the road barely move the ribbon
-    fit, while the older midpoint method is pulled several feet."""
+    """A shadow over one edge and a grey lot beside the road barely move the ribbon fit."""
     from centerline_align.config import RefineConfig
     from centerline_align.refine import refine_line
 
@@ -49,14 +48,11 @@ def test_ribbon_resists_shadow_and_side_lot():
         return np.clip(p + rng.normal(0, 0.1, p.shape), 0, 1)
 
     line = np.array([[0.0, 0.0], [800.0, 0.0]])
-    err = {}
-    for method in ("midpoint", "ribbon"):
-        r = refine_line(line, sample, RefineConfig(method=method), 0.5, keep_stations=True)
-        x, off = r.stations["x"], r.stations["final"]
-        bad = ((x > 200) & (x < 350)) | ((x > 500) & (x < 560))
-        err[method] = np.abs(off[bad] - true_off).mean()
-        assert not r.reasons
-    assert err["ribbon"] < 2.5 < err["midpoint"], err
+    r = refine_line(line, sample, RefineConfig(), 0.5, keep_stations=True)
+    x, off = r.stations["x"], r.stations["final"]
+    bad = ((x > 200) & (x < 350)) | ((x > 500) & (x < 560))
+    assert not r.reasons
+    assert np.abs(off[bad] - true_off).mean() < 2.5
 
 
 def test_find_junctions():
@@ -89,23 +85,3 @@ def test_flagged_lines_keep_original_geometry():
     assert np.array_equal(r.coords, line)
     r2 = refine_line(line, nothing, RefineConfig(keep_flagged=False), 0.5)
     assert r2.moved
-
-
-def test_fit_move_model_keeps_unhelpful_moves():
-    """Big confident moves helped, small ones made lines worse: the model learns to skip
-    the small ones."""
-    from centerline_align.engine import fit_move_model, move_probability
-    rng = np.random.default_rng(0)
-    recs, gains = [], []
-    for k in range(60):
-        big = k % 2 == 0
-        shift = rng.uniform(4, 8) if big else rng.uniform(0.3, 1.5)
-        recs.append(dict(shift_avg=shift, shift_max=shift + 1, conf=rng.uniform(0.3, 0.6),
-                         pct_valid=rng.uniform(0.6, 1.0), width_med=rng.uniform(18, 26)))
-        gains.append(shift - 0.5 if big else -rng.uniform(0.5, 1.0))
-    model = fit_move_model(recs, gains)
-    assert model is not None
-    keep = [move_probability(model, r) >= model["threshold"] for r in recs]
-    assert keep == [k % 2 == 0 for k in range(60)]
-    assert model["gain_chosen"] > model["gain_all"]
-    assert fit_move_model(recs[:10], gains[:10]) is None      # too few lines

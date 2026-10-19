@@ -23,51 +23,20 @@ if __name__ not in _sys.modules:
 # config.py
 # ======================================================================
 
-"""Run configuration, loaded from a YAML file.
+"""Settings for the Align tool. Distances are in the imagery's linear units
+(US feet in Georgia State Plane)."""
 
-All distances are in the linear units of the working CRS (``crs``), which is
-normally your State Plane projection in US feet.
-"""
-
-from dataclasses import dataclass, field, fields
-from pathlib import Path
-
-
-@dataclass
-class InputConfig:
-    imagery: str                      # a GeoTIFF / VRT, or a folder of GeoTIFF tiles
-    roads: str                        # local road centerlines (shp / gpkg)
-    grids: str                        # 1-mile grid polygons (shp / gpkg)
-    road_id_field: str = "OBJECTID"   # unique id carried to the output
-    grid_id_field: str = "GRID_ID"
-    roads_layer: str | None = None    # layer name when reading from a gpkg
-    grids_layer: str | None = None
-
-
-@dataclass
-class BandConfig:
-    # 1-based band indexes in the imagery. nir is optional.
-    red: int = 1
-    green: int = 2
-    blue: int = 3
-    nir: int | None = None
+from dataclasses import dataclass
 
 
 @dataclass
 class ClassifierConfig:
-    # "pixel": spectral + texture features (no GPU needed)
-    # "embedding": pixel features + frozen foundation-model embeddings (GPU)
-    features: str = "pixel"
-    embedding_model: str = "facebook/dinov2-small"
-    embedding_device: str = "cuda"
-    embedding_tile: int = 518         # pixels per inference tile (multiple of patch size)
     # Training labels come from the local road file itself (distances in CRS units).
     positive_half_width: float = 4.0  # pixels within this distance of a road = road
     negative_min_dist: float = 45.0   # pixels between these distances from any road = not road
     negative_max_dist: float = 120.0
     samples_per_class: int = 20000
     training_grids: int = 8           # how many grids to sample training pixels from
-    model_path: str | None = None     # reuse a saved classifier instead of training
 
 
 @dataclass
@@ -77,18 +46,11 @@ class RefineConfig:
     max_shift: float = 30.0           # never move a line farther than this
     min_road_width: float = 10.0      # plausible pavement widths
     max_road_width: float = 60.0
-    prob_threshold: float = 0.5
-    smooth_window: int = 7            # stations used for the along-road median filter
-    outlier_tolerance: float = 4.0    # station offsets farther than this from the median are dropped
     simplify_tolerance: float = 0.5
     node_snap_tolerance: float = 1.0  # input endpoints closer than this are one node
     node_taper: float = 50.0          # distance over which an end's move into its node fades out
     review_min_confidence: float = 0.2
     review_max_shift: float = 15.0
-    # "ribbon": fit both pavement edges and a smooth width along the whole line at once
-    # (shadows on one edge, cross streets and single bad cross-sections barely move it).
-    # "midpoint": the older method - midpoint of each cross-section, then smoothing.
-    method: str = "ribbon"
     junction_mask: float = 30.0       # ignore cross-sections this close to an intersection
     offset_stiffness: float = 0.5     # cost of the line bending sideways (per ft^2 per station)
     width_stiffness: float = 0.25     # cost of the width changing between stations
@@ -98,67 +60,6 @@ class RefineConfig:
     # checked against hand-validated roads, moves under trees and big jumps made lines
     # worse more often than better.
     keep_flagged: bool = True
-
-
-@dataclass
-class OutputConfig:
-    folder: str = "output"
-    name: str = "aligned_centerlines"
-    write_shapefile: bool = True
-    write_geopackage: bool = True
-    write_stations: bool = False      # per-station QA points (large)
-    write_probability: bool = False   # road-probability GeoTIFF per grid
-
-
-@dataclass
-class Config:
-    inputs: InputConfig
-    crs: str | None = None            # working CRS; defaults to the imagery CRS
-    resolution: float | None = None   # working pixel size; defaults to the imagery's own
-    grid_ids: list | None = None      # process only these grids
-    bands: BandConfig = field(default_factory=BandConfig)
-    classifier: ClassifierConfig = field(default_factory=ClassifierConfig)
-    refine: RefineConfig = field(default_factory=RefineConfig)
-    output: OutputConfig = field(default_factory=OutputConfig)
-
-    @classmethod
-    def load(cls, path: str | Path) -> "Config":
-        import yaml
-
-        with open(path) as f:
-            raw = yaml.safe_load(f) or {}
-        return cls.from_dict(raw)
-
-    @classmethod
-    def from_dict(cls, raw: dict) -> "Config":
-        sections = {
-            "inputs": InputConfig,
-            "bands": BandConfig,
-            "classifier": ClassifierConfig,
-            "refine": RefineConfig,
-            "output": OutputConfig,
-        }
-        known = {f.name for f in fields(cls)}
-        unknown = set(raw) - known
-        if unknown:
-            raise ValueError(f"Unknown config keys: {sorted(unknown)}")
-        kwargs = {}
-        for key, value in raw.items():
-            if key in sections:
-                kwargs[key] = _build(sections[key], value or {}, key)
-            else:
-                kwargs[key] = value
-        if "inputs" not in kwargs:
-            raise ValueError("Config needs an 'inputs' section")
-        return cls(**kwargs)
-
-
-def _build(dc, values: dict, section: str):
-    known = {f.name for f in fields(dc)}
-    unknown = set(values) - known
-    if unknown:
-        raise ValueError(f"Unknown keys in '{section}': {sorted(unknown)}")
-    return dc(**values)
 
 
 # ======================================================================
@@ -183,11 +84,6 @@ class Chip:
     x0: float
     y0: float
     res: float
-    # optional LiDAR layers resampled to this chip: (intensity, ground elevation,
-    # surface elevation), heights in metres; aux_valid marks where they exist
-    aux: np.ndarray | None = None
-    aux_valid: np.ndarray | None = None
-    xy_to_m: float = 0.3048006096  # metres per CRS unit (for slopes)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -272,18 +168,8 @@ def simplify(c: np.ndarray, tol: float) -> np.ndarray:
 # features.py
 # ======================================================================
 
-"""Per-pixel features for the road / not-road classifier.
-
-Two sources, which the classifier can combine:
-
-* ``pixel_features`` - spectral and texture measures computed from the bands
-  directly. Cheap, needs no GPU.
-* ``EmbeddingExtractor`` - patch embeddings from a frozen, pretrained vision
-  foundation model (DINOv2 / DINOv3 via Hugging Face). These come out at
-  patch resolution (e.g. one vector per 14x14 or 16x16 pixels) and are kept at
-  that resolution; the classifier is linear, so its output can be upsampled
-  instead of the (much larger) embeddings.
-"""
+"""Per-pixel features for the road / not-road classifier: spectral and texture
+measures computed from the bands directly."""
 
 import numpy as np
 from scipy import ndimage
@@ -344,137 +230,6 @@ def pixel_features(scaled: np.ndarray, has_nir: bool) -> np.ndarray:
     return np.stack(feats).astype(np.float32)
 
 
-def lidar_feature_names(has_nir: bool) -> list[str]:
-    names = ["l_int", "l_int_s", "l_height", "l_canopy", "l_slope", "l_rough",
-             "x_canopy_bright", "x_canopy_sat"]
-    if has_nir:
-        names.append("x_canopy_ndvi")
-    return names
-
-
-def lidar_features(chip, img_feats: np.ndarray, has_nir: bool) -> np.ndarray:
-    """Features from the chip's LiDAR layers (see ``Chip.aux``); NaN where there is
-    no LiDAR. Ground intensity shows asphalt under gaps in the canopy, the ground
-    surface is flat and smooth on a road bed, canopy height says where the imagery
-    can't see the ground, and the canopy x imagery terms let the (linear)
-    classifier trust the imagery less under trees."""
-    inten, dtm, dsm = (a.astype(np.float32) for a in chip.aux)
-    ok = chip.aux_valid
-    if not ok.any():
-        return np.full((len(lidar_feature_names(has_nir)),) + chip.shape, np.nan, np.float32)
-    for a in (inten, dtm, dsm):  # neutral values where missing, so blurs stay sane
-        a[~ok] = np.median(a[ok])
-    res_m = chip.res * chip.xy_to_m
-    blur = ndimage.gaussian_filter
-    height = np.clip(dsm - dtm, 0, 40)
-    canopy = np.clip((height - 1.0) / 8.0, 0, 1)
-    gy, gx = np.gradient(dtm, res_m)
-    slope = np.hypot(gx, gy)
-    sig = 1.5 / res_m
-    rough = np.sqrt(np.maximum(blur(dtm * dtm, sig) - blur(dtm, sig) ** 2, 0))
-    names = pixel_feature_names(has_nir)
-    feats = [inten, blur(inten, 1.0 / res_m), height, canopy, slope, rough,
-             canopy * img_feats[names.index("bright")], canopy * img_feats[names.index("sat")]]
-    if has_nir:
-        feats.append(canopy * img_feats[names.index("ndvi")])
-    out = np.stack(feats).astype(np.float32)
-    out[:, ~ok] = np.nan
-    return out
-
-
-def all_features(chip, scaled: np.ndarray, has_nir: bool, lidar: bool) -> np.ndarray:
-    """Pixel features, plus LiDAR features when the classifier uses them."""
-    feats = pixel_features(scaled, has_nir)
-    if not lidar:
-        return feats
-    if chip.aux is None:
-        raise ValueError("This classifier was trained with LiDAR layers: give the same "
-                         "LiDAR folder again (or retrain without LiDAR in a new work folder).")
-    return np.concatenate([feats, lidar_features(chip, feats, has_nir)])
-
-
-def sample_lowres(grid: np.ndarray, rows: np.ndarray, cols: np.ndarray, patch: int) -> np.ndarray:
-    """Bilinearly sample a patch-resolution array (C, h, w) at full-res pixel positions.
-
-    Patch ``i`` covers pixels ``i*patch .. (i+1)*patch-1``, so its centre is at
-    pixel ``(i + 0.5) * patch - 0.5``.
-    """
-    pr = (np.asarray(rows, dtype=np.float64) + 0.5) / patch - 0.5
-    pc = (np.asarray(cols, dtype=np.float64) + 0.5) / patch - 0.5
-    out = [ndimage.map_coordinates(c, [pr, pc], order=1, mode="nearest") for c in grid]
-    return np.stack(out)
-
-
-def upsample_lowres(grid2d: np.ndarray, shape: tuple[int, int], patch: int) -> np.ndarray:
-    """Bilinearly upsample a single patch-resolution band to ``shape`` (full res)."""
-    rows, cols = np.mgrid[0:shape[0], 0:shape[1]]
-    return sample_lowres(grid2d[None], rows.ravel(), cols.ravel(), patch)[0].reshape(shape)
-
-
-class EmbeddingExtractor:
-    """Frozen foundation-model patch embeddings for an RGB tile.
-
-    Works with Hugging Face vision transformers that return one token per
-    patch (optionally after a CLS token and register tokens), e.g.
-    ``facebook/dinov2-small`` (Apache-2.0) or a DINOv3 satellite checkpoint
-    (gated; accept its licence on Hugging Face first).
-    """
-
-    def __init__(self, model_name: str, device: str = "cuda"):
-        try:
-            import torch
-            from transformers import AutoModel
-        except ImportError as e:  # pragma: no cover - depends on optional install
-            raise ImportError(
-                "Embedding features need PyTorch and transformers: "
-                "pip install -r requirements-gpu.txt"
-            ) from e
-
-        self.torch = torch
-        if device == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError("embedding_device is 'cuda' but no CUDA GPU is visible to PyTorch")
-        self.device = device
-        self.model = AutoModel.from_pretrained(model_name).to(device).eval()
-        if device == "cuda":
-            self.model = self.model.half()
-        cfg = self.model.config
-        self.patch = int(getattr(cfg, "patch_size", 14))
-        self.n_registers = int(getattr(cfg, "num_register_tokens", 0) or 0)
-        self.dim = int(cfg.hidden_size)
-        self.mean, self.std = _normalisation(model_name)
-
-    def __call__(self, rgb: np.ndarray) -> np.ndarray:
-        """rgb: (3, H, W) scaled 0-1. Returns (dim, ceil(H/p), ceil(W/p)) float32."""
-        torch = self.torch
-        _, h, w = rgb.shape
-        p = self.patch
-        hp, wp = -(-h // p), -(-w // p)
-        x = np.zeros((3, hp * p, wp * p), dtype=np.float32)
-        x[:, :h, :w] = np.clip(rgb, 0, 1)
-        x = (x - self.mean[:, None, None]) / self.std[:, None, None]
-        t = torch.from_numpy(x)[None].to(self.device)
-        if self.device == "cuda":
-            t = t.half()
-        with torch.no_grad():
-            tokens = self.model(pixel_values=t).last_hidden_state[0]
-        tokens = tokens[-hp * wp:]  # drop CLS / register tokens at the front
-        emb = tokens.float().cpu().numpy().T.reshape(self.dim, hp, wp)
-        return emb.astype(np.float32)
-
-
-def _normalisation(model_name: str) -> tuple[np.ndarray, np.ndarray]:
-    mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]  # ImageNet
-    try:
-        from transformers import AutoImageProcessor
-
-        proc = AutoImageProcessor.from_pretrained(model_name)
-        mean = list(getattr(proc, "image_mean", mean))
-        std = list(getattr(proc, "image_std", std))
-    except Exception:
-        pass
-    return np.asarray(mean, dtype=np.float32), np.asarray(std, dtype=np.float32)
-
-
 # ======================================================================
 # classifier.py
 # ======================================================================
@@ -486,8 +241,6 @@ close to a road line are "road", pixels a good distance from every road are
 "not road". A logistic regression on those samples gives a road-probability
 map that is far more robust than a fixed colour threshold.
 
-The model is linear on standardised features, so the embedding part can be
-evaluated at patch resolution and upsampled afterwards (see ``predict``).
 It is saved as plain JSON - no pickles. Only numpy and scipy are needed, so it
 also runs inside ArcGIS Pro's built-in Python.
 """
@@ -505,7 +258,6 @@ log = logging.getLogger("centerline_align")
 
 @dataclass
 class RoadClassifier:
-    feature_mode: str                 # "pixel" or "embedding"
     has_nir: bool
     band_lo: list
     band_hi: list
@@ -514,14 +266,7 @@ class RoadClassifier:
     pix_std: list
     pix_coef: list
     intercept: float
-    embedding_model: str | None = None
-    emb_mean: list | None = None
-    emb_std: list | None = None
-    emb_coef: list | None = None
     train_accuracy: float | None = None
-    trained_from: str | None = None   # second pass: the earlier result it learned from
-    lidar: bool = False               # uses LiDAR layers as well as the imagery
-    move_model: dict | None = None    # keep/move model learned from checked roads
 
     def save(self, path):
         with open(path, "w") as f:
@@ -534,23 +279,12 @@ class RoadClassifier:
         known = set(cls.__dataclass_fields__)
         return cls(**{k: v for k, v in raw.items() if k in known})
 
-    def predict(self, chip: Chip, embedder: EmbeddingExtractor | None = None) -> np.ndarray:
+    def predict(self, chip: Chip) -> np.ndarray:
         """Road probability (H, W) float32 for a chip; 0 where imagery is missing."""
-        scaled = scale_bands(chip.data, self.band_lo, self.band_hi)
-        feats = all_features(chip, scaled, self.has_nir, self.lidar)
+        feats = pixel_features(scale_bands(chip.data, self.band_lo, self.band_hi), self.has_nir)
         mean = np.asarray(self.pix_mean, np.float32)[:, None, None]
-        if self.lidar:  # no LiDAR here: those features count as average (no effect)
-            feats = np.where(np.isnan(feats), mean, feats)
         w = np.asarray(self.pix_coef, np.float32) / np.asarray(self.pix_std, np.float32)
-        z = np.tensordot(w, feats - mean, axes=1)
-        z += self.intercept
-        if self.feature_mode == "embedding":
-            if embedder is None:
-                raise ValueError("This classifier needs an EmbeddingExtractor")
-            emb = embedder(scaled[:3])
-            we = np.asarray(self.emb_coef, np.float32) / np.asarray(self.emb_std, np.float32)
-            ze = np.tensordot(we, emb - np.asarray(self.emb_mean, np.float32)[:, None, None], axes=1)
-            z += upsample_lowres(ze, chip.shape, embedder.patch)
+        z = np.tensordot(w, feats - mean, axes=1) + self.intercept
         prob = 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
         prob[~chip.valid] = 0.0
         return prob.astype(np.float32)
@@ -579,41 +313,12 @@ def distance_to_roads(chip: Chip, lines) -> np.ndarray:
     return (ndimage.distance_transform_edt(~burned) * chip.res).astype(np.float32)
 
 
-def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int, trusted=None):
-    """Pick (row, col) indexes of positive and negative training pixels in a chip.
-
-    trusted: optional (lines with known pavement width [(coords, half_width)],
-    untrusted lines [coords]) from an earlier run (second pass), or hand-checked
-    lines with half_width None (labelled road near the line only). Then the road
-    labels cover the measured pavement (minus a margin) of trusted lines, and
-    the verges just beyond their edges are labelled not-road too, which teaches
-    the classifier where pavement ends.
-    """
+def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int):
+    """Pick (row, col) indexes of positive and negative training pixels in a chip."""
     dist = distance_to_roads(chip, lines)
     ok = chip.valid
-    far = (dist > ccfg.negative_min_dist) & (dist <= ccfg.negative_max_dist) & ok
-    if trusted is not None:
-        good, bad = trusted
-        pos_m = np.zeros(chip.shape, bool)
-        verge = np.zeros(chip.shape, bool)
-        by_width: dict = {}
-        for c, hw in good:   # hw None: width unknown (hand-checked centerlines)
-            key = None if hw is None else float(np.round(hw * 0.5) * 2)   # 2-unit bins
-            by_width.setdefault(key, []).append(c)
-        for hw, group in by_width.items():
-            d = distance_to_roads(chip, group)
-            if hw is None:
-                pos_m |= d <= ccfg.positive_half_width
-                continue
-            pos_m |= d <= max(ccfg.positive_half_width, hw - 2.0)
-            verge |= (d > hw + 5.0) & (d <= hw + 15.0)
-        others = distance_to_roads(chip, bad) if bad else np.full(chip.shape, np.inf)
-        verge &= ~pos_m & (others > ccfg.negative_min_dist) & ok
-        pos = np.flatnonzero(pos_m & ok)
-        neg = np.flatnonzero(far | verge)
-    else:
-        pos = np.flatnonzero((dist <= ccfg.positive_half_width) & ok)
-        neg = np.flatnonzero(far)
+    pos = np.flatnonzero((dist <= ccfg.positive_half_width) & ok)
+    neg = np.flatnonzero((dist > ccfg.negative_min_dist) & (dist <= ccfg.negative_max_dist) & ok)
     pos = rng.choice(pos, min(len(pos), n_per_class), replace=False) if len(pos) else pos
     neg = rng.choice(neg, min(len(neg), n_per_class), replace=False) if len(neg) else neg
     idx = np.concatenate([pos, neg])
@@ -622,48 +327,33 @@ def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int, trust
     return rows, cols, labels
 
 
-def fit(samples_pix: np.ndarray, samples_emb: np.ndarray | None, labels: np.ndarray,
-        *, feature_mode: str, has_nir: bool, band_lo, band_hi,
-        embedding_model: str | None, lidar: bool = False) -> RoadClassifier:
+def fit(samples: np.ndarray, labels: np.ndarray, *, has_nir: bool, band_lo,
+        band_hi) -> RoadClassifier:
     """Fit a balanced logistic regression on standardised features."""
     if len(np.unique(labels)) < 2:
         raise ValueError(
             "Training found only one class. Check that roads overlap the imagery and "
             "that negative_min_dist / negative_max_dist suit your CRS units."
         )
-    X = [samples_pix]
-    if samples_emb is not None:
-        X.append(samples_emb)
-    X = np.concatenate(X, axis=1).astype(np.float64)
-    mean = np.nanmean(X, axis=0)
-    mean[np.isnan(mean)] = 0.0
-    X = np.where(np.isnan(X), mean, X)   # pixels without LiDAR count as average
+    X = samples.astype(np.float64)
+    mean = X.mean(axis=0)
     std = X.std(axis=0)
     std[std < 1e-9] = 1.0
     Xs = (X - mean) / std
     coef, intercept = logistic_regression(Xs, labels, C=0.5)
     acc = float((((Xs @ coef + intercept) > 0) == (labels > 0.5)).mean())
     log.info("Classifier trained on %d samples, training accuracy %.3f", len(labels), acc)
-    n_pix = samples_pix.shape[1]
-    clf = RoadClassifier(
-        feature_mode=feature_mode,
+    return RoadClassifier(
         has_nir=has_nir,
         band_lo=[float(v) for v in band_lo],
         band_hi=[float(v) for v in band_hi],
-        pix_names=pixel_feature_names(has_nir) + (lidar_feature_names(has_nir) if lidar else []),
-        pix_mean=mean[:n_pix].tolist(),
-        pix_std=std[:n_pix].tolist(),
-        pix_coef=coef[:n_pix].tolist(),
+        pix_names=pixel_feature_names(has_nir),
+        pix_mean=mean.tolist(),
+        pix_std=std.tolist(),
+        pix_coef=coef.tolist(),
         intercept=float(intercept),
         train_accuracy=acc,
-        lidar=lidar,
     )
-    if samples_emb is not None:
-        clf.embedding_model = embedding_model
-        clf.emb_mean = mean[n_pix:].tolist()
-        clf.emb_std = std[n_pix:].tolist()
-        clf.emb_coef = coef[n_pix:].tolist()
-    return clf
 
 
 def logistic_regression(X: np.ndarray, y: np.ndarray, C: float = 1.0,
@@ -694,17 +384,10 @@ def logistic_regression(X: np.ndarray, y: np.ndarray, C: float = 1.0,
     return beta[:-1], float(beta[-1])
 
 
-def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi, embedder=None,
-                    lidar: bool = False):
+def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi) -> np.ndarray:
     """Feature vectors (n, F) at the given pixels, matching what ``predict`` computes."""
-    scaled = scale_bands(chip.data, band_lo, band_hi)
-    feats = all_features(chip, scaled, has_nir, lidar)
-    pix = feats[:, rows, cols].T
-    emb = None
-    if embedder is not None:
-        low = embedder(scaled[:3])
-        emb = sample_lowres(low, rows, cols, embedder.patch).T
-    return pix, emb
+    feats = pixel_features(scale_bands(chip.data, band_lo, band_hi), has_nir)
+    return feats[:, rows, cols].T
 
 
 # ======================================================================
@@ -714,20 +397,15 @@ def extract_samples(chip: Chip, rows, cols, has_nir, band_lo, band_hi, embedder=
 """Move a road line to the middle of the pavement using cross-sections.
 
 At regular stations along the existing line, the road-probability map is
-sampled along a short line perpendicular to the road. Two methods turn those
-profiles into a new line:
-
-* ``ribbon`` (default): the road is a ribbon with a centre offset and a width
-  at every station. The best ribbon for the whole line is found at once
-  (dynamic programming): it should cover the "road" pixels and avoid the rest,
-  while the centre bends gently and the width stays steady. A shadow that hides
-  one edge for a few stations can't drag the centre over, because that would
-  need a sudden change in width; cross-sections at intersections (which see the
-  cross street) are ignored and bridged by the neighbouring stations. This is
-  the "ribbon snake" idea from the road-conflation literature.
-* ``midpoint``: the run of "road" pixels nearest the line gives the two edges
-  at each station; their midpoint is the centre. Outliers are dropped, gaps
-  interpolated and the offsets smoothed.
+sampled along a short line perpendicular to the road. The road is a ribbon
+with a centre offset and a width at every station. The best ribbon for the
+whole line is found at once (dynamic programming): it should cover the "road"
+pixels and avoid the rest, while the centre bends gently and the width stays
+steady. A shadow that hides one edge for a few stations can't drag the centre
+over, because that would need a sudden change in width; cross-sections at
+intersections (which see the cross street) are ignored and bridged by the
+neighbouring stations. This is the "ribbon snake" idea from the
+road-conflation literature.
 
 Where the imagery gives no usable answer (trees, shadows, no data) the line
 keeps its original position and is flagged for review.
@@ -783,59 +461,12 @@ def _tangents(c: np.ndarray, s: np.ndarray, d: np.ndarray, h: float) -> np.ndarr
     return t / norm
 
 
-def measure_profile(offsets: np.ndarray, prob: np.ndarray, cfg: RefineConfig):
-    """Find the pavement run nearest offset 0 in one cross-section profile.
-
-    Returns (centre, width, confidence) or None when no plausible run exists.
-    """
-    above = prob >= cfg.prob_threshold
-    if not above.any():
-        return None
-    labels, n = ndimage.label(above)
-    step = offsets[1] - offsets[0]
-    best = None
-    for k in range(1, n + 1):
-        idx = np.flatnonzero(labels == k)
-        i0, i1 = idx[0], idx[-1]
-        if i0 == 0 or i1 == len(prob) - 1:
-            continue  # edge runs past the search window: width unknown
-        left = _crossing(offsets, prob, i0 - 1, i0, cfg.prob_threshold)
-        right = _crossing(offsets, prob, i1, i1 + 1, cfg.prob_threshold)
-        width = right - left
-        if width < cfg.min_road_width * 0.5:
-            continue
-        centre = 0.5 * (left + right)
-        dist = 0.0 if left <= 0 <= right else min(abs(left), abs(right))
-        if best is None or dist < best[0]:
-            best = (dist, centre, width, i0, i1)
-    if best is None:
-        return None
-    _, centre, width, i0, i1 = best
-    if abs(centre) > cfg.max_shift:
-        return None
-    inside = prob[i0:i1 + 1].mean()
-    pad = max(1, int(round(min(width, 10 * step) / step)))
-    outside = np.concatenate([prob[max(0, i0 - pad):i0], prob[i1 + 1:i1 + 1 + pad]])
-    contrast = float(np.clip(inside - (outside.mean() if len(outside) else 0.0), 0, 1))
-    width_ok = cfg.min_road_width <= width <= cfg.max_road_width
-    conf = contrast * (1.0 if width_ok else 0.4)
-    return centre, width, conf
-
-
-def _crossing(x, p, i, j, thr):
-    """Sub-sample position where the profile crosses ``thr`` between samples i and j."""
-    if p[j] == p[i]:
-        return 0.5 * (x[i] + x[j])
-    t = (thr - p[i]) / (p[j] - p[i])
-    return x[i] + t * (x[j] - x[i])
-
-
 def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
                 valid: Sampler | None = None, keep_stations: bool = False,
                 junctions: np.ndarray | None = None) -> RefineResult:
     """Refine one line given as (N, 2) coords. ``step`` is the cross-section sample
     spacing (normally the pixel size). ``junctions``: (k, 2) intersection points;
-    cross-sections near them are ignored by the ribbon method."""
+    cross-sections near them are ignored."""
     c = as_coords(coords)
     s = cumlen(c)
     d = station_distances(s, cfg.station_spacing)
@@ -856,26 +487,13 @@ def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
         has = valid(pts[:, 0], pts[:, 1]) > 0.5
         no_data = (~has).mean() > 0.5
 
-    if cfg.method == "ribbon":
-        near_junction = np.zeros(n, bool)
-        if junctions is not None and len(junctions) and cfg.junction_mask > 0:
-            jd = np.min(np.hypot(pts[:, None, 0] - junctions[None, :, 0],
-                                 pts[:, None, 1] - junctions[None, :, 1]), axis=1)
-            near_junction = jd < cfg.junction_mask
-        final, width, conf, used = fit_ribbon(offs, profiles, d, has & ~near_junction, cfg)
-        raw = np.where(used, final, np.nan)
-    else:
-        raw = np.full(n, np.nan)
-        width = np.full(n, np.nan)
-        conf = np.zeros(n)
-        for i in range(n):
-            m = measure_profile(offs, profiles[i], cfg)
-            if m is not None and m[2] > 0:
-                raw[i], width[i], conf[i] = m
-        raw[~has] = np.nan
-        conf[~has] = 0.0
-        final, used = _clean_offsets(d, raw, cfg)
-        final = np.clip(final, -cfg.max_shift, cfg.max_shift)
+    near_junction = np.zeros(n, bool)
+    if junctions is not None and len(junctions) and cfg.junction_mask > 0:
+        jd = np.min(np.hypot(pts[:, None, 0] - junctions[None, :, 0],
+                             pts[:, None, 1] - junctions[None, :, 1]), axis=1)
+        near_junction = jd < cfg.junction_mask
+    final, width, conf, used = fit_ribbon(offs, profiles, d, has & ~near_junction, cfg)
+    raw = np.where(used, final, np.nan)
 
     new_line = simplify(pts + normal * final[:, None], cfg.simplify_tolerance)
 
@@ -910,28 +528,6 @@ def refine_line(coords, sample: Sampler, cfg: RefineConfig, step: float,
         stations=stations,
         moved=moved,
     )
-
-
-def _clean_offsets(d: np.ndarray, raw: np.ndarray, cfg: RefineConfig):
-    """Drop outliers, fill gaps along the road, smooth. Returns (offsets, used mask)."""
-    good = ~np.isnan(raw)
-    if not good.any():
-        return np.zeros_like(raw), good
-    w = max(1, cfg.smooth_window)
-    half = w // 2
-    med = np.array([
-        np.nanmedian(raw[max(0, i - half):i + half + 1])
-        if good[max(0, i - half):i + half + 1].any() else np.nan
-        for i in range(len(raw))
-    ])
-    used = good & (np.abs(raw - med) <= cfg.outlier_tolerance)
-    if not used.any():
-        return np.zeros_like(raw), used
-    filled = np.interp(d, d[used], raw[used])
-    if len(filled) >= 3 and w > 1:
-        sigma = max(1.0, w / 3.0)
-        filled = ndimage.gaussian_filter1d(filled, sigma, mode="nearest")
-    return filled, used
 
 
 # --------------------------------------------------------------------------- ribbon
@@ -1159,7 +755,7 @@ def _components(n: int, pairs) -> list[list[int]]:
 # engine.py
 # ======================================================================
 
-"""Processing steps shared by the command-line tool and the ArcGIS Pro toolbox.
+"""Processing steps of the Align tool.
 
 Everything here works on plain numpy coordinate arrays and an imagery
 *reader*, so it runs with only numpy + scipy. A reader needs:
@@ -1179,7 +775,7 @@ from scipy.spatial import cKDTree
 
 log = logging.getLogger("centerline_align")
 
-PAD_PX = 64  # context pixels read around each tile so blurs/embeddings have no edge effects
+PAD_PX = 64  # context pixels read around each tile so blurs have no edge effects
 TRAIN_TILES_PER_GRID = 4
 
 
@@ -1208,8 +804,7 @@ class ProbabilityMap:
         return v.reshape(np.shape(x)).astype(np.float32)
 
 
-def region_probability(reader, clf: RoadClassifier, embedder, bounds, lines, rcfg, ccfg
-                       ) -> ProbabilityMap:
+def region_probability(reader, clf: RoadClassifier, bounds, lines, rcfg) -> ProbabilityMap:
     """Road probability for ``bounds`` plus a margin, computed only near ``lines``."""
     res = reader.res
     margin = rcfg.search_half_width + rcfg.max_shift + 4 * res
@@ -1219,8 +814,7 @@ def region_probability(reader, clf: RoadClassifier, embedder, bounds, lines, rcf
     height = int(np.ceil((y0 - (miny - margin)) / res))
     pmap = ProbabilityMap(x0, y0, res, (height, width))
 
-    tile = ccfg.embedding_tile if embedder is not None else 1024
-    core = max(64, tile - 2 * PAD_PX) if embedder is not None else tile
+    core = 1024
     reach = rcfg.search_half_width + rcfg.max_shift
     pts = np.concatenate([densify(as_coords(c), 5.0) for c in lines]) if lines else np.zeros((0, 2))
     tree = cKDTree(pts) if len(pts) else None
@@ -1234,7 +828,7 @@ def region_probability(reader, clf: RoadClassifier, embedder, bounds, lines, rcf
                 continue  # nothing to refine near this tile
             chip = reader.read(tx0 - PAD_PX * res, ty0 + PAD_PX * res,
                                w + 2 * PAD_PX, h + 2 * PAD_PX)
-            p = clf.predict(chip, embedder)[PAD_PX:PAD_PX + h, PAD_PX:PAD_PX + w]
+            p = clf.predict(chip)[PAD_PX:PAD_PX + h, PAD_PX:PAD_PX + w]
             v = chip.valid[PAD_PX:PAD_PX + h, PAD_PX:PAD_PX + w]
             pmap.prob[r0:r0 + h, c0:c0 + w] = np.round(p * 255).astype(np.uint8)
             pmap.valid[r0:r0 + h, c0:c0 + w] = v
@@ -1292,18 +886,16 @@ def alignment_check(chip, lines, has_nir: bool, max_shift: float = 60.0,
     return float(dc * chip.res), float(-dr * chip.res), float(sub[i, j]), float(corr[0, 0])
 
 
-def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
-                     seed: int = 0, on_chip=None, trusted_near=None) -> RoadClassifier:
+def train_classifier(reader, cells: list[list], lines_near, ccfg, seed: int = 0,
+                     on_chip=None) -> RoadClassifier:
     """Train from tiles centred on random road points in each training cell.
 
     cells: for each training grid, the road coords inside it.
     lines_near(bounds) -> road coords intersecting ``bounds`` (for labelling).
     on_chip(k, chip, lines) is called for every training tile (for diagnostics).
-    trusted_near(bounds) -> ([(coords, half_width)], [coords]): second pass, label
-    from an earlier run's trusted lines (see ``sample_training_pixels``).
     """
     rng = np.random.default_rng(seed)
-    tile = ccfg.embedding_tile if embedder is not None else 1024
+    tile = 1024
     half = tile * reader.res / 2
     centres = []
     for lines in cells:
@@ -1335,7 +927,7 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
 
     # Pass 2: labelled samples.
     per_tile = max(50, ccfg.samples_per_class // len(centres))
-    pix_s, emb_s, lab_s, shifts = [], [], [], []
+    pix_s, lab_s, shifts = [], [], []
     for k, c in enumerate(centres):
         chip = read_at(c)
         bx0, by0, bx1, by1 = chip.bounds
@@ -1346,16 +938,11 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
         a = alignment_check(chip, near, reader.has_nir)
         if a is not None:
             shifts.append(a)
-        trusted = trusted_near(chip.bounds) if trusted_near is not None else None
-        rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile, trusted)
+        rows, cols, labels = sample_training_pixels(chip, near, ccfg, rng, per_tile)
         if len(labels) == 0:
             continue
-        pix, emb = extract_samples(chip, rows, cols, reader.has_nir, lo, hi, embedder,
-                                   lidar=getattr(reader, "has_lidar", False))
-        pix_s.append(pix)
+        pix_s.append(extract_samples(chip, rows, cols, reader.has_nir, lo, hi))
         lab_s.append(labels)
-        if emb is not None:
-            emb_s.append(emb)
     if not lab_s:
         raise ValueError("No training pixels found; check imagery coverage")
     _report_alignment(shifts)
@@ -1366,10 +953,7 @@ def train_classifier(reader, cells: list[list], lines_near, ccfg, embedder=None,
         means = pix[labels == lab, :nb].mean(axis=0)
         log.info("Average %s training pixel (0-1 scale): %s", what,
                  ", ".join(f"{n} {m:.2f}" for n, m in zip(names, means)))
-    clf = fit(pix, np.concatenate(emb_s) if emb_s else None, labels,
-              feature_mode=ccfg.features, has_nir=reader.has_nir, band_lo=lo, band_hi=hi,
-              embedding_model=ccfg.embedding_model if embedder is not None else None,
-              lidar=getattr(reader, "has_lidar", False))
+    clf = fit(pix, labels, has_nir=reader.has_nir, band_lo=lo, band_hi=hi)
     if clf.train_accuracy is not None and clf.train_accuracy < 0.75:
         log.warning(
             "Training accuracy is only %.2f: the classifier can barely tell road from not-road "
@@ -1466,55 +1050,8 @@ def _crossings(lines, tol: float, seg: float = 10.0) -> list:
 
 
 # what the keep/move model looks at for each refined line
-MOVE_FEATURES = ("shift_avg", "shift_max", "conf", "pct_valid", "width_med")
-MOVE_MIN_GAIN = 0.5   # a move "helps" when it brings the line at least this much closer
-
-
-def move_probability(model: dict, rec: dict) -> float:
-    """Chance (0-1) that applying a refined line's move brings it closer to where a
-    person would put it, from the line's own QA values."""
-    x = np.array([float(rec[k]) for k in MOVE_FEATURES])
-    z = float(np.dot((x - np.asarray(model["mean"])) / np.asarray(model["std"]),
-                     np.asarray(model["coef"])) + model["intercept"])
-    return 1.0 / (1.0 + np.exp(-np.clip(z, -30, 30)))
-
-
-def fit_move_model(recs: list[dict], gains, min_rows: int = 20):
-    """Learn when a move is worth applying.
-
-    recs: refined records whose move was applied (``moved`` = 1); gains: for each,
-    how much closer the move brought the line to the hand-checked line (negative =
-    farther). Fits a logistic regression for "helps by at least MOVE_MIN_GAIN", then
-    picks the probability threshold that maximises the total gain on these lines.
-    Returns None when there are too few lines of either kind to learn from.
-    """
-    gains = np.asarray(gains, float)
-    y = (gains >= MOVE_MIN_GAIN).astype(float)
-    if len(recs) < min_rows or y.sum() < 5 or (1 - y).sum() < 5:
-        return None
-    X = np.array([[float(r[k]) for k in MOVE_FEATURES] for r in recs])
-    mean, std = X.mean(axis=0), X.std(axis=0)
-    std[std < 1e-9] = 1.0
-    coef, intercept = logistic_regression((X - mean) / std, y, C=1.0)
-    model = dict(features=list(MOVE_FEATURES), mean=mean.tolist(), std=std.tolist(),
-                 coef=coef.tolist(), intercept=float(intercept), threshold=0.5)
-    p = np.array([move_probability(model, r) for r in recs])
-    cands = np.unique(np.concatenate([p, [0.0, 1.01]]))
-    total = [gains[p >= t].sum() for t in cands]
-    model["threshold"] = float(cands[int(np.argmax(total))])
-    model["rows"] = len(recs)
-    model["gain_all"] = float(gains.sum())          # applying every move
-    model["gain_chosen"] = float(max(total))        # applying the chosen ones
-    return model
-
-
-def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False,
-                  move_model: dict | None = None):
-    """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts.
-
-    move_model: optional keep/move model (``fit_move_model``); a move it judges
-    unlikely to help is not applied (the original line is kept, reason
-    ``move_unlikely_to_help``)."""
+def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):
+    """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts."""
     records, stations = [], []
     junctions = find_junctions([c for _, c in pieces])
     for src_id, coords in pieces:
@@ -1530,13 +1067,6 @@ def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations
             o_sx=float(c[0, 0]), o_sy=float(c[0, 1]), o_ex=float(c[-1, 0]), o_ey=float(c[-1, 1]),
             coords=r.coords,
         ))
-        rec = records[-1]
-        if move_model is not None and rec["moved"]:
-            p = move_probability(move_model, rec)
-            rec["move_p"] = round(p, 3)
-            if p < move_model["threshold"]:
-                rec["coords"], rec["moved"] = c.copy(), 0
-                rec["reason"] = ";".join(r.reasons + ["move_unlikely_to_help"])
         if r.stations is not None:
             s = r.stations
             for i in range(len(s["x"])):
@@ -1907,7 +1437,6 @@ import re
 import time
 
 import numpy as np
-from scipy import ndimage
 
 
 TILE_EXTS = (".tif", ".tiff", ".img", ".jp2", ".sid")
@@ -2023,76 +1552,6 @@ class ArcTileReader:
         return Chip(data=data, valid=valid, x0=x0, y0=y0, res=r)
 
 
-LIDAR_LAYERS = ("intensity", "dtm", "dsm")
-LIDAR_NODATA = -9999.0
-
-
-class LidarLayers:
-    """The rasters made by make_lidar_layers.py: ground intensity, ground elevation
-    (dtm) and surface elevation (dsm), as tiles in subfolders of one folder."""
-
-    def __init__(self, arcpy, folder: str, sr):
-        meta_path = os.path.join(folder, "lidar_layers.json")
-        if not os.path.exists(meta_path):
-            raise ValueError(f"{folder} is not a LiDAR layers folder (no lidar_layers.json); "
-                             "make it with make_lidar_layers.py")
-        with open(meta_path) as f:
-            meta = json.load(f)
-        self.z_to_m = float(meta.get("z_to_m", 1.0))
-        self.xy_to_m = float(meta.get("xy_to_m", 0.3048006096))
-        self.readers = []
-        for name in LIDAR_LAYERS:
-            sub = os.path.join(folder, name)
-            if not os.path.isdir(sub):
-                raise ValueError(f"LiDAR folder {folder} has no '{name}' subfolder")
-            r = ArcTileReader(arcpy, sub, [1], nodata=LIDAR_NODATA)
-            if r.sr.name != sr.name:
-                raise ValueError(f"LiDAR layers are in {r.sr.name} but the imagery is in "
-                                 f"{sr.name}; remake them with the imagery's coordinate system")
-            self.readers.append(r)
-
-    def sample(self, chip):
-        """(3, H, W) LiDAR values at the chip's pixel centres (heights in metres), and
-        where all three exist."""
-        bx0, by0, bx1, by1 = chip.bounds
-        out = np.zeros((3,) + chip.shape, np.float32)
-        ok = np.ones(chip.shape, bool)
-        h, w = chip.shape
-        for k, rd in enumerate(self.readers):
-            r = rd.res
-            x0, y0 = rd.snap(bx0 - 2 * r, by1 + 2 * r)
-            nw = int(np.ceil((bx1 + 2 * r - x0) / r))
-            nh = int(np.ceil((y0 - (by0 - 2 * r)) / r))
-            blk = rd.read(x0, y0, nw, nh)
-            cols = (chip.x0 + (np.arange(w) + 0.5) * chip.res - x0) / r - 0.5
-            rows = (y0 - (chip.y0 - (np.arange(h) + 0.5) * chip.res)) / r - 0.5
-            rr, cc = np.meshgrid(rows, cols, indexing="ij")
-            v = ndimage.map_coordinates(blk.data[0], [rr, cc], order=1, mode="nearest")
-            good = ndimage.map_coordinates(blk.valid.astype(np.float32), [rr, cc], order=1,
-                                           mode="constant", cval=0.0) > 0.99
-            out[k] = v * (self.z_to_m if k > 0 else 1.0)
-            ok &= good
-        return out, ok
-
-
-class WithLidar:
-    """An imagery reader whose chips also carry the LiDAR layers."""
-
-    has_lidar = True
-
-    def __init__(self, reader, lidar: LidarLayers):
-        self.base, self.lidar = reader, lidar
-
-    def __getattr__(self, name):
-        return getattr(self.base, name)
-
-    def read(self, x0, y0, width_px, height_px):
-        chip = self.base.read(x0, y0, width_px, height_px)
-        chip.aux, chip.aux_valid = self.lidar.sample(chip)
-        chip.xy_to_m = self.lidar.xy_to_m
-        return chip
-
-
 # --------------------------------------------------------------------------- vectors
 
 def read_lines(arcpy, fc, id_field, sr):
@@ -2178,7 +1637,7 @@ def _safe(value) -> str:
 
 def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
         out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False,
-        diagnostics=False, retrain_from=None, lidar_folder=None, classifier_file=None):
+        diagnostics=False):
     msg = arcpy.AddMessage
     handler = _ArcHandler(arcpy)
     root = logging.getLogger("centerline_align")
@@ -2186,15 +1645,13 @@ def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, wor
     root.setLevel(logging.INFO)
     try:
         return _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field,
-                    work_folder, out_fc, bands, refine, classifier, fresh, diagnostics,
-                    retrain_from, lidar_folder, classifier_file)
+                    work_folder, out_fc, bands, refine, classifier, fresh, diagnostics)
     finally:
         root.removeHandler(handler)
 
 
 def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False, retrain_from=None,
-         lidar_folder=None, classifier_file=None):
+         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False):
     os.makedirs(work_folder, exist_ok=True)
     grid_dir = os.path.join(work_folder, "grids")
     os.makedirs(grid_dir, exist_ok=True)
@@ -2208,12 +1665,6 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
         arcpy.AddWarning(f"{len(reader.skipped)} imagery file(s) were skipped:\n" + "\n".join(
             f"  {p}: {why}" for p, why in reader.skipped[:15])
             + (f"\n  ... and {len(reader.skipped) - 15} more" if len(reader.skipped) > 15 else ""))
-
-    if lidar_folder:
-        lidar = LidarLayers(arcpy, lidar_folder, sr)
-        reader = WithLidar(reader, lidar)
-        counts = ", ".join(f"{len(r.tiles)} {n}" for n, r in zip(LIDAR_LAYERS, lidar.readers))
-        msg(f"LiDAR layers: {lidar_folder} (tiles: {counts})")
 
     roads = read_lines(arcpy, roads_fc, road_id_field, sr)
     grids = read_grids(arcpy, grids_fc, grid_id_field, sr)
@@ -2236,36 +1687,9 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
                 os.remove(os.path.join(grid_dir, f))
         if os.path.exists(model_path):
             os.remove(model_path)
-    if classifier_file:
-        clf = RoadClassifier.load(classifier_file)
-        msg(f"Using the trained classifier {classifier_file}"
-            + (f" (trained from {clf.trained_from})" if clf.trained_from else ""))
-        if clf.has_nir != reader.has_nir:
-            raise ValueError("The trained classifier was made with "
-                             f"{'4' if clf.has_nir else '3'} bands; set the same bands here.")
-        if clf.lidar and not lidar_folder:
-            raise ValueError("The trained classifier uses LiDAR: give the LiDAR folder.")
-        if clf.move_model:
-            msg("It includes a keep/move model: moves it judges unlikely to help keep the "
-                "original line (REASON move_unlikely_to_help; MOVE_P = its estimate).")
-    elif os.path.exists(model_path):
+    if os.path.exists(model_path):
         clf = RoadClassifier.load(model_path)
         msg(f"Using saved classifier {model_path}")
-        if clf.lidar and not lidar_folder:
-            raise ValueError("The saved classifier in this work folder uses LiDAR: give the "
-                             "LiDAR folder, or use a new work folder.")
-        if lidar_folder and not clf.lidar:
-            arcpy.AddWarning("The saved classifier in this work folder was trained without "
-                             "LiDAR, so the LiDAR layers are not used. Use a new work folder "
-                             "to train with them.")
-        if retrain_from and clf.trained_from != str(retrain_from):
-            arcpy.AddWarning(
-                "This work folder already has a classifier, so the second-pass setting is "
-                "ignored. For a second pass, use a new, empty work folder (or tick Start over).")
-    elif retrain_from:
-        clf = _train_second_pass(arcpy, msg, reader, grids, retrain_from, ccfg, sr)
-        clf.save(model_path)
-        msg(f"Classifier saved to {model_path} (training accuracy {clf.train_accuracy:.3f})")
     else:
         with_roads = [gi for gi in range(len(grids))
                       if any(_overlaps(r[3], grids[gi][2]) for r in roads)]
@@ -2285,7 +1709,7 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
                 os.makedirs(diag_dir, exist_ok=True)
                 _save_training_diag(arcpy, diag_dir, k // 4 + 1, chip, lines, ccfg, sr)
 
-        clf = train_classifier(reader, cells, lines_near, ccfg, None, on_chip=on_chip)
+        clf = train_classifier(reader, cells, lines_near, ccfg, on_chip=on_chip)
         msg(f"Diagnostic rasters for the first training tiles: {diag_dir}")
         clf.save(model_path)
         msg(f"Classifier saved to {model_path} (training accuracy {clf.train_accuracy:.3f})")
@@ -2305,16 +1729,14 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
             pieces = clip_to_grid(arcpy, roads, grids, k, sr)
             records = []
             if pieces:
-                pmap = region_probability(reader, clf, None, cext, [c for _, c in pieces],
-                                          rcfg, ccfg)
+                pmap = region_probability(reader, clf, cext, [c for _, c in pieces], rcfg)
                 if diagnostics:
                     prob_dir = os.path.join(work_folder, "diagnostics")
                     os.makedirs(prob_dir, exist_ok=True)
                     h = pmap.prob.shape[0]
                     _save_raster(arcpy, pmap.prob, pmap.x0, pmap.y0 - h * pmap.res, pmap.res,
                                  os.path.join(prob_dir, f"road_prob_{_safe(gid)}.tif"), sr)
-                records, _ = refine_pieces(pmap, pieces, rcfg, reader.res,
-                                           move_model=clf.move_model)
+                records, _ = refine_pieces(pmap, pieces, rcfg, reader.res)
             for r in records:
                 r["grid_id"] = gid
                 r["coords"] = np.asarray(r["coords"]).tolist()
@@ -2342,44 +1764,6 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     for line in summarize(records):
         msg(line)
     return {"lines": len(records), "review": n_rev}
-
-
-def _train_second_pass(arcpy, msg, reader, grids, earlier_fc, ccfg, sr):
-    """Train from an earlier run's output: lines it was confident about (REVIEW = 0)
-    give road labels across their measured width; the rest only mark where roads are."""
-    good, bad = [], []
-    with arcpy.da.SearchCursor(earlier_fc, ["SHAPE@", "REVIEW", "WIDTH_MED"],
-                               spatial_reference=sr) as cur:
-        for g, review, width in cur:
-            if g is None:
-                continue
-            for c in _parts(g):
-                ext = (c[:, 0].min(), c[:, 1].min(), c[:, 0].max(), c[:, 1].max())
-                if not review and width and width > 0:
-                    good.append((c, float(width) / 2, ext))
-                else:
-                    bad.append((c, ext))
-    if not good:
-        raise ValueError(f"{earlier_fc} has no lines with REVIEW = 0 to learn from")
-    msg(f"Second pass: learning from {len(good)} trusted lines (REVIEW = 0) of {earlier_fc}; "
-        f"{len(bad)} flagged lines are only used to keep road pixels out of the not-road labels")
-    with_good = [gi for gi, (_, _, ge) in enumerate(grids)
-                 if any(_overlaps(e, ge) for _, _, e in good)]
-    train = pick_spread(with_good, ccfg.training_grids)
-    msg("Training the road classifier on grid(s): " + ", ".join(str(grids[g][0]) for g in train))
-    cells = [[c for c, _, e in good if _overlaps(e, grids[gi][2])] for gi in train]
-
-    def lines_near(b):
-        return ([c for c, _, e in good if _overlaps(e, b)]
-                + [c for c, e in bad if _overlaps(e, b)])
-
-    def trusted_near(b):
-        return ([(c, hw) for c, hw, e in good if _overlaps(e, b)],
-                [c for c, e in bad if _overlaps(e, b)])
-
-    clf = train_classifier(reader, cells, lines_near, ccfg, None, trusted_near=trusted_near)
-    clf.trained_from = str(earlier_fc)
-    return clf
 
 
 def _save_raster(arcpy, arr, x_ll, y_ll, res, path, sr):
@@ -2432,7 +1816,7 @@ def _id_field_type(arcpy, fc, field):
 OUT_FIELDS = [("SRC_ID", None), ("GRID_ID", "TEXT"), ("SHIFT_AVG", "DOUBLE"),
               ("SHIFT_MAX", "DOUBLE"), ("CONF", "DOUBLE"), ("PCT_VALID", "DOUBLE"),
               ("WIDTH_MED", "DOUBLE"), ("REVIEW", "SHORT"), ("REASON", "TEXT"),
-              ("MOVED", "SHORT"), ("MOVE_P", "DOUBLE")]
+              ("MOVED", "SHORT")]
 
 
 def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
@@ -2454,7 +1838,7 @@ def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
             src = r["src_id"] if id_type != "TEXT" else str(r["src_id"])
             cur.insertRow([src, str(r["grid_id"]), r["shift_avg"], r["shift_max"], r["conf"],
                            r["pct_valid"], r["width_med"], int(r["review"]), r["reason"],
-                           int(r.get("moved", 1)), r.get("move_p"), line])
+                           int(r.get("moved", 1)), line])
 
 
 # --------------------------------------------------------------------------- evaluation
@@ -2628,9 +2012,9 @@ def _write_check_points(arcpy, out_fc, sr, pts, cover, oids, errors):
 # arcgis_training.py
 # ======================================================================
 
-"""Collect training data while you edit, and train the classifier from it overnight.
+"""Collect training data while you edit, and export it for the deep-learning model.
 
-Three toolbox buttons, used in this order:
+Toolbox buttons, used in this order:
 
 1. Start of day (``snapshot``): remembers every road's geometry before you edit
    it. The first geometry seen for a road is kept as its *original* and never
@@ -2638,44 +2022,34 @@ Three toolbox buttons, used in this order:
    replace its real original.
 2. End of day (``collect``): every road you have checked (e.g.
    ``Validated = 'Yes'``) becomes a training road, with how far your edit moved
-   it from its original. Roads you checked and left alone count too: they
-   teach the tool when not to move a line.
-3. Overnight (``train``): trains the road classifier on the checked roads (road
-   labels on your lines, not on a reference layer that is itself a few feet
-   off), then measures on grids held back from training how close the tool gets
-   the original lines to your edits, and whether the new model beats the last.
+   it from its original and whether it was traced from a reference layer.
+3. Weekly (``export_training_chips``): imagery chips with the checked
+   centrelines as targets, zipped for training in Google Colab.
 
 Following the REVAMP Phase 6 manual:
 
 * Roads marked abandoned or private (``AbandonedRoad`` / ``PrivateRoad`` = 'Yes',
   when the layer has those fields) are never used: there may be no pavement.
-* The ends of every line are left out of the road labels: lines are split at
-  intersections, and the manual snaps them simply and bends T-intersections along
-  the turn, so near a junction a line is not a pavement centre.
+* The ends of every line are left out of the training targets: lines are split
+  at intersections, and the manual snaps them simply and bends T-intersections
+  along the turn, so near a junction a line is not a pavement centre.
 * Roads traced from a reference layer (the manual's Replace Geometry > Trace) are
-  marked, so the nightly test can also report on the roads drawn from the imagery.
-* A road checked without an edit means "meets the standard" (the line falls
-  within the pavement), not "on the exact centre". Such roads teach the keep/move
-  model to leave good lines alone.
+  marked: they are trained on but not scored, since the reference layer would
+  win there by default.
 
 Nothing is ever written to the road layer. Everything lives in the training
-folder: ``originals.json``, ``training_roads.json`` and ``models\\``.
+folder (``originals.json``, ``training_roads.json``) and the chips folder.
 """
 
 import json
-import logging
 import os
 import time
-import zlib
 
 import numpy as np
 
 
 ORIGINALS = "originals.json"
 TRAINING = "training_roads.json"
-MODELS = "models"
-CURRENT_MODEL = "road_classifier.json"
-HOLDOUT_EVERY = 5      # about 1 grid in 5 with checked roads is kept for testing
 SAMPLE_SPACING = 5.0   # how often lines are compared (map units)
 MATCH_DIST = 40.0      # an original farther than this from the edited line isn't its match
 END_TRIM = 40.0        # line ends left out of the road labels (intersections)
@@ -2745,19 +2119,6 @@ def _excluded(arcpy, roads_fc):
                     out.add(int(row[0]))
     return out, fields
 
-
-def _with_log(arcpy, fn, *a, **k):
-    handler = _ArcHandler(arcpy)
-    root = logging.getLogger("centerline_align")
-    root.addHandler(handler)
-    root.setLevel(logging.INFO)
-    try:
-        return fn(*a, **k)
-    finally:
-        root.removeHandler(handler)
-
-
-# --------------------------------------------------------------------------- 1. snapshot
 
 def snapshot(arcpy, *, roads_fc, checked_where, training_folder, today=None):
     """Start of day: add every road not seen before to the originals (read-only on roads)."""
@@ -2927,22 +2288,6 @@ def _write_training_fc(arcpy, out_fc, roads, sr):
 
 # --------------------------------------------------------------------------- 3. train
 
-def _projector(arcpy, sr_text, sr):
-    """Function mapping stored parts (in the road layer's coordinates) to ``sr``."""
-    src = arcpy.SpatialReference()
-    src.loadFromString(sr_text)
-    if src.name == sr.name:
-        return lambda parts: [np.asarray(c, float) for c in parts]
-
-    def project(parts):
-        out = []
-        for c in parts:
-            g = arcpy.Polyline(arcpy.Array([arcpy.Point(x, y) for x, y in c]), src)
-            out += _parts(g.projectAs(sr))
-        return out
-    return project
-
-
 def _ext(c):
     return (c[:, 0].min(), c[:, 1].min(), c[:, 0].max(), c[:, 1].max())
 
@@ -2959,247 +2304,6 @@ def trim_ends(c, d: float):
     inner = (s > d) & (s < s[-1] - d)
     ends = interpolate(c, np.array([d, s[-1] - d]), s)
     return np.vstack([ends[:1], c[inner], ends[1:]])
-
-
-def train(arcpy, *, imagery, training_folder, grids_fc, grid_id_field, bands,
-          compare=(), training_grids=30, refine: RefineConfig | None = None, today=None):
-    return _with_log(arcpy, _train, arcpy, imagery, training_folder, grids_fc, grid_id_field,
-                     bands, list(compare or ()), training_grids, refine or RefineConfig(),
-                     today or _today())
-
-
-def _train(arcpy, imagery, training_folder, grids_fc, grid_id_field, bands, compare,
-           training_grids, rcfg, today):
-    msg = arcpy.AddMessage
-    store = _load(training_folder, TRAINING)
-    orig = _load(training_folder, ORIGINALS)
-    if not store or not store["roads"] or not orig:
-        raise ValueError(f"No training roads in {training_folder}. Use 'Start of Day' and "
-                         "'End of Day' while you edit first.")
-    reader = ArcTileReader(arcpy, imagery, bands)
-    sr = reader.sr
-    msg(f"Imagery: {len(reader.tiles)} raster(s), {sr.name}, cell size {reader.res:g}")
-
-    to_sr = _projector(arcpy, store["sr"], sr)
-    truth = []   # (oid, coords, ext, record)
-    for oid, r in store["roads"].items():
-        for c in to_sr(r["parts"]):
-            truth.append((int(oid), c, _ext(c), r))
-    to_sr = _projector(arcpy, orig["sr"], sr)
-    originals = []   # (oid, coords, ext)
-    for oid, r in orig["roads"].items():
-        for c in to_sr(r["parts"]):
-            originals.append((int(oid), c, _ext(c)))
-
-    grids = read_grids(arcpy, grids_fc, grid_id_field, sr)
-    mids = np.array([interpolate(c, cumlen(c)[-1] / 2)[0] for _, c, _, _ in truth])
-    home = np.full(len(truth), -1)
-    for gi, (_, g, _) in enumerate(grids):
-        free = home < 0
-        if free.any():
-            inside = _points_in_polygons(mids[free], [g])
-            home[np.flatnonzero(free)[inside]] = gi
-    with_truth = sorted(set(home[home >= 0].tolist()))
-    if not with_truth:
-        raise ValueError("None of the checked roads are inside the grids")
-    holdout = [gi for gi in with_truth
-               if zlib.crc32(str(grids[gi][0]).encode()) % HOLDOUT_EVERY == 0]
-    if not holdout and len(with_truth) >= 2:
-        holdout = [min(with_truth, key=lambda gi: zlib.crc32(str(grids[gi][0]).encode()))]
-    if len(holdout) == len(with_truth):
-        holdout = []
-    learn = [gi for gi in with_truth if gi not in holdout]
-    msg(f"{len(store['roads'])} checked roads in {len(with_truth)} grid(s): training on "
-        f"{len(learn)}, testing on {len(holdout)} ("
-        + (", ".join(str(grids[g][0]) for g in holdout) or "none: too few grids yet") + ")")
-
-    ccfg = ClassifierConfig(training_grids=training_grids)
-    train_on = pick_spread(learn, training_grids)
-    test_set = set(holdout)
-    learn_truth = []   # (trimmed coords, ext, home grid): road labels, ends left out
-    for (_, c, _, _), h in zip(truth, home):
-        t = trim_ends(c, END_TRIM)
-        if t is not None and h not in test_set:
-            learn_truth.append((t, _ext(t), h))
-    cells = [[c for c, _, h in learn_truth if h == gi] for gi in train_on]
-    if not any(cells):
-        raise ValueError("The training grids have no checked roads longer than "
-                         f"{2 * END_TRIM:g} to learn from yet.")
-
-    def lines_near(b):
-        return ([c for _, c, e, _ in truth if _overlaps(e, b)]
-                + [c for _, c, e in originals if _overlaps(e, b)])
-
-    def trusted_near(b):
-        # road labels on your lines only; the originals (and roads in the test grids)
-        # just keep road pixels out of the not-road labels
-        return ([(c, None) for c, e, _ in learn_truth if _overlaps(e, b)],
-                [c for _, c, e in originals if _overlaps(e, b)]
-                + [c for _, c, e, _ in truth if _overlaps(e, b)])
-
-    msg("Training the road classifier on grid(s): "
-        + ", ".join(str(grids[g][0]) for g in train_on))
-    clf = train_classifier(reader, cells, lines_near, ccfg, None, trusted_near=trusted_near)
-    clf.trained_from = f"{len(learn_truth)} checked road parts, {today}"
-    clf.move_model = _learn_moves(arcpy, msg, reader, grids, train_on, truth, home,
-                                  originals, clf, rcfg, ccfg, sr)
-    models = os.path.join(training_folder, MODELS)
-    os.makedirs(models, exist_ok=True)
-    dated = os.path.join(models, f"road_classifier_{today}.json")
-    clf.save(dated)
-    msg(f"Classifier saved to {dated} (training accuracy {clf.train_accuracy:.3f})")
-
-    current_path = os.path.join(models, CURRENT_MODEL)
-    prev = RoadClassifier.load(current_path) if os.path.exists(current_path) else None
-    if prev is not None and (prev.has_nir != clf.has_nir or prev.lidar):
-        prev = None   # different bands or LiDAR: not comparable
-
-    scores = {}
-    if holdout:
-        scores = _score(arcpy, msg, reader, grids, holdout, truth, home, originals, clf, prev,
-                        compare, rcfg, ccfg, sr)
-    new, old = scores.get("new"), scores.get("previous")
-    promote = prev is None or new is None or old is None or new <= old
-    if promote:
-        clf.save(current_path)
-        msg(f"This model is now the current one: {current_path}. Point 'Align Centerlines' "
-            "at it (Trained classifier).")
-    else:
-        msg(f"The new model ({new:.2f}) did not beat the current one ({old:.2f}) on the test "
-            f"grids, so {current_path} is unchanged. Tonight's model is kept as {dated}.")
-    _append_history(models, today, len(store["roads"]), len(train_on), len(holdout), clf,
-                    scores, promote)
-    return dict(scores, promoted=promote, model=dated, holdout=[grids[g][0] for g in holdout])
-
-
-def _score(arcpy, msg, reader, grids, holdout, truth, home, originals, clf, prev, compare,
-           rcfg, ccfg, sr):
-    """Align the original lines in the test grids with each model and compare with your
-    edits. Roads whose original is unknown (checked before the first snapshot) are skipped."""
-    test = [(c, e, r.get("traced", 0)) for (_, c, e, r), h in zip(truth, home)
-            if h in set(holdout) and r.get("original_known")]
-    if not test:
-        arcpy.AddWarning("The test grids have no checked roads with a known original yet, so "
-                         "the models can't be measured.")
-        return {}
-    near = [(oid, c, e) for oid, c, e in originals
-            if any(_overlaps(e, _grow(te, MATCH_DIST)) for _, te, _ in test)]
-    roads = [(oid, arcpy.Polyline(arcpy.Array([arcpy.Point(x, y) for x, y in c]), sr), [c], e)
-             for oid, c, e in near]
-    models = [("Tool, new model", clf)] + ([("Tool, current model", prev)] if prev else [])
-    aligned = {name: [] for name, _ in models}
-    for gi in holdout:
-        pieces = clip_to_grid(arcpy, roads, grids, gi, sr)
-        if not pieces:
-            continue
-        lines = [c for _, c in pieces]
-        for name, model in models:
-            pmap = region_probability(reader, model, None, grids[gi][2], lines, rcfg, ccfg)
-            records, _ = refine_pieces(pmap, pieces, rcfg, reader.res,
-                                       move_model=model.move_model)
-            aligned[name] += [np.asarray(r["coords"]) for r in records]
-        msg(f"Test grid {grids[gi][0]}: {len(pieces)} road pieces aligned")
-
-    lines = [c for c, _, _ in test]
-    pts, tans, line_idx = sample_lines(lines, SAMPLE_SPACING)
-    errors = {"Original lines": SegmentIndex([c for _, c, _ in near]).distances(
-        pts, tans, MATCH_DIST)}
-    for name, _ in models:
-        errors[name] = SegmentIndex(aligned[name]).distances(pts, tans, MATCH_DIST)
-    for fc in compare:
-        other = [c for _, _, parts, _ in read_lines(arcpy, fc, "OID@", sr) for c in parts]
-        errors[os.path.basename(fc) or fc] = SegmentIndex(other).distances(pts, tans, MATCH_DIST)
-    cover = _cover_classes(reader, pts, line_idx)
-    cover[near_junctions(pts, find_junctions([c for _, c, _ in near]), 40.0)] = "intersection"
-    msg(f"How close each layer is to your edits on {len(lines)} checked road part(s) in the "
-        "test grids (smaller is better):")
-    units = sr.linearUnitName or ""
-    ft = "ft" if "foot" in units.lower() or "feet" in units.lower() else ""
-    for line in eval_report(errors, cover, ft):
-        msg(line)
-    traced = np.array([t for _, _, t in test], bool)[line_idx]
-    if traced.any() and not traced.all():
-        msg("")
-        msg(f"Only roads you did NOT trace from a reference layer ({(~traced).sum()} points): "
-            "the fair test against that layer")
-        for line in eval_report({k: e[~traced] for k, e in errors.items()}, cover[~traced], ft):
-            msg(line)
-    # models are compared away from intersections, where the manual's snapping rules
-    # (not the pavement centre) decide where a line goes
-    use = np.all([~np.isnan(e) for e in errors.values()], axis=0) & (cover != "intersection")
-    med = {k: float(np.median(e[use])) if use.any() else None for k, e in errors.items()}
-    msg(f"Median distance to your edits away from intersections ({int(use.sum())} points): "
-        + ", ".join(f"{k} {v:.2f}" for k, v in med.items() if v is not None))
-    return {"original": med["Original lines"], "new": med["Tool, new model"],
-            "previous": med.get("Tool, current model"), "points": int(use.sum())}
-
-
-def _learn_moves(arcpy, msg, reader, grids, train_on, truth, home, originals, clf, rcfg,
-                 ccfg, sr):
-    """Align the original lines of checked roads in the training grids and learn which
-    moves bring a line closer to the checked line (keep/move model)."""
-    by_oid: dict = {}
-    for (oid, c, _, r), h in zip(truth, home):
-        if r.get("original_known") and h in train_on:
-            by_oid.setdefault(oid, []).append(c)
-    orig = [(oid, c, e) for oid, c, e in originals if oid in by_oid]
-    if not orig:
-        msg("Keep/move model: no checked roads with a known original in the training grids "
-            "yet.")
-        return None
-    roads = [(oid, arcpy.Polyline(arcpy.Array([arcpy.Point(x, y) for x, y in c]), sr), [c], e)
-             for oid, c, e in orig]
-    recs, gains = [], []
-    for gi in train_on:
-        pieces = clip_to_grid(arcpy, roads, grids, gi, sr)
-        if not pieces:
-            continue
-        pmap = region_probability(reader, clf, None, grids[gi][2], [c for _, c in pieces],
-                                  rcfg, ccfg)
-        records, _ = refine_pieces(pmap, pieces, rcfg, reader.res)
-        for (oid, c0), rec in zip([p for p in pieces if len(p[1]) >= 2], records):
-            if not rec["moved"]:
-                continue
-            truth_idx = SegmentIndex(by_oid[oid])
-            # compare away from the ends (intersections follow the manual's snapping rules)
-            before, after = trim_ends(np.asarray(c0), END_TRIM), trim_ends(
-                np.asarray(rec["coords"]), END_TRIM)
-            if before is None or after is None:
-                continue
-            e = []
-            for line in (before, after):
-                p, t, _ = sample_lines([line], SAMPLE_SPACING)
-                d = truth_idx.distances(p, t, MATCH_DIST)
-                e.append(float(np.nanmean(d)) if np.mean(~np.isnan(d)) >= 0.5 else np.nan)
-            if not np.isnan(e).any():
-                recs.append(rec)
-                gains.append(e[0] - e[1])
-    model = fit_move_model(recs, gains)
-    if model is None:
-        msg(f"Keep/move model: {len(recs)} moved line(s) to learn from; need at least 20 with "
-            "moves that helped and moves that didn't. Every move is applied for now.")
-        return None
-    kept = sum(move_probability(model, r) < model["threshold"] for r in recs)
-    msg(f"Keep/move model learned from {len(recs)} moved lines: it keeps the original for "
-        f"{kept} of them. On these lines, applying every move would bring them "
-        f"{model['gain_all']:+.0f} closer in total, applying only the chosen ones "
-        f"{model['gain_chosen']:+.0f}.")
-    return model
-
-
-def _append_history(models, today, n_roads, n_train, n_test, clf, scores, promoted):
-    path = os.path.join(models, "history.csv")
-    head = not os.path.exists(path)
-
-    def f(v):
-        return "" if v is None else f"{v:.2f}"
-    with open(path, "a") as out:
-        if head:
-            out.write("day,checked_roads,train_grids,test_grids,train_accuracy,"
-                      "median_original,median_new,median_current,promoted\n")
-        out.write(f"{today},{n_roads},{n_train},{n_test},{clf.train_accuracy:.3f},"
-                  f"{f(scores.get('original'))},{f(scores.get('new'))},"
-                  f"{f(scores.get('previous'))},{int(promoted)}\n")
 
 
 # --------------------------------------------------------------------------- deep learning
@@ -3390,8 +2494,8 @@ class Toolbox:
     def __init__(self):
         self.label = "Centerline Alignment"
         self.alias = "centerline"
-        self.tools = [AlignCenterlines, EvaluateAlignment, StartOfDay, EndOfDay, TrainOvernight,
-                      ExportTrainingChips]
+        self.tools = [StartOfDay, EndOfDay, ExportTrainingChips, EvaluateAlignment,
+                      AlignCenterlines]
 
 
 def _param(name, label, datatype, direction="Input", required=True, category=None, value=None):
@@ -3438,15 +2542,6 @@ class AlignCenterlines:
         work = _param("work_folder", "Work folder (progress and trained classifier)", "DEFolder")
         out = _param("out_fc", "Output aligned centerlines", "DEFeatureClass", direction="Output")
         params = [imagery, roads, road_id, grids, grid_id, work, out]
-        params.append(_param("lidar_folder",
-                             "LiDAR layers folder (optional; from make_lidar_layers.py)",
-                             "DEFolder", required=False, category="LiDAR"))
-        params.append(_param("classifier_file",
-                             "Trained classifier (optional; from 'Overnight: Train From My "
-                             "Edits')", "DEFile", required=False, category="Trained model"))
-        params.append(_param("retrain_from",
-                             "Learn from an earlier result (optional; use a new work folder)",
-                             "GPFeatureLayer", required=False, category="Second pass"))
         for name, label, default in (("red", "Red band", 1), ("green", "Green band", 2),
                                      ("blue", "Blue band", 3)):
             params.append(_param(name, label, "GPLong", category="Bands", value=default))
@@ -3455,11 +2550,6 @@ class AlignCenterlines:
         for name, label, default in ADVANCED:
             params.append(_param(name, label + " (map units)" if "confidence" not in label
                                  else label, "GPDouble", category="Advanced", value=default))
-        method = _param("method", "Refinement method", "GPString", category="Advanced",
-                        value="ribbon")
-        method.filter.type = "ValueList"
-        method.filter.list = ["ribbon", "midpoint"]
-        params.append(method)
         params.append(_param("keep_flagged",
                              "Keep the original line where the result is flagged for review",
                              "GPBoolean", required=False, category="Advanced", value=True))
@@ -3487,8 +2577,7 @@ class AlignCenterlines:
         bands = [int(p["red"].value), int(p["green"].value), int(p["blue"].value)]
         if nir not in (None, "", 0):
             bands.append(int(nir))
-        rcfg = RefineConfig(method=p["method"].valueAsText or "ribbon",
-                            keep_flagged=p["keep_flagged"].value is not False,
+        rcfg = RefineConfig(keep_flagged=p["keep_flagged"].value is not False,
                             **{name: float(p[name].value) for name, _, _ in ADVANCED})
         ccfg = ClassifierConfig(training_grids=int(p["training_grids"].value))
         run(arcpy,
@@ -3501,10 +2590,7 @@ class AlignCenterlines:
             out_fc=p["out_fc"].valueAsText,
             bands=bands, refine=rcfg, classifier=ccfg,
             fresh=bool(p["fresh"].value),
-            diagnostics=bool(p["diagnostics"].value),
-            retrain_from=p["retrain_from"].valueAsText,
-            lidar_folder=p["lidar_folder"].valueAsText,
-            classifier_file=p["classifier_file"].valueAsText)
+            diagnostics=bool(p["diagnostics"].value))
 
     def postExecute(self, parameters):
         return
@@ -3517,7 +2603,7 @@ def _split_multi(text) -> list[str]:
 
 class EvaluateAlignment:
     def __init__(self):
-        self.label = "Evaluate Against Checked Roads"
+        self.label = "4. Evaluate Against Checked Roads"
         self.description = (
             "Measures how far road layers (the original roads, aligned outputs) are from roads "
             "you checked by hand, per cover type: open, shadow, partial trees, canopy, "
@@ -3658,69 +2744,13 @@ class EndOfDay:
         return
 
 
-class TrainOvernight:
-    def __init__(self):
-        self.label = "3. Overnight: Train From My Edits"
-        self.description = (
-            "Trains the road classifier from the roads you checked, then tests it on grids "
-            "kept out of training: how close the tool gets the original lines to your edits, "
-            "compared with the current model. The better model becomes the current one.")
-        self.canRunInBackground = True
-
-    def getParameterInfo(self):
-        imagery = _param("imagery", "Imagery (raster, mosaic dataset, or folder of .tif tiles)",
-                         ["GPRasterLayer", "DERasterDataset", "DEMosaicDataset", "DEFolder"])
-        folder = _param("training_folder", "Training folder (the one used for Start/End of Day)",
-                        "DEFolder")
-        grids = _param("grids", "Work grids (1-mile)", "GPFeatureLayer")
-        grids.filter.list = ["Polygon"]
-        grid_id = _param("grid_id_field", "Grid ID field", "Field")
-        grid_id.parameterDependencies = [grids.name]
-        compare = arcpy.Parameter(name="compare", displayName="Also compare these layers "
-                                  "(optional, e.g. the county roads)", datatype="GPFeatureLayer",
-                                  parameterType="Optional", direction="Input", multiValue=True)
-        params = [imagery, folder, grids, grid_id, compare]
-        for name, label, default in (("red", "Red band", 1), ("green", "Green band", 2),
-                                     ("blue", "Blue band", 3)):
-            params.append(_param(name, label, "GPLong", category="Bands", value=default))
-        params.append(_param("nir", "Near-infrared band (leave empty if none)", "GPLong",
-                             required=False, category="Bands", value=4))
-        params.append(_param("training_grids", "Grids used to train the classifier", "GPLong",
-                             category="Advanced", value=30))
-        return params
-
-    def isLicensed(self):
-        return True
-
-    def updateParameters(self, parameters):
-        return
-
-    def updateMessages(self, parameters):
-        return
-
-    def execute(self, parameters, messages):
-        p = {x.name: x for x in parameters}
-        nir = p["nir"].value
-        bands = [int(p["red"].value), int(p["green"].value), int(p["blue"].value)]
-        if nir not in (None, "", 0):
-            bands.append(int(nir))
-        train(arcpy, imagery=p["imagery"].valueAsText,
-              training_folder=p["training_folder"].valueAsText,
-              grids_fc=p["grids"].valueAsText, grid_id_field=p["grid_id_field"].valueAsText,
-              bands=bands, compare=_split_multi(p["compare"].valueAsText),
-              training_grids=int(p["training_grids"].value or 30))
-
-    def postExecute(self, parameters):
-        return
-
-
 class ExportTrainingChips:
     def __init__(self):
-        self.label = "Export Training Chips (deep learning)"
+        self.label = "3. Export Training Chips (weekly)"
         self.description = (
             "Cuts imagery chips around roads you checked by hand and labels where their true "
             "centreline is, for training a centreline model in Google Colab (see "
-            "dl/README.md). Writes a zip to upload. Only reads the inputs.")
+            "README.md). Writes a zip to upload. Only reads the inputs.")
         self.canRunInBackground = True
 
     def getParameterInfo(self):

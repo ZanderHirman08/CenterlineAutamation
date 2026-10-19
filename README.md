@@ -1,234 +1,189 @@
-# Centerline Alignment
+# Centerline Alignment: REVAMP Phase 6, Glynn County
 
-Moves road centerlines onto the middle of the pavement in your orthoimagery,
-one 1-mile grid at a time, and writes a shapefile you can use to update your
-deliverable road layer. Everything runs on your own machine; no data leaves it.
+**Goal:** put GDOT road centerlines (`Roads_working`) on the centre of the pavement in
+the GIO imagery to **within a foot**, following the REVAMP Phase 6 manual.
 
-![Synthetic demo: input roads in red, aligned output in cyan](docs/demo_before_after.png)
+**The plan:** a deep-learning model learns the pavement centre from the roads you
+validate by hand. It is trained for free on Google Colab's GPU, because nothing
+can be installed on the work PC. When it beats the county road layer on roads it
+has never seen, it will draw the centrelines for you to review.
 
-## How it works
-
-1. **Learn what pavement looks like in *your* imagery.** The local road file
-   doubles as training labels: pixels right on a road line count as "road",
-   pixels 45–120 ft from any road count as "not road". A small classifier is
-   trained on samples from a handful of grids and saved as
-   `road_classifier.json`. It can use plain colour/texture features (no GPU),
-   or add **foundation-model embeddings** (DINOv2 / DINOv3) on a GPU, which hold
-   up better with shadows, mixed surfaces and gravel.
-2. **Turn each grid into a road-probability map** (only near roads, to save time).
-3. **Take cross-sections.** Every 10 ft along each road, the probability is
-   sampled across the road, ±40 ft.
-4. **Fit a ribbon along the whole road.** The road is treated as a ribbon with
-   a centre and a width at every cross-section, and the best ribbon for the
-   whole line is found at once: it should cover road pixels and avoid the rest,
-   while the centre bends gently and the width stays steady (narrowing costs
-   more than widening, since shadows and trees only ever make pavement look
-   narrower). Cross-sections at intersections are ignored and bridged by their
-   neighbours. Where the imagery gives no answer, the line stays put and is
-   **flagged**, never guessed. (The older per-cross-section *midpoint* method
-   is still available under Advanced.)
-5. **Keep the network connected.** Intersections and grid-edge cuts are put
-   back together at the point where the corrected roads cross.
-6. **Write outputs** with QA fields for every line.
-
-Grids are saved as they finish, so a county run can be stopped and restarted
-(`run` skips finished grids).
-
-## Option A: ArcGIS Pro toolbox (no installs)
-
-Everything needed ships with ArcGIS Pro, so this works on a locked-down
-machine with any licence level (Basic is fine).
-
-1. **Get the file.** Open
-   [`arcgis/CenterlineAlign.pyt`](arcgis/CenterlineAlign.pyt) on GitHub and use
-   *Download raw file*. If downloads are blocked, click **Raw**, select all
-   (Ctrl+A), copy, paste into Notepad, and save as `CenterlineAlign.pyt`
-   (*Save as type: All files*, encoding UTF-8).
-2. **Add it to Pro.** Catalog pane → Toolboxes → right-click → *Add Toolbox* →
-   pick the file. Open **Align Centerlines to Imagery**.
-3. **Fill in the tool:**
-   * *Imagery*: the folder of `.tif` tiles (or a raster / mosaic dataset)
-   * *Local road centerlines* + *Road ID field*
-   * *Work grids* + *Grid ID field*
-   * *Work folder*: any empty folder; progress and the trained classifier go here
-   * *Output*: a shapefile or geodatabase feature class
-   * *Bands*: defaults are R=1, G=2, B=3, NIR=4; clear NIR for 3-band imagery
-   Step-by-step setup (folders, copying the imagery for your grids out of the
-   state set): [docs/county_setup.md](docs/county_setup.md).
-4. **Start small.** Select 2–3 grids in the map first; the tool only processes
-   selected grids (and selected roads, if any are selected). Clear the selection for the full run.
-
-Re-running with the same work folder skips grids that are already done. Tick
-*Start over* (Advanced) after changing settings. The messages window shows
-the imagery's units; all distance settings use them.
-
-The toolbox uses the colour/texture classifier. GPU embeddings need PyTorch,
-which is an install, so they're only in Option B.
-
-**Also in the toolbox:**
-
-* **LiDAR** (optional): make ground intensity / ground / surface layers from
-  USGS LAZ tiles with [`arcgis/make_lidar_layers.py`](arcgis/make_lidar_layers.py)
-  and point *LiDAR layers folder* at them. The classifier then also uses
-  asphalt's laser return strength, the flat road bed and the canopy height,
-  which lets it find roads the imagery can't see under trees.
-* **Second pass** (optional): point *Learn from an earlier result* at a
-  finished output (and use a new work folder). The classifier retrains from
-  that run's trusted lines, labelling their full measured pavement width as
-  road and the verges as not-road.
-* **Training from your daily edits**: *1. Start of Day*, *2. End of Day* and
-  *3. Overnight* turn the roads you check by hand into training data and train
-  the classifier from them overnight, scoring each night's model on grids held
-  back from training. See [docs/daily_training.md](docs/daily_training.md).
-  Point *Align*'s *Trained classifier* at the result.
-* **Evaluate Against Checked Roads**: measures any number of road layers
-  against roads you checked by hand (e.g. `Validated = 'Yes'`), by cover type
-  (open, shadow, partial trees, canopy, intersection). Use it to compare runs
-  and settings on the same roads.
-
-## Option B: command line (needs a Python environment)
-
-ArcGIS Pro's built-in Python lacks rasterio/geopandas, so this needs a
-separate environment (ask IT if installs are restricted). With
-[Miniforge](https://github.com/conda-forge/miniforge), in the Miniforge Prompt:
-
-```bat
-conda create -n centerline -c conda-forge python=3.11 geopandas rasterio scikit-learn scipy pyyaml pytest
-conda activate centerline
-cd path\to\CenterlineAutamation
-python -m pytest tests          # should all pass
+```
+ You edit & validate roads ──► Start/End of Day tools record your edits (every day)
+                                      │
+                                      ▼
+                     Export Training Chips ──► chips.zip (weekly)
+                                      │
+                                      ▼
+                  Google Colab trains the model ──► score vs. county layer
+                                      │
+                                      ▼
+        (next) model draws centrelines ──► you review in Pro ──► Validated = 'Yes'
 ```
 
-For GPU embeddings, also install PyTorch for your CUDA version
-([pytorch.org](https://pytorch.org/get-started/locally/)) and `pip install transformers`.
+---
 
-## Your imagery
+## 1. Downloads
 
-* **GeoTIFF tiles (`.tif` + `.tif.aux.xml`)**: point the tool at the folder.
-  Tiles are read as one image (the command line builds
-  `output/imagery_mosaic.vrt`; the toolbox reads tiles directly). Keep each
-  `.aux.xml` next to its `.tif`; it can hold the projection and NoData value.
-* **MrSID (`.sid`)**: not readable by the standard GDAL build. Use the
-  GeoTIFF copies if they cover the same area, or convert in ArcGIS Pro with
-  **Copy Raster** (output `.tif`) and point the tool at the result.
-* **4-band (with near-infrared)?** Set `bands.nir: 4`. Separating vegetation
-  from pavement is much easier with it. `check` prints sample band values and
-  a reminder to confirm band 4 in a 4-1-2 false-colour view.
-* **Pyramids** (`.ovr` / `.rrd` next to the tiles): keep them; they speed up
-  the coarse reads used during training.
-* **No NoData value set:** fine. Gaps between tiles are treated as no data;
-  real pixels of exactly 0 in band 1 would be too, but 8-bit orthos rarely
-  have them.
+Branch: **`claude/road-centerline-alignment-albtwy`** (the files are on this branch).
+Right-click a download link → **Save link as…**
 
-### How long it takes
+| File | Download | Save it to |
+|---|---|---|
+| Toolbox | [CenterlineAlign.pyt](https://github.com/ZanderHirman08/CenterlineAutamation/raw/claude/road-centerline-alignment-albtwy/arcgis/CenterlineAlign.pyt) | `C:\Users\zhirman\Desktop\Centerline\Toolbox_v2\` |
+| Colab notebook | [Train_Centerline_Colab.ipynb](https://github.com/ZanderHirman08/CenterlineAutamation/raw/claude/road-centerline-alignment-albtwy/dl/Train_Centerline_Colab.ipynb) | `C:\Users\zhirman\Desktop\Centerline\Glynn\dl\` |
+| Imagery copy script (new counties only) | [copy_aoi_tiles.py](https://github.com/ZanderHirman08/CenterlineAutamation/raw/claude/road-centerline-alignment-albtwy/arcgis/copy_aoi_tiles.py) | `C:\Users\zhirman\Desktop\Centerline\` |
 
-On a full-size test (0.5 ft, 4-band, 10,000 × 10,000 px tiles, a city-style
-street grid) one 1-mile grid took about **1 minute on CPU** in pixel mode, plus
-about 1 minute per training grid once at the start. A county of a few hundred
-grids is an overnight run; dense urban grids take longer than rural ones.
-`resolution: 1.0` roughly quarters the time if you can accept a coarser
-measurement.
+You can also open the notebook straight in Colab:
+**[Open in Colab](https://colab.research.google.com/github/ZanderHirman08/CenterlineAutamation/blob/claude/road-centerline-alignment-albtwy/dl/Train_Centerline_Colab.ipynb)**.
+Colab asks to connect to GitHub the first time; the repository is private.
 
-## Running (command line)
+Check the saved file names end in `.pyt` and `.ipynb`, not `.txt`. In File
+Explorer, use View → Show → File name extensions to see them.
 
-```bat
-copy config.example.yaml config.yaml      &:: then edit the paths and fields
-python -m centerline_align check config.yaml          &:: checks files, CRS, bands, overlap
-python -m centerline_align run config.yaml --grids G101 G102   &:: try a couple of grids first
-python -m centerline_align run config.yaml            &:: the whole county
+Websites: [Google Drive](https://drive.google.com) · [Google Colab](https://colab.research.google.com)
+
+---
+
+## 2. One-time setup
+
+1. **Make folders:**
+   ```
+   C:\Users\zhirman\Desktop\Centerline\Toolbox_v2
+   C:\Users\zhirman\Desktop\Centerline\Glynn\training
+   C:\Users\zhirman\Desktop\Centerline\Glynn\dl
+   ```
+2. **Download** the toolbox and notebook (table above) into those folders.
+3. **Add the toolbox in Pro.** In your *work* project (the one with `Roads_working`):
+   Catalog pane → Toolboxes → right-click → **Add Toolbox** → `Toolbox_v2\CenterlineAlign.pyt`.
+   You should see 5 tools. If not, restart Pro.
+4. **Get the OK** from your supervisor/IT to upload imagery chips to Google Drive.
+5. **Google:** in [Google Drive](https://drive.google.com), create a folder named `Centerline`.
+
+The old Centerline project and its outputs are not touched. None of the tools
+write to `Roads_working`; they only read it.
+
+---
+
+## 3. Every day you edit
+
+| When | Tool | Settings |
+|---|---|---|
+| ☀️ Before your first edit | **1. Start of Day: Snapshot Roads** | Road layer: `Roads_working` · Checked where: `Validated = 'Yes'` · Training folder: `...\Glynn\training` |
+| ✏️ During the day | *(edit normally, per the manual)* | Mark `Validated = 'Yes'` on every road you check |
+| 🌙 After **saving** edits | **2. End of Day: Collect My Edits** | Same three settings, plus Reference road layer: `Local_Roads_Glynn` |
+
+**For the best training data:** draw on the **centre of the pavement** in the GIO
+imagery, zoomed in, rather than tracing the county layer. Spread your roads over
+trees, shadows, wide and narrow roads, and different grids.
+
+---
+
+## 4. Once a week: train the model
+
+### a. Export (in Pro): **3. Export Training Chips (weekly)**
+
+| Setting | Value |
+|---|---|
+| Checked roads | `Roads_working` |
+| Only checked roads where | `Validated = 'Yes'` |
+| Imagery | `C:\Users\zhirman\Desktop\Centerline\Glynn\imagery\tiles` |
+| Output folder | `C:\Users\zhirman\Desktop\Centerline\Glynn\dl\chips` |
+| Local roads | `Local_Roads_Glynn` |
+| Training folder from 'End of Day' | `C:\Users\zhirman\Desktop\Centerline\Glynn\training` |
+| Only roads I moved | unchecked (turn on once you have a few hundred moved roads) |
+
+It writes **`...\Glynn\dl\chips.zip`** (next to the `chips` folder). Copy the messages;
+they include the **score to beat** (the county layer's error).
+
+### b. Upload
+Drag `chips.zip` into **Google Drive → Centerline**, replacing last week's.
+
+### c. Train (in Colab)
+1. Open the notebook: [Open in Colab](https://colab.research.google.com/github/ZanderHirman08/CenterlineAutamation/blob/claude/road-centerline-alignment-albtwy/dl/Train_Centerline_Colab.ipynb),
+   or Colab → File → Upload notebook → `Train_Centerline_Colab.ipynb`.
+2. **Runtime → Change runtime type → T4 GPU → Save**.
+3. **Runtime → Run all**, and allow Google Drive access.
+4. Wait 20–40 min. If it disconnects, **Run all** again; it resumes where it stopped.
+
+Results go to **Google Drive → Centerline → model** (`best_model.pt`, `model_info.json`).
+
+### d. Send back
+The final "model vs. local roads" block it prints, and a screenshot of the example chips.
+
+---
+
+## 5. Where everything lives
+
+```
+Desktop\Centerline\
+├── Toolbox_v2\CenterlineAlign.pyt   ← the toolbox
+└── Glynn\
+    ├── imagery\tiles\               ← GIO imagery (already there)
+    ├── training\                    ← Start/End of Day write here
+    └── dl\
+        ├── Train_Centerline_Colab.ipynb
+        ├── chips\                   ← made by Export Training Chips
+        └── chips.zip                ← upload this
+
+Google Drive\Centerline\
+├── chips.zip                        ← you upload
+└── model\                           ← Colab writes the trained model here
 ```
 
-`--fresh` throws away finished grids and the saved classifier and starts over
-(do this after changing classifier or refine settings).
+---
 
-No data handy? `python scripts/make_demo_data.py` writes a synthetic scene and
-config to `demo/`.
+## 6. The tools
 
-## Outputs
-
-The toolbox writes the output feature class you choose (same fields as below)
-and keeps per-grid progress in the work folder. The command line writes to
-`output/`:
-
-| File | What it is |
+| Tool | What it does |
 |---|---|
-| `aligned_centerlines.shp` / `.gpkg` | the aligned lines, split at grid edges |
-| `grid_summary.csv` | per grid: pieces, length, number and length flagged, average shift, time |
-| `grids/<id>.gpkg` | per-grid results (and `stations` points if `write_stations: true`) |
-| `grids/<id>_prob.tif` | road-probability map if `write_probability: true` |
-| `road_classifier.json` | the trained classifier (reused on later runs) |
+| **1. Start of Day** | Remembers each road's shape before you edit it (stored in the training folder). |
+| **2. End of Day** | Records every checked road: whether you moved it, by how much, and whether it was traced from the county layer. It leaves out roads with AbandonedRoad/PrivateRoad = 'Yes'. |
+| **3. Export Training Chips** | Imagery chips (R, G, B, NIR) with your centrelines as the target. Details below. |
+| **4. Evaluate Against Checked Roads** | Measures any layer's distance to your validated roads (open road, shadow, canopy, intersection). |
+| **Align Centerlines to Imagery** | The current imagery-classifier method. It is accurate to about 1.5 ft, which is no better than the county layer. It will be switched to the model once the model wins. |
 
-Fields on each line:
+What the export does with your roads:
+* **Ends of lines:** 40 ft at each end is left out, because lines bend through junctions (manual Examples 2–4).
+* **Roads you haven't checked:** pixels near them are left out, so the model is never told "no road" there.
+* **Validation:** 20% of the ground (1000 ft blocks) is kept for testing and never trained on, so the score is honest.
+* **Traced roads:** used for training but not scored, since the county layer would win there by default.
 
-| Field | Meaning |
+## 7. Manual rules the project keeps
+
+* No Attribute Transfer, and line direction is never changed.
+* No curve tools; new cul-de-sacs are straight.
+* Route ID, mile points, function type, county, system code and ownership are never touched.
+* Routes stay connected at intersections.
+* Nothing is deleted (abandoned roads use AbandonedRoad = 'Yes').
+* GIO imagery is the reference.
+* You review every change and mark Validated = 'Yes' yourself.
+
+## 8. Status
+
+| Step | Status |
 |---|---|
-| `SRC_ID` | id of the input road (`road_id_field`) |
-| `GRID_ID` | grid it was processed in |
-| `SHIFT_AVG`, `SHIFT_MAX` | how far the line moved (CRS units) |
-| `CONF` | 0–1 confidence: pavement contrast × share of usable cross-sections |
-| `PCT_VALID` | share of cross-sections that found pavement |
-| `WIDTH_MED` | median measured pavement width; a sanity check |
-| `REVIEW` | 1 = check this one by eye |
-| `REASON` | why: `low_confidence`, `few_matches`, `large_shift`, `no_imagery` |
+| Daily edit capture (Start/End of Day) | ✅ built, not yet run on real data |
+| Export Training Chips | ✅ built, not yet run on real data |
+| Colab training notebook | ✅ built (tested on synthetic data) |
+| First real training run, score vs. county layer | ⏳ next: needs upload approval |
+| Model draws centrelines along `Roads_working` → review in Pro | 🔜 after the model beats the county layer |
 
-**Review workflow:** symbolise on `REVIEW`, fix or accept the flagged lines,
-spot-check a sample of the unflagged ones, and keep track of how often you
-had to edit, since that tells you whether to tighten or loosen the thresholds.
+Results so far, measured on validated roads in grids 7, 11, 16, 92, 284 and 285:
+* County layer: median **1.42 ft** from the validated roads.
+* Current Align tool: median **1.62 ft**.
 
-## Getting the geometry into the deliverable layer
+That ~1.5 ft limit is why the project moved to a deep-learning model.
 
-The output is split at grid edges. In ArcGIS Pro, first run **Dissolve** on
-`SRC_ID` (uncheck *multipart*, check *unsplit lines*) to get one line per road.
+---
 
-* **Deliverable layer shares the local road IDs:** join on the ID and copy
-  the shapes over, e.g. in the Pro Python window (untested sketch; try it on a
-  copy first):
+## For developers
 
-  ```python
-  import arcpy
-  new = {r[0]: r[1] for r in arcpy.da.SearchCursor("aligned_dissolved", ["SRC_ID", "SHAPE@"])}
-  with arcpy.da.UpdateCursor("Deliverable_Roads", ["OBJECTID", "SHAPE@"]) as cur:
-      for oid, shp in cur:
-          if oid in new:
-              cur.updateRow([oid, new[oid]])
-  ```
-* **Deliverable is the state layer (different IDs/segmentation):** use the
-  aligned output as the target in **Generate Rubbersheet Links** /
-  **Rubbersheet Features**, or match segments first with **Transfer Attributes**.
-  If the state layer carries LRS measures, recalibrate routes afterwards.
-
-## Tuning
-
-| Symptom | Try |
-|---|---|
-| Lines pulled toward parking lots / wide shoulders | lower `max_road_width`, raise `prob_threshold` |
-| Lots of `few_matches` under trees | expected; review them. Embeddings or NIR help |
-| Local file is very far off in places | raise `search_half_width` and `max_shift` |
-| Too slow | set `resolution: 1.0` (or 0.5), process grids in batches |
-| Jagged output | raise `smooth_window` or `simplify_tolerance` |
-
-Turn on `write_stations` and `write_probability` for a few grids to see
-exactly what each cross-section measured.
-
-## Limits
-
-* It refines **existing** lines; it does not invent roads missing from the
-  local file.
-* Measurements at intersections are noisy; ends are fixed by the network
-  step, but give intersections a look.
-* Tested here on synthetic imagery only (lines started about 5.6 ft off and
-  ended about 0.1 ft off). Real orthos are harder: expect to tune on a few
-  grids before a county run.
-* Embedding mode was tested for plumbing with a tiny random model; the real
-  DINOv2/DINOv3 weights download from Hugging Face on first use (DINOv3 is
-  gated: accept its licence there first).
-* The ArcGIS toolbox is tested here against a stand-in for `arcpy`
-  (`tests/fake_arcpy.py`) that follows the documented arcpy behaviour. It
-  hasn't run inside real ArcGIS Pro yet; if a message in the geoprocessing
-  window looks wrong, copy it into an issue.
-
-## Development
-
-`arcgis/CenterlineAlign.pyt` is generated from the `centerline_align` package.
-After changing the package, rebuild it with `python scripts/build_pyt.py`; a
-test fails if the committed `.pyt` is out of date.
+* `centerline_align/`: the package. `scripts/build_pyt.py` bundles it into
+  `arcgis/CenterlineAlign.pyt`. Only arcpy, numpy and scipy are allowed, with
+  Python 3.9 syntax. Rebuild after any change; a test checks it.
+* `dl/train_centerline.py`: the training code. `scripts/build_notebook.py`
+  builds the Colab notebook from it. Rebuild after any change; a test checks it.
+* Tests: `pip install -r requirements-dev.txt`, then `pytest`. ArcGIS is
+  simulated by `tests/fake_arcpy.py` on a synthetic scene.
+* `docs/HANDOFF.md`: project summary for picking the work up in a new session.

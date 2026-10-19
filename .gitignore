@@ -1,6 +1,3 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-output/
-config.yaml
-demo/

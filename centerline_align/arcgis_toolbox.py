@@ -2,7 +2,7 @@
 import arcpy
 
 from .arcgis_impl import evaluate, run
-from .arcgis_training import collect, export_training_chips, snapshot, train
+from .arcgis_training import collect, export_training_chips, snapshot
 from .config import ClassifierConfig, RefineConfig
 
 
@@ -10,8 +10,8 @@ class Toolbox:
     def __init__(self):
         self.label = "Centerline Alignment"
         self.alias = "centerline"
-        self.tools = [AlignCenterlines, EvaluateAlignment, StartOfDay, EndOfDay, TrainOvernight,
-                      ExportTrainingChips]
+        self.tools = [StartOfDay, EndOfDay, ExportTrainingChips, EvaluateAlignment,
+                      AlignCenterlines]
 
 
 def _param(name, label, datatype, direction="Input", required=True, category=None, value=None):
@@ -58,15 +58,6 @@ class AlignCenterlines:
         work = _param("work_folder", "Work folder (progress and trained classifier)", "DEFolder")
         out = _param("out_fc", "Output aligned centerlines", "DEFeatureClass", direction="Output")
         params = [imagery, roads, road_id, grids, grid_id, work, out]
-        params.append(_param("lidar_folder",
-                             "LiDAR layers folder (optional; from make_lidar_layers.py)",
-                             "DEFolder", required=False, category="LiDAR"))
-        params.append(_param("classifier_file",
-                             "Trained classifier (optional; from 'Overnight: Train From My "
-                             "Edits')", "DEFile", required=False, category="Trained model"))
-        params.append(_param("retrain_from",
-                             "Learn from an earlier result (optional; use a new work folder)",
-                             "GPFeatureLayer", required=False, category="Second pass"))
         for name, label, default in (("red", "Red band", 1), ("green", "Green band", 2),
                                      ("blue", "Blue band", 3)):
             params.append(_param(name, label, "GPLong", category="Bands", value=default))
@@ -75,11 +66,6 @@ class AlignCenterlines:
         for name, label, default in ADVANCED:
             params.append(_param(name, label + " (map units)" if "confidence" not in label
                                  else label, "GPDouble", category="Advanced", value=default))
-        method = _param("method", "Refinement method", "GPString", category="Advanced",
-                        value="ribbon")
-        method.filter.type = "ValueList"
-        method.filter.list = ["ribbon", "midpoint"]
-        params.append(method)
         params.append(_param("keep_flagged",
                              "Keep the original line where the result is flagged for review",
                              "GPBoolean", required=False, category="Advanced", value=True))
@@ -107,8 +93,7 @@ class AlignCenterlines:
         bands = [int(p["red"].value), int(p["green"].value), int(p["blue"].value)]
         if nir not in (None, "", 0):
             bands.append(int(nir))
-        rcfg = RefineConfig(method=p["method"].valueAsText or "ribbon",
-                            keep_flagged=p["keep_flagged"].value is not False,
+        rcfg = RefineConfig(keep_flagged=p["keep_flagged"].value is not False,
                             **{name: float(p[name].value) for name, _, _ in ADVANCED})
         ccfg = ClassifierConfig(training_grids=int(p["training_grids"].value))
         run(arcpy,
@@ -121,10 +106,7 @@ class AlignCenterlines:
             out_fc=p["out_fc"].valueAsText,
             bands=bands, refine=rcfg, classifier=ccfg,
             fresh=bool(p["fresh"].value),
-            diagnostics=bool(p["diagnostics"].value),
-            retrain_from=p["retrain_from"].valueAsText,
-            lidar_folder=p["lidar_folder"].valueAsText,
-            classifier_file=p["classifier_file"].valueAsText)
+            diagnostics=bool(p["diagnostics"].value))
 
     def postExecute(self, parameters):
         return
@@ -137,7 +119,7 @@ def _split_multi(text) -> list[str]:
 
 class EvaluateAlignment:
     def __init__(self):
-        self.label = "Evaluate Against Checked Roads"
+        self.label = "4. Evaluate Against Checked Roads"
         self.description = (
             "Measures how far road layers (the original roads, aligned outputs) are from roads "
             "you checked by hand, per cover type: open, shadow, partial trees, canopy, "
@@ -278,69 +260,13 @@ class EndOfDay:
         return
 
 
-class TrainOvernight:
-    def __init__(self):
-        self.label = "3. Overnight: Train From My Edits"
-        self.description = (
-            "Trains the road classifier from the roads you checked, then tests it on grids "
-            "kept out of training: how close the tool gets the original lines to your edits, "
-            "compared with the current model. The better model becomes the current one.")
-        self.canRunInBackground = True
-
-    def getParameterInfo(self):
-        imagery = _param("imagery", "Imagery (raster, mosaic dataset, or folder of .tif tiles)",
-                         ["GPRasterLayer", "DERasterDataset", "DEMosaicDataset", "DEFolder"])
-        folder = _param("training_folder", "Training folder (the one used for Start/End of Day)",
-                        "DEFolder")
-        grids = _param("grids", "Work grids (1-mile)", "GPFeatureLayer")
-        grids.filter.list = ["Polygon"]
-        grid_id = _param("grid_id_field", "Grid ID field", "Field")
-        grid_id.parameterDependencies = [grids.name]
-        compare = arcpy.Parameter(name="compare", displayName="Also compare these layers "
-                                  "(optional, e.g. the county roads)", datatype="GPFeatureLayer",
-                                  parameterType="Optional", direction="Input", multiValue=True)
-        params = [imagery, folder, grids, grid_id, compare]
-        for name, label, default in (("red", "Red band", 1), ("green", "Green band", 2),
-                                     ("blue", "Blue band", 3)):
-            params.append(_param(name, label, "GPLong", category="Bands", value=default))
-        params.append(_param("nir", "Near-infrared band (leave empty if none)", "GPLong",
-                             required=False, category="Bands", value=4))
-        params.append(_param("training_grids", "Grids used to train the classifier", "GPLong",
-                             category="Advanced", value=30))
-        return params
-
-    def isLicensed(self):
-        return True
-
-    def updateParameters(self, parameters):
-        return
-
-    def updateMessages(self, parameters):
-        return
-
-    def execute(self, parameters, messages):
-        p = {x.name: x for x in parameters}
-        nir = p["nir"].value
-        bands = [int(p["red"].value), int(p["green"].value), int(p["blue"].value)]
-        if nir not in (None, "", 0):
-            bands.append(int(nir))
-        train(arcpy, imagery=p["imagery"].valueAsText,
-              training_folder=p["training_folder"].valueAsText,
-              grids_fc=p["grids"].valueAsText, grid_id_field=p["grid_id_field"].valueAsText,
-              bands=bands, compare=_split_multi(p["compare"].valueAsText),
-              training_grids=int(p["training_grids"].value or 30))
-
-    def postExecute(self, parameters):
-        return
-
-
 class ExportTrainingChips:
     def __init__(self):
-        self.label = "Export Training Chips (deep learning)"
+        self.label = "3. Export Training Chips (weekly)"
         self.description = (
             "Cuts imagery chips around roads you checked by hand and labels where their true "
             "centreline is, for training a centreline model in Google Colab (see "
-            "dl/README.md). Writes a zip to upload. Only reads the inputs.")
+            "README.md). Writes a zip to upload. Only reads the inputs.")
         self.canRunInBackground = True
 
     def getParameterInfo(self):

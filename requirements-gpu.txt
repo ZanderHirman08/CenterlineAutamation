@@ -1,4 +1,0 @@
-# Only needed for classifier.features: embedding.
-# Install PyTorch for your CUDA version first: https://pytorch.org/get-started/locally/
-torch>=2.1
-transformers>=4.40

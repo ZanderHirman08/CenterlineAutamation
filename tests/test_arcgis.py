@@ -14,10 +14,14 @@ import rasterio
 from rasterio.windows import Window
 
 from . import fake_arcpy, synthetic
-from .test_pipeline import error_to_truth
+from .synthetic import error_to_truth
 
 ROOT = Path(__file__).resolve().parents[1]
 PYT = ROOT / "arcgis" / "CenterlineAlign.pyt"
+
+
+def _by_name(mod, cls_name):
+    return next(t for t in mod.Toolbox().tools if t.__name__ == cls_name)()
 
 
 def test_pyt_is_up_to_date():
@@ -35,8 +39,7 @@ def test_notebook_is_up_to_date():
 def test_pyt_uses_only_arcgis_pro_packages():
     import ast
     allowed = {"__future__", "arcpy", "numpy", "scipy", "json", "logging", "os", "re", "time",
-               "math", "dataclasses", "pathlib", "typing", "sys", "types", "shutil",
-               "zlib", "yaml"}  # yaml: CLI-only, lazy
+               "math", "dataclasses", "pathlib", "typing", "sys", "types", "shutil"}
     tree = ast.parse(PYT.read_text())
     used = set()
     for node in ast.walk(tree):
@@ -44,8 +47,7 @@ def test_pyt_uses_only_arcgis_pro_packages():
             used |= {a.name.split(".")[0] for a in node.names}
         elif isinstance(node, ast.ImportFrom) and node.module:
             used.add(node.module.split(".")[0])
-    # transformers/torch are imported lazily only for GPU embeddings, never by the toolbox
-    assert used - allowed <= {"torch", "transformers"}, used - allowed
+    assert used <= allowed, used - allowed
 
 
 @pytest.fixture()
@@ -84,7 +86,7 @@ def tiled_scene(tmp_path_factory):
 
 
 def run_tool(mod, scene, tmp_path, **overrides):
-    tool = mod.Toolbox().tools[0]()
+    tool = _by_name(mod, "AlignCenterlines")
     params = tool.getParameterInfo()
     p = {x.name: x for x in params}
     p["imagery"].value = str(scene["tiles"])
@@ -102,7 +104,7 @@ def run_tool(mod, scene, tmp_path, **overrides):
 
 
 def test_toolbox_parameters(toolbox):
-    params = toolbox.Toolbox().tools[0]().getParameterInfo()
+    params = _by_name(toolbox, "AlignCenterlines").getParameterInfo()
     names = [p.name for p in params]
     assert len(names) == len(set(names))
     assert {"imagery", "roads", "road_id_field", "grids", "grid_id_field", "work_folder",
@@ -148,27 +150,6 @@ def test_toolbox_aligns_roads(toolbox, tiled_scene, tmp_path):
     out2 = run_tool(toolbox, tiled_scene, tmp_path)
     assert sum("already done" in m for m in fake_arcpy.messages) == 2
     assert len(out2) == len(out)
-
-
-def test_toolbox_matches_cli(toolbox, tiled_scene, tmp_path):
-    """Same inputs through the toolbox and the command-line pipeline agree closely."""
-    from centerline_align import pipeline
-    from centerline_align.config import Config
-
-    arc = run_tool(toolbox, tiled_scene, tmp_path / "arc")
-    cfg = Config.from_dict({
-        "inputs": {"imagery": str(tiled_scene["tiles"]), "roads": str(tiled_scene["roads"]),
-                   "grids": str(tiled_scene["grids"]), "road_id_field": "RD_ID",
-                   "grid_id_field": "GRID_ID"},
-        "bands": {"nir": 4}, "classifier": {"training_grids": 2},
-        "output": {"folder": str(tmp_path / "cli")}})
-    pipeline.run(cfg)
-    cli = gpd.read_file(tmp_path / "cli" / "aligned_centerlines.gpkg")
-    a = arc.sort_values(["SRC_ID", "GRID_ID"]).reset_index(drop=True)
-    c = cli.sort_values(["src_id", "grid_id"]).reset_index(drop=True)
-    assert len(a) == len(c)
-    d = [ga.hausdorff_distance(gc) for ga, gc in zip(a.geometry, c.geometry)]
-    assert max(d) < 0.05, d
 
 
 def test_toolbox_skips_bad_tiles_and_warns_about_gaps(toolbox, tiled_scene, tmp_path):
@@ -346,7 +327,7 @@ def test_evaluate_tool(toolbox, tiled_scene, tmp_path):
     roads = synthetic.true_roads()
     gpd.GeoDataFrame({"Validated": ["Yes", "Yes", "No"]},
                      geometry=[g for g, _ in roads], crs=synthetic.CRS).to_file(truth)
-    tool = toolbox.Toolbox().tools[1]()
+    tool = _by_name(toolbox, "EvaluateAlignment")
     params = tool.getParameterInfo()
     p = {x.name: x for x in params}
     p["truth"].value = str(truth)
@@ -373,189 +354,6 @@ def test_evaluate_tool(toolbox, tiled_scene, tmp_path):
     with pytest.raises(ValueError, match="Values found in Validated"):
         p["truth_where"].value = "Validated = 'Y'"
         tool.execute(params, None)
-
-
-def test_second_pass(toolbox, tiled_scene, tmp_path):
-    """A second run learns from the first run's trusted lines and still aligns well."""
-    import shutil
-    run_tool(toolbox, tiled_scene, tmp_path)
-    first = tmp_path / "first"
-    first.mkdir()
-    for f in tmp_path.glob("aligned.*"):
-        shutil.copy(f, first / f.name)
-    fake_arcpy.messages.clear()
-    out = run_tool(toolbox, tiled_scene, tmp_path / "p2", retrain_from=str(first / "aligned.shp"))
-    text = "\n".join(fake_arcpy.messages)
-    assert "Second pass: learning from" in text, text
-    assert error_to_truth(out.geometry)[0] < 1.0
-    import json
-    model = json.loads((tmp_path / "p2" / "work" / "road_classifier.json").read_text())
-    assert model["trained_from"].endswith("aligned.shp")
-
-    # reusing that work folder with another earlier result: warned, not silently ignored
-    fake_arcpy.warnings.clear()
-    run_tool(toolbox, tiled_scene, tmp_path / "p2", retrain_from=str(tiled_scene["roads"]))
-    assert any("second-pass setting is ignored" in w for w in fake_arcpy.warnings)
-
-
-def test_lidar_sees_road_under_canopy(toolbox, tmp_path):
-    """A stretch of road hidden by trees in the imagery: without LiDAR the line can't
-    move there; with ground intensity and a smooth road bed it lands on the road."""
-    from shapely.geometry import box
-
-    base = tmp_path / "scene"
-    paths = synthetic.write_scene(base, nir=True)
-    synthetic.hide_under_canopy(paths["imagery"])
-    split_tiles(paths["imagery"], base / "tiles")
-    scene = dict(paths, tiles=base / "tiles")
-    lidar = synthetic.write_lidar(tmp_path / "lidar")
-    x0, y0, x1, y1 = synthetic.CANOPY
-    hidden = box(x0 + 40, y0, x1 - 40, y1)
-
-    def error_hidden(out):
-        from shapely.geometry import LineString
-        road = LineString([(synthetic.X0, synthetic.MID), (synthetic.X0 + 1600, synthetic.MID)])
-        d = [ln.interpolate(s).distance(road) for ln in out.geometry
-             for s in np.arange(0, ln.length, 5.0) if hidden.contains(ln.interpolate(s))]
-        assert d
-        return float(np.mean(d))
-
-    plain = error_hidden(run_tool(toolbox, scene, tmp_path / "a"))
-    fake_arcpy.messages.clear()
-    with_lidar = error_hidden(run_tool(toolbox, scene, tmp_path / "b", lidar_folder=str(lidar)))
-    assert any("LiDAR layers:" in m for m in fake_arcpy.messages)
-    assert plain > 4.0, plain            # stays near the original line (7 ft off)
-    assert with_lidar < 2.0, with_lidar
-
-    # a work folder trained with LiDAR refuses to run without it
-    with pytest.raises(ValueError, match="uses LiDAR"):
-        run_tool(toolbox, scene, tmp_path / "b")
-
-
-def test_make_lidar_layers_flow(monkeypatch, tiled_scene, tmp_path):
-    """Control flow of make_lidar_layers.py with the LAS tools stubbed out: one set of
-    rasters per grid, done grids skipped, a failing grid reported and cleaned up."""
-    import types
-    monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
-    src = (ROOT / "arcgis" / "make_lidar_layers.py").read_text()
-    call = ("make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN, "
-            "CONVERT_LAZ,\n                  ZLAS_FOLDER, LIDAR_WKID, LIDAR_VERT_WKID)")
-    assert src.rstrip().endswith(call)
-    ns = {"__name__": "make_lidar_layers"}
-    exec(compile(src.rstrip()[: -len(call)], "make_lidar_layers.py", "exec"), ns)
-
-    laz = tmp_path / "laz"
-    laz.mkdir()
-    (laz / "a.laz").write_bytes(b"")
-    calls = []
-    sr = fake_arcpy.SpatialReference(synthetic.CRS)
-    sr.metersPerUnit = 0.3048006096
-    real_describe = fake_arcpy.Describe
-
-    def describe(path):
-        if str(path).endswith(".lasd"):
-            return types.SimpleNamespace(fileCount=1, spatialReference=sr)
-        return types.SimpleNamespace(spatialReference=sr)
-
-    def to_raster(lyr, out, field, *a):
-        calls.append((field, a[0]))
-        if field == "ELEVATION" and fake_arcpy.env.extent.XMin > synthetic.X0 + 500:
-            raise RuntimeError("ERROR 999999: something went wrong")   # second grid fails
-        open(out, "w").close()
-
-    def project(raw, out, *a):
-        open(out, "w").close()
-
-    monkeypatch.setattr(fake_arcpy, "Describe", describe)
-    monkeypatch.setattr(fake_arcpy.management, "CreateLasDataset",
-                        lambda src_, out, *a, **k: open(out, "w").close(), raising=False)
-    monkeypatch.setattr(fake_arcpy.management, "MakeLasDatasetLayer",
-                        lambda lasd, name, **k: [name], raising=False)
-    monkeypatch.setattr(fake_arcpy.management, "ProjectRaster", project, raising=False)
-    monkeypatch.setattr(fake_arcpy, "conversion",
-                        types.SimpleNamespace(LasDatasetToRaster=to_raster), raising=False)
-    for k in ("extent", "outputCoordinateSystem", "pyramid", "rasterStatistics",
-              "compression"):
-        monkeypatch.setattr(fake_arcpy.env, k, None, raising=False)
-    sr.type = "Projected"
-
-    out = tmp_path / "lidar"
-    make = ns["make_lidar_layers"]
-    dry = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out),
-               dry_run=True)
-    assert dry["todo"] == [1, 2] and not out.exists()
-    r = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out))
-    assert r["done"] == [1] and [o for o, _ in r["failed"]] == [2]
-    assert sorted(p.name for p in (out / "dtm").iterdir()) == ["g1.tif"]
-    assert {c[0] for c in calls} == {"INTENSITY", "ELEVATION"}
-    import json
-    assert json.loads((out / "lidar_layers.json").read_text())["xy_to_m"] == sr.metersPerUnit
-    assert fake_arcpy.env.extent is None          # environment restored
-    calls.clear()
-    r2 = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out))
-    assert r2["todo"] == [2]                      # grid 1 is skipped
-    monkeypatch.setattr(fake_arcpy, "Describe", real_describe)
-
-
-def test_make_lidar_layers_converts_nearby_laz(monkeypatch, tiled_scene, tmp_path):
-    """CONVERT_LAZ: only .laz tiles near the grids are converted to .zlas, once."""
-    import types
-    import geopandas as gpd_
-    monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
-    src = (ROOT / "arcgis" / "make_lidar_layers.py").read_text()
-    ns = {"__name__": "make_lidar_layers"}
-    exec(compile(src[: src.rindex("make_lidar_layers(LAZ_FOLDER")], "m.py", "exec"), ns)
-
-    # tile names around the synthetic grids, in CONUS Albers km, plus one far away
-    c = gpd_.read_file(tiled_scene["grids"]).to_crs(6350).geometry.union_all().centroid
-    e, n = int(c.x // 1000), int(c.y // 1000)
-    laz = tmp_path / "laz"
-    laz.mkdir()
-    near = [f"USGS_LPC_X_e{e + dx}n{n + dy}.laz" for dx in (0, 1) for dy in (0, 1)]
-    far = f"USGS_LPC_X_e{e + 50}n{n + 50}.laz"
-    for f in near + [far]:
-        (laz / f).write_bytes(b"")
-    converted = []
-
-    def convert(path, folder, **k):
-        assert k.get("compression") == "ZLAS"
-        converted.append(os.path.basename(path))
-        open(os.path.join(folder, os.path.basename(path)[:-4] + ".zlas"), "w").close()
-
-    monkeypatch.setattr(fake_arcpy, "conversion",
-                        types.SimpleNamespace(ConvertLas=convert), raising=False)
-    sr = fake_arcpy.SpatialReference(synthetic.CRS)
-    sr.type, sr.metersPerUnit = "Projected", 0.3048006096
-    monkeypatch.setattr(fake_arcpy, "Describe", lambda p: types.SimpleNamespace(spatialReference=sr))
-    zl = tmp_path / "zlas"
-    r = ns["make_lidar_layers"](str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]),
-                                str(tmp_path / "out"), dry_run=True, convert_laz=True,
-                                zlas_folder=str(zl))
-    assert r["todo"] == [1, 2] and not converted
-    assert sorted(ns["near_grids"]([str(laz / f) for f in near + [far]],
-                                   [(1, g) for g in _grid_geoms(fake_arcpy, tiled_scene)],
-                                   150.0)) == sorted(str(laz / f) for f in near)
-    monkeypatch.setattr(fake_arcpy, "SpatialReference",
-                        lambda *a: types.SimpleNamespace(wkids=a))
-    seen = []
-    real_convert = convert
-
-    def convert_sr(path, folder, **k):
-        seen.append((k.get("define_coordinate_system"), k["in_coordinate_system"].wkids))
-        real_convert(path, folder, compression=k["compression"])
-    monkeypatch.setattr(fake_arcpy.conversion, "ConvertLas", convert_sr)
-    assert ns["convert_to_zlas"]([str(laz / f) for f in near], str(zl), 6350, 5703) == []
-    assert set(seen) == {("ALL_FILES", (6350, 5703))}
-    assert sorted(converted) == sorted(near)
-    converted.clear()
-    ns["convert_to_zlas"]([str(laz / f) for f in near], str(zl))
-    assert converted == []                      # already converted: skipped
-
-
-def _grid_geoms(arcpy_, scene):
-    sr = arcpy_.SpatialReference(synthetic.CRS)
-    with arcpy_.da.SearchCursor(str(scene["grids"]), ["SHAPE@"], spatial_reference=sr) as cur:
-        return [g for (g,) in cur]
 
 
 def _truth_pieces(tmp_path):
@@ -687,7 +485,7 @@ def _edit(path, geoms=None, validated=None):
 
 
 def test_training_day_cycle(toolbox, tiled_scene, tmp_path):
-    """Start of day / edit / end of day, twice, then overnight training and its use."""
+    """Start of day / edit / end of day, twice."""
     import json
     from shapely.geometry import LineString
 
@@ -751,52 +549,3 @@ def test_training_day_cycle(toolbox, tiled_scene, tmp_path):
     store = json.loads((folder / "training_roads.json").read_text())["roads"]
     assert store["2"]["changed"] == 0 and store["2"]["shift_max"] < 0.5
     assert store["6"]["day"] == "2026-10-19" and store["6"]["original_known"]
-
-    # overnight: train, test on the held-back grid, against the county layer too
-    tool, params, p = _tool(toolbox, "TrainOvernight")
-    p["imagery"].value = str(tiled_scene["tiles"])
-    p["training_folder"].value = str(folder)
-    p["grids"].value = str(tiled_scene["grids"])
-    p["grid_id_field"].value = "GRID_ID"
-    p["compare"].value = str(tiled_scene["roads"])
-    fake_arcpy.messages.clear()
-    res = toolbox.train(fake_arcpy, imagery=str(tiled_scene["tiles"]),
-                        training_folder=str(folder), grids_fc=str(tiled_scene["grids"]),
-                        grid_id_field="GRID_ID", bands=[1, 2, 3, 4],
-                        compare=[str(tiled_scene["roads"])], today="2026-10-20")
-    msgs = "\n".join(fake_arcpy.messages)
-    assert len(res["holdout"]) == 1, msgs
-    assert res["new"] < 1.0 and res["original"] > 2, res         # tool fixes the held-back roads
-    assert res["promoted"] and "local_roads.shp" in msgs
-    assert "Keep/move model" in msgs and "away from intersections" in msgs
-    assert "did NOT trace" in msgs
-    models = folder / "models"
-    assert (models / "road_classifier.json").exists()
-    assert (models / "road_classifier_2026-10-20.json").exists()
-
-    # the toolbox button runs the same thing; the second night compares with the current model
-    fake_arcpy.messages.clear()
-    tool.execute(params, None)
-    msgs = "\n".join(fake_arcpy.messages)
-    assert "Tool, current model" in msgs, msgs
-    hist = (models / "history.csv").read_text().splitlines()
-    assert len(hist) == 3 and hist[0].startswith("day,")
-
-    # the Align tool uses the trained model instead of training its own
-    out = run_tool(toolbox, tiled_scene, tmp_path / "align",
-                   classifier_file=str(models / "road_classifier.json"))
-    assert any("Using the trained classifier" in m for m in fake_arcpy.messages)
-    assert not (tmp_path / "align" / "work" / "road_classifier.json").exists()
-    assert error_to_truth(out.geometry)[0] < 1.0
-
-    # a keep/move model that never trusts a move keeps every original line
-    clf = json.loads((models / "road_classifier.json").read_text())
-    clf["move_model"] = dict(features=["shift_avg", "shift_max", "conf", "pct_valid",
-                                       "width_med"], mean=[0] * 5, std=[1] * 5,
-                             coef=[0] * 5, intercept=0.0, threshold=0.9)
-    (models / "never_move.json").write_text(json.dumps(clf))
-    out = run_tool(toolbox, tiled_scene, tmp_path / "never",
-                   classifier_file=str(models / "never_move.json"))
-    assert (out.MOVED == 0).all() and (out.MOVE_P == 0.5).all()
-    assert out.REASON.str.contains("move_unlikely_to_help").all()
-    assert error_to_truth(out.geometry)[0] > 4

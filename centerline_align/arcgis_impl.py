@@ -13,7 +13,6 @@ import re
 import time
 
 import numpy as np
-from scipy import ndimage
 
 from .chip import Chip
 from .classifier import RoadClassifier, distance_to_roads
@@ -137,76 +136,6 @@ class ArcTileReader:
         return Chip(data=data, valid=valid, x0=x0, y0=y0, res=r)
 
 
-LIDAR_LAYERS = ("intensity", "dtm", "dsm")
-LIDAR_NODATA = -9999.0
-
-
-class LidarLayers:
-    """The rasters made by make_lidar_layers.py: ground intensity, ground elevation
-    (dtm) and surface elevation (dsm), as tiles in subfolders of one folder."""
-
-    def __init__(self, arcpy, folder: str, sr):
-        meta_path = os.path.join(folder, "lidar_layers.json")
-        if not os.path.exists(meta_path):
-            raise ValueError(f"{folder} is not a LiDAR layers folder (no lidar_layers.json); "
-                             "make it with make_lidar_layers.py")
-        with open(meta_path) as f:
-            meta = json.load(f)
-        self.z_to_m = float(meta.get("z_to_m", 1.0))
-        self.xy_to_m = float(meta.get("xy_to_m", 0.3048006096))
-        self.readers = []
-        for name in LIDAR_LAYERS:
-            sub = os.path.join(folder, name)
-            if not os.path.isdir(sub):
-                raise ValueError(f"LiDAR folder {folder} has no '{name}' subfolder")
-            r = ArcTileReader(arcpy, sub, [1], nodata=LIDAR_NODATA)
-            if r.sr.name != sr.name:
-                raise ValueError(f"LiDAR layers are in {r.sr.name} but the imagery is in "
-                                 f"{sr.name}; remake them with the imagery's coordinate system")
-            self.readers.append(r)
-
-    def sample(self, chip):
-        """(3, H, W) LiDAR values at the chip's pixel centres (heights in metres), and
-        where all three exist."""
-        bx0, by0, bx1, by1 = chip.bounds
-        out = np.zeros((3,) + chip.shape, np.float32)
-        ok = np.ones(chip.shape, bool)
-        h, w = chip.shape
-        for k, rd in enumerate(self.readers):
-            r = rd.res
-            x0, y0 = rd.snap(bx0 - 2 * r, by1 + 2 * r)
-            nw = int(np.ceil((bx1 + 2 * r - x0) / r))
-            nh = int(np.ceil((y0 - (by0 - 2 * r)) / r))
-            blk = rd.read(x0, y0, nw, nh)
-            cols = (chip.x0 + (np.arange(w) + 0.5) * chip.res - x0) / r - 0.5
-            rows = (y0 - (chip.y0 - (np.arange(h) + 0.5) * chip.res)) / r - 0.5
-            rr, cc = np.meshgrid(rows, cols, indexing="ij")
-            v = ndimage.map_coordinates(blk.data[0], [rr, cc], order=1, mode="nearest")
-            good = ndimage.map_coordinates(blk.valid.astype(np.float32), [rr, cc], order=1,
-                                           mode="constant", cval=0.0) > 0.99
-            out[k] = v * (self.z_to_m if k > 0 else 1.0)
-            ok &= good
-        return out, ok
-
-
-class WithLidar:
-    """An imagery reader whose chips also carry the LiDAR layers."""
-
-    has_lidar = True
-
-    def __init__(self, reader, lidar: LidarLayers):
-        self.base, self.lidar = reader, lidar
-
-    def __getattr__(self, name):
-        return getattr(self.base, name)
-
-    def read(self, x0, y0, width_px, height_px):
-        chip = self.base.read(x0, y0, width_px, height_px)
-        chip.aux, chip.aux_valid = self.lidar.sample(chip)
-        chip.xy_to_m = self.lidar.xy_to_m
-        return chip
-
-
 # --------------------------------------------------------------------------- vectors
 
 def read_lines(arcpy, fc, id_field, sr):
@@ -292,7 +221,7 @@ def _safe(value) -> str:
 
 def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
         out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False,
-        diagnostics=False, retrain_from=None, lidar_folder=None, classifier_file=None):
+        diagnostics=False):
     msg = arcpy.AddMessage
     handler = _ArcHandler(arcpy)
     root = logging.getLogger("centerline_align")
@@ -300,15 +229,13 @@ def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, wor
     root.setLevel(logging.INFO)
     try:
         return _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field,
-                    work_folder, out_fc, bands, refine, classifier, fresh, diagnostics,
-                    retrain_from, lidar_folder, classifier_file)
+                    work_folder, out_fc, bands, refine, classifier, fresh, diagnostics)
     finally:
         root.removeHandler(handler)
 
 
 def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
-         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False, retrain_from=None,
-         lidar_folder=None, classifier_file=None):
+         out_fc, bands, rcfg, ccfg, fresh, diagnostics=False):
     os.makedirs(work_folder, exist_ok=True)
     grid_dir = os.path.join(work_folder, "grids")
     os.makedirs(grid_dir, exist_ok=True)
@@ -322,12 +249,6 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
         arcpy.AddWarning(f"{len(reader.skipped)} imagery file(s) were skipped:\n" + "\n".join(
             f"  {p}: {why}" for p, why in reader.skipped[:15])
             + (f"\n  ... and {len(reader.skipped) - 15} more" if len(reader.skipped) > 15 else ""))
-
-    if lidar_folder:
-        lidar = LidarLayers(arcpy, lidar_folder, sr)
-        reader = WithLidar(reader, lidar)
-        counts = ", ".join(f"{len(r.tiles)} {n}" for n, r in zip(LIDAR_LAYERS, lidar.readers))
-        msg(f"LiDAR layers: {lidar_folder} (tiles: {counts})")
 
     roads = read_lines(arcpy, roads_fc, road_id_field, sr)
     grids = read_grids(arcpy, grids_fc, grid_id_field, sr)
@@ -350,36 +271,9 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
                 os.remove(os.path.join(grid_dir, f))
         if os.path.exists(model_path):
             os.remove(model_path)
-    if classifier_file:
-        clf = RoadClassifier.load(classifier_file)
-        msg(f"Using the trained classifier {classifier_file}"
-            + (f" (trained from {clf.trained_from})" if clf.trained_from else ""))
-        if clf.has_nir != reader.has_nir:
-            raise ValueError("The trained classifier was made with "
-                             f"{'4' if clf.has_nir else '3'} bands; set the same bands here.")
-        if clf.lidar and not lidar_folder:
-            raise ValueError("The trained classifier uses LiDAR: give the LiDAR folder.")
-        if clf.move_model:
-            msg("It includes a keep/move model: moves it judges unlikely to help keep the "
-                "original line (REASON move_unlikely_to_help; MOVE_P = its estimate).")
-    elif os.path.exists(model_path):
+    if os.path.exists(model_path):
         clf = RoadClassifier.load(model_path)
         msg(f"Using saved classifier {model_path}")
-        if clf.lidar and not lidar_folder:
-            raise ValueError("The saved classifier in this work folder uses LiDAR: give the "
-                             "LiDAR folder, or use a new work folder.")
-        if lidar_folder and not clf.lidar:
-            arcpy.AddWarning("The saved classifier in this work folder was trained without "
-                             "LiDAR, so the LiDAR layers are not used. Use a new work folder "
-                             "to train with them.")
-        if retrain_from and clf.trained_from != str(retrain_from):
-            arcpy.AddWarning(
-                "This work folder already has a classifier, so the second-pass setting is "
-                "ignored. For a second pass, use a new, empty work folder (or tick Start over).")
-    elif retrain_from:
-        clf = _train_second_pass(arcpy, msg, reader, grids, retrain_from, ccfg, sr)
-        clf.save(model_path)
-        msg(f"Classifier saved to {model_path} (training accuracy {clf.train_accuracy:.3f})")
     else:
         with_roads = [gi for gi in range(len(grids))
                       if any(_overlaps(r[3], grids[gi][2]) for r in roads)]
@@ -399,7 +293,7 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
                 os.makedirs(diag_dir, exist_ok=True)
                 _save_training_diag(arcpy, diag_dir, k // 4 + 1, chip, lines, ccfg, sr)
 
-        clf = train_classifier(reader, cells, lines_near, ccfg, None, on_chip=on_chip)
+        clf = train_classifier(reader, cells, lines_near, ccfg, on_chip=on_chip)
         msg(f"Diagnostic rasters for the first training tiles: {diag_dir}")
         clf.save(model_path)
         msg(f"Classifier saved to {model_path} (training accuracy {clf.train_accuracy:.3f})")
@@ -419,16 +313,14 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
             pieces = clip_to_grid(arcpy, roads, grids, k, sr)
             records = []
             if pieces:
-                pmap = region_probability(reader, clf, None, cext, [c for _, c in pieces],
-                                          rcfg, ccfg)
+                pmap = region_probability(reader, clf, cext, [c for _, c in pieces], rcfg)
                 if diagnostics:
                     prob_dir = os.path.join(work_folder, "diagnostics")
                     os.makedirs(prob_dir, exist_ok=True)
                     h = pmap.prob.shape[0]
                     _save_raster(arcpy, pmap.prob, pmap.x0, pmap.y0 - h * pmap.res, pmap.res,
                                  os.path.join(prob_dir, f"road_prob_{_safe(gid)}.tif"), sr)
-                records, _ = refine_pieces(pmap, pieces, rcfg, reader.res,
-                                           move_model=clf.move_model)
+                records, _ = refine_pieces(pmap, pieces, rcfg, reader.res)
             for r in records:
                 r["grid_id"] = gid
                 r["coords"] = np.asarray(r["coords"]).tolist()
@@ -456,44 +348,6 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
     for line in summarize(records):
         msg(line)
     return {"lines": len(records), "review": n_rev}
-
-
-def _train_second_pass(arcpy, msg, reader, grids, earlier_fc, ccfg, sr):
-    """Train from an earlier run's output: lines it was confident about (REVIEW = 0)
-    give road labels across their measured width; the rest only mark where roads are."""
-    good, bad = [], []
-    with arcpy.da.SearchCursor(earlier_fc, ["SHAPE@", "REVIEW", "WIDTH_MED"],
-                               spatial_reference=sr) as cur:
-        for g, review, width in cur:
-            if g is None:
-                continue
-            for c in _parts(g):
-                ext = (c[:, 0].min(), c[:, 1].min(), c[:, 0].max(), c[:, 1].max())
-                if not review and width and width > 0:
-                    good.append((c, float(width) / 2, ext))
-                else:
-                    bad.append((c, ext))
-    if not good:
-        raise ValueError(f"{earlier_fc} has no lines with REVIEW = 0 to learn from")
-    msg(f"Second pass: learning from {len(good)} trusted lines (REVIEW = 0) of {earlier_fc}; "
-        f"{len(bad)} flagged lines are only used to keep road pixels out of the not-road labels")
-    with_good = [gi for gi, (_, _, ge) in enumerate(grids)
-                 if any(_overlaps(e, ge) for _, _, e in good)]
-    train = pick_spread(with_good, ccfg.training_grids)
-    msg("Training the road classifier on grid(s): " + ", ".join(str(grids[g][0]) for g in train))
-    cells = [[c for c, _, e in good if _overlaps(e, grids[gi][2])] for gi in train]
-
-    def lines_near(b):
-        return ([c for c, _, e in good if _overlaps(e, b)]
-                + [c for c, e in bad if _overlaps(e, b)])
-
-    def trusted_near(b):
-        return ([(c, hw) for c, hw, e in good if _overlaps(e, b)],
-                [c for c, e in bad if _overlaps(e, b)])
-
-    clf = train_classifier(reader, cells, lines_near, ccfg, None, trusted_near=trusted_near)
-    clf.trained_from = str(earlier_fc)
-    return clf
 
 
 def _save_raster(arcpy, arr, x_ll, y_ll, res, path, sr):
@@ -546,7 +400,7 @@ def _id_field_type(arcpy, fc, field):
 OUT_FIELDS = [("SRC_ID", None), ("GRID_ID", "TEXT"), ("SHIFT_AVG", "DOUBLE"),
               ("SHIFT_MAX", "DOUBLE"), ("CONF", "DOUBLE"), ("PCT_VALID", "DOUBLE"),
               ("WIDTH_MED", "DOUBLE"), ("REVIEW", "SHORT"), ("REASON", "TEXT"),
-              ("MOVED", "SHORT"), ("MOVE_P", "DOUBLE")]
+              ("MOVED", "SHORT")]
 
 
 def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
@@ -568,7 +422,7 @@ def _write_output(arcpy, out_fc, records, coords, sr, roads_fc, road_id_field):
             src = r["src_id"] if id_type != "TEXT" else str(r["src_id"])
             cur.insertRow([src, str(r["grid_id"]), r["shift_avg"], r["shift_max"], r["conf"],
                            r["pct_valid"], r["width_med"], int(r["review"]), r["reason"],
-                           int(r.get("moved", 1)), r.get("move_p"), line])
+                           int(r.get("moved", 1)), line])
 
 
 # --------------------------------------------------------------------------- evaluation
