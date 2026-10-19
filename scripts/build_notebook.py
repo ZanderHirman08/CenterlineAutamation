@@ -76,8 +76,10 @@ plt.show()
 ## Look at validation chips
 
 Left: imagery with your checked line (red). Middle: the model's prediction
-(bright = centreline). Right: your line on the prediction. First 4 spread
-through the validation set, then the 4 where the model is furthest off.
+(bright = centreline). Right: your line on the prediction. First a table of checked roads where the
+model disagrees by more than 3 ft (worth a look in Pro: sometimes the checked
+line is the one that's off), then 4 chips spread through the validation set,
+then the 4 where the model is furthest off.
 """),
         code("""
 import numpy as np
@@ -99,6 +101,22 @@ chip_err = np.array(chip_err)
 has = np.flatnonzero(~np.isnan(chip_err))
 spread = has[np.linspace(0, len(has) - 1, 4).astype(int)]
 worst = has[np.argsort(chip_err[has])[-4:][::-1]]
+
+# Checked roads the model disagrees with: either the model is wrong there, or the
+# checked line is. Zoom to the coordinates in Pro (same coordinate system as the
+# imagery) and look. 15.00 means "15 ft or more" (the edge of the search).
+import pandas as pd
+half = val["image"].shape[-1] * res / 2
+df = pd.DataFrame(dict(road_oid=val["road"], err=chip_err,
+                       x=val["x0"] + half, y=val["y0"] - half))
+by_road = (df.dropna().groupby("road_oid")
+           .agg(chips=("err", "size"), median_error_ft=("err", "median"),
+                x=("x", "median"), y=("y", "median"))
+           .sort_values("median_error_ft", ascending=False))
+suspect = by_road[by_road.median_error_ft > 3]
+print(f"{len(suspect)} of {len(by_road)} validation roads where the model and the checked "
+      "line disagree by more than 3 ft (check these in Pro):")
+print(suspect.round(2).to_string() if len(suspect) else "  none")
 
 def show(i):
     p = tc.predict_probs(model, val["image"][i:i + 1], info["mean"], info["std"], dev)[0]

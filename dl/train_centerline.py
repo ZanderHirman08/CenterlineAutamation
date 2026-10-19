@@ -62,14 +62,17 @@ def load_chips(folder: str):
                     shapes = {k: q[k].shape[1:] for k in ("image", "heat", "mask")}
         n = sum(sizes)
         d = {k: np.empty((n,) + shapes[k], np.uint8) for k in shapes}
-        d["road"], start = [], 0
+        d["road"], d["x0"], d["y0"], start = [], [], [], 0
         for p, size in zip(files, sizes):
             with np.load(p) as q:
                 for k in shapes:
                     d[k][start:start + size] = q[k]
                 d["road"] += q["road"].tolist()
+                d["x0"] += q["x0"].tolist()
+                d["y0"] += q["y0"].tolist()
             start += size
-        d["road"] = np.array(d["road"])
+        for k in ("road", "x0", "y0"):
+            d[k] = np.array(d[k])
         d["lines"] = lines
         out[split] = d
     return manifest, out
