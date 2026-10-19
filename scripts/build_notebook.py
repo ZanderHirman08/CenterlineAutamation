@@ -76,10 +76,10 @@ plt.show()
 ## Look at validation chips
 
 Left: imagery with your checked line (red). Middle: the model's prediction
-(bright = centreline). Right: your line on the prediction. First a table of checked roads where the
-model disagrees by more than 3 ft (worth a look in Pro: sometimes the checked
-line is the one that's off), then 4 chips spread through the validation set,
-then the 4 where the model is furthest off.
+(bright = centreline). Right: your line on the prediction. First a table of checked roads (validation
+and training) where the model disagrees with the line, worth a look in Pro:
+sometimes the checked line is the one that's off. Then 4 chips spread through
+the validation set, then the 4 where the model is furthest off.
 """),
         code("""
 import numpy as np
@@ -90,14 +90,30 @@ model.load_state_dict(torch.load(MODEL_FOLDER + "/best_model.pt", map_location="
 dev = "cuda" if torch.cuda.is_available() else "cpu"
 model.to(dev)
 res = info["res"]
-chip_err = []
-for i in range(0, len(val["image"]), 64):
-    probs = tc.predict_probs(model, val["image"][i:i + 64], info["mean"], info["std"], dev)
-    for k, p in enumerate(probs):
-        e = tc.crest_errors(p, val["lines"][i + k], res, mask=val["mask"][i + k])
-        e = e[~np.isnan(e)]
-        chip_err.append(np.median(e) if len(e) else np.nan)
-chip_err = np.array(chip_err)
+import pandas as pd
+
+def chip_errors(d):
+    # median distance (ft) from each chip's checked line to the model's centreline
+    out = []
+    for i in range(0, len(d["image"]), 64):
+        probs = tc.predict_probs(model, d["image"][i:i + 64], info["mean"], info["std"], dev)
+        for k, p in enumerate(probs):
+            e = tc.crest_errors(p, d["lines"][i + k], res, mask=d["mask"][i + k])
+            e = e[~np.isnan(e)]
+            out.append(np.median(e) if len(e) else np.nan)
+    return np.array(out)
+
+def by_road(d, err, name):
+    half = d["image"].shape[-1] * res / 2
+    df = pd.DataFrame(dict(road_oid=d["road"], err=err, x=d["x0"] + half, y=d["y0"] - half))
+    t = (df.dropna().groupby("road_oid")
+         .agg(chips=("err", "size"), median_error_ft=("err", "median"),
+              x=("x", "median"), y=("y", "median")))
+    t.insert(0, "set", name)
+    return t
+
+chip_err = chip_errors(val)
+train_err = chip_errors(data["train"])
 has = np.flatnonzero(~np.isnan(chip_err))
 spread = has[np.linspace(0, len(has) - 1, 4).astype(int)]
 worst = has[np.argsort(chip_err[has])[-4:][::-1]]
@@ -105,18 +121,20 @@ worst = has[np.argsort(chip_err[has])[-4:][::-1]]
 # Checked roads the model disagrees with: either the model is wrong there, or the
 # checked line is. Zoom to the coordinates in Pro (same coordinate system as the
 # imagery) and look. 15.00 means "15 ft or more" (the edge of the search).
-import pandas as pd
-half = val["image"].shape[-1] * res / 2
-df = pd.DataFrame(dict(road_oid=val["road"], err=chip_err,
-                       x=val["x0"] + half, y=val["y0"] - half))
-by_road = (df.dropna().groupby("road_oid")
-           .agg(chips=("err", "size"), median_error_ft=("err", "median"),
-                x=("x", "median"), y=("y", "median"))
-           .sort_values("median_error_ft", ascending=False))
-suspect = by_road[by_road.median_error_ft > 3]
-print(f"{len(suspect)} of {len(by_road)} validation roads where the model and the checked "
-      "line disagree by more than 3 ft (check these in Pro):")
+# Training roads were learned from, so a bad line there shows a smaller gap:
+# their threshold is lower.
+roads = pd.concat([by_road(val, chip_err, "validation"),
+                   by_road(data["train"], train_err, "training")])
+suspect = roads[((roads.set == "validation") & (roads.median_error_ft > 3))
+                | ((roads.set == "training") & (roads.median_error_ft > 2))]
+suspect = suspect.sort_values("median_error_ft", ascending=False)
+print(f"{len(suspect)} of {len(roads)} checked roads where the model and the line disagree "
+      "(over 3 ft on validation roads, over 2 ft on training roads). Check these in Pro:")
 print(suspect.round(2).to_string() if len(suspect) else "  none")
+oids = ", ".join(dict.fromkeys(str(o) for o in suspect.index))
+if oids:
+    print()
+    print(f"Select By Attributes on Roads_working:  OBJECTID IN ({oids})")
 
 def show(i):
     p = tc.predict_probs(model, val["image"][i:i + 1], info["mean"], info["std"], dev)[0]
