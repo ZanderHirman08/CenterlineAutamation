@@ -101,3 +101,18 @@ def test_self_crossings():
     hits = self_crossings(p_road)
     assert len(hits) == 1 and hits[0][1] > 400
     assert self_crossings(np.array([[0.0, 0.0], [100.0, 0.0], [200.0, 50.0]])) == []
+
+
+def test_lines_in_pixels_keeps_only_the_chip():
+    """A long road through a chip is stored only where it is in (or near) the chip,
+    and a line that leaves and comes back becomes two pieces."""
+    from centerline_align.chips import lines_in_pixels
+    long_road = np.array([[-5000.0, 50.0], [5000.0, 50.0]])        # 10,000 ft, through the chip
+    (piece,) = lines_in_pixels(0.0, 128.0, 0.5, [long_road], (256, 256))
+    piece = np.asarray(piece)
+    assert piece[:, 0].min() >= -8 and piece[:, 0].max() <= 263 and len(piece) < 300
+    full = lines_in_pixels(0.0, 128.0, 0.5, [long_road])[0]
+    assert len(full) > 9000                                         # without shape: everything
+    u = np.array([[10.0, 150.0], [10.0, 60.0], [400.0, 60.0], [400.0, 100.0], [100.0, 100.0],
+                  [100.0, 150.0]])                                 # in, out to the east, back in
+    assert len(lines_in_pixels(0.0, 128.0, 0.5, [u], (256, 256))) == 2

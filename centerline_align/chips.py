@@ -112,14 +112,26 @@ def hash_id(road_id) -> int:
     return v
 
 
-def lines_in_pixels(x0, y0, res, lines, pad: float = 0.0):
-    """Line coords converted to chip pixel coords (col, row) - for evaluation."""
+def lines_in_pixels(x0, y0, res, lines, shape=None, pad: int = 8):
+    """Line coords converted to chip pixel coords (col, row) - for evaluation. With
+    ``shape`` (h, w), only the parts within ``pad`` pixels of the chip are kept (a
+    line leaving and re-entering the chip becomes two pieces): a chip needs nothing
+    beyond its edges, and whole roads would make the files many times larger."""
     out = []
     for c in lines:
         c = densify(as_coords(c), 2 * res)
         col = (c[:, 0] - x0) / res - 0.5
         row = (y0 - c[:, 1]) / res - 0.5
-        out.append(np.column_stack([col, row]).round(2).tolist())
+        px = np.column_stack([col, row])
+        if shape is None:
+            out.append(px.round(2).tolist())
+            continue
+        h, w = shape
+        inside = (col >= -pad) & (col <= w - 1 + pad) & (row >= -pad) & (row <= h - 1 + pad)
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], inside.astype(int), [0]])))
+        for a, b in zip(edges[::2], edges[1::2]):
+            if b - a >= 2:
+                out.append(px[a:b].round(2).tolist())
     return out
 
 

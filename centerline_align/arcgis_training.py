@@ -459,7 +459,7 @@ def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_f
         s_lines = [c for (_, c), e in zip(scored, scored_ext) if _overlaps(e, box)]
         buffers[split].append(dict(
             image=np.clip(chip.data, 0, 255).astype(np.uint8), heat=heat, mask=mask,
-            x0=x0, y0=y0, road=oid, lines=lines_in_pixels(x0, y0, res, s_lines)))
+            x0=x0, y0=y0, road=oid, lines=lines_in_pixels(x0, y0, res, s_lines, chip.shape)))
         counts[split] += 1
         if len(buffers[split]) >= shard_size:
             flush(split)
