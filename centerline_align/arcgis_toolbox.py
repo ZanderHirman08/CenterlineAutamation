@@ -2,6 +2,7 @@
 import arcpy
 
 from .arcgis_impl import evaluate, run
+from .arcgis_training import collect, snapshot, train
 from .config import ClassifierConfig, RefineConfig
 
 
@@ -9,7 +10,7 @@ class Toolbox:
     def __init__(self):
         self.label = "Centerline Alignment"
         self.alias = "centerline"
-        self.tools = [AlignCenterlines, EvaluateAlignment]
+        self.tools = [AlignCenterlines, EvaluateAlignment, StartOfDay, EndOfDay, TrainOvernight]
 
 
 def _param(name, label, datatype, direction="Input", required=True, category=None, value=None):
@@ -59,6 +60,9 @@ class AlignCenterlines:
         params.append(_param("lidar_folder",
                              "LiDAR layers folder (optional; from make_lidar_layers.py)",
                              "DEFolder", required=False, category="LiDAR"))
+        params.append(_param("classifier_file",
+                             "Trained classifier (optional; from 'Overnight: Train From My "
+                             "Edits')", "DEFile", required=False, category="Trained model"))
         params.append(_param("retrain_from",
                              "Learn from an earlier result (optional; use a new work folder)",
                              "GPFeatureLayer", required=False, category="Second pass"))
@@ -118,7 +122,8 @@ class AlignCenterlines:
             fresh=bool(p["fresh"].value),
             diagnostics=bool(p["diagnostics"].value),
             retrain_from=p["retrain_from"].valueAsText,
-            lidar_folder=p["lidar_folder"].valueAsText)
+            lidar_folder=p["lidar_folder"].valueAsText,
+            classifier_file=p["classifier_file"].valueAsText)
 
     def postExecute(self, parameters):
         return
@@ -184,6 +189,139 @@ class EvaluateAlignment:
                  out_points=p["out_points"].valueAsText,
                  spacing=float(p["spacing"].value or 5.0),
                  max_dist=float(p["max_dist"].value or 40.0))
+
+    def postExecute(self, parameters):
+        return
+
+
+def _checked_params():
+    roads = _param("roads", "Road layer you edit", "GPFeatureLayer")
+    roads.filter.list = ["Polyline"]
+    where = _param("checked_where", "Checked roads are where (SQL)", "GPString",
+                   value="Validated = 'Yes'")
+    folder = _param("training_folder", "Training folder (keep the same one every day)",
+                    "DEFolder")
+    return [roads, where, folder]
+
+
+class StartOfDay:
+    def __init__(self):
+        self.label = "1. Start of Day: Snapshot Roads"
+        self.description = (
+            "Run before you start editing. Remembers the original shape of every road, so "
+            "'End of Day' can tell what you changed. Only reads the road layer.")
+        self.canRunInBackground = True
+
+    def getParameterInfo(self):
+        return _checked_params()
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        p = {x.name: x for x in parameters}
+        snapshot(arcpy, roads_fc=p["roads"].valueAsText,
+                 checked_where=p["checked_where"].valueAsText,
+                 training_folder=p["training_folder"].valueAsText)
+
+    def postExecute(self, parameters):
+        return
+
+
+class EndOfDay:
+    def __init__(self):
+        self.label = "2. End of Day: Collect My Edits"
+        self.description = (
+            "Run when you finish editing. Every checked road becomes training data, with how "
+            "far you moved it from its original. Only reads the road layer.")
+        self.canRunInBackground = True
+
+    def getParameterInfo(self):
+        params = _checked_params()
+        params.append(_param("out_fc", "Training roads to look at (optional)", "DEFeatureClass",
+                             direction="Output", required=False))
+        params.append(_param("min_change", "Count a road as moved when an edit moved it at "
+                             "least (map units)", "GPDouble", category="Advanced", value=1.0))
+        return params
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        p = {x.name: x for x in parameters}
+        collect(arcpy, roads_fc=p["roads"].valueAsText,
+                checked_where=p["checked_where"].valueAsText,
+                training_folder=p["training_folder"].valueAsText,
+                out_fc=p["out_fc"].valueAsText,
+                min_change=float(p["min_change"].value or 1.0))
+
+    def postExecute(self, parameters):
+        return
+
+
+class TrainOvernight:
+    def __init__(self):
+        self.label = "3. Overnight: Train From My Edits"
+        self.description = (
+            "Trains the road classifier from the roads you checked, then tests it on grids "
+            "kept out of training: how close the tool gets the original lines to your edits, "
+            "compared with the current model. The better model becomes the current one.")
+        self.canRunInBackground = True
+
+    def getParameterInfo(self):
+        imagery = _param("imagery", "Imagery (raster, mosaic dataset, or folder of .tif tiles)",
+                         ["GPRasterLayer", "DERasterDataset", "DEMosaicDataset", "DEFolder"])
+        folder = _param("training_folder", "Training folder (the one used for Start/End of Day)",
+                        "DEFolder")
+        grids = _param("grids", "Work grids (1-mile)", "GPFeatureLayer")
+        grids.filter.list = ["Polygon"]
+        grid_id = _param("grid_id_field", "Grid ID field", "Field")
+        grid_id.parameterDependencies = [grids.name]
+        compare = arcpy.Parameter(name="compare", displayName="Also compare these layers "
+                                  "(optional, e.g. the county roads)", datatype="GPFeatureLayer",
+                                  parameterType="Optional", direction="Input", multiValue=True)
+        params = [imagery, folder, grids, grid_id, compare]
+        for name, label, default in (("red", "Red band", 1), ("green", "Green band", 2),
+                                     ("blue", "Blue band", 3)):
+            params.append(_param(name, label, "GPLong", category="Bands", value=default))
+        params.append(_param("nir", "Near-infrared band (leave empty if none)", "GPLong",
+                             required=False, category="Bands", value=4))
+        params.append(_param("training_grids", "Grids used to train the classifier", "GPLong",
+                             category="Advanced", value=30))
+        return params
+
+    def isLicensed(self):
+        return True
+
+    def updateParameters(self, parameters):
+        return
+
+    def updateMessages(self, parameters):
+        return
+
+    def execute(self, parameters, messages):
+        p = {x.name: x for x in parameters}
+        nir = p["nir"].value
+        bands = [int(p["red"].value), int(p["green"].value), int(p["blue"].value)]
+        if nir not in (None, "", 0):
+            bands.append(int(nir))
+        train(arcpy, imagery=p["imagery"].valueAsText,
+              training_folder=p["training_folder"].valueAsText,
+              grids_fc=p["grids"].valueAsText, grid_id_field=p["grid_id_field"].valueAsText,
+              bands=bands, compare=_split_multi(p["compare"].valueAsText),
+              training_grids=int(p["training_grids"].value or 30))
 
     def postExecute(self, parameters):
         return

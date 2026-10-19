@@ -113,7 +113,8 @@ def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int, trust
     """Pick (row, col) indexes of positive and negative training pixels in a chip.
 
     trusted: optional (lines with known pavement width [(coords, half_width)],
-    untrusted lines [coords]) from an earlier run (second pass). Then the road
+    untrusted lines [coords]) from an earlier run (second pass), or hand-checked
+    lines with half_width None (labelled road near the line only). Then the road
     labels cover the measured pavement (minus a margin) of trusted lines, and
     the verges just beyond their edges are labelled not-road too, which teaches
     the classifier where pavement ends.
@@ -125,11 +126,15 @@ def sample_training_pixels(chip: Chip, lines, ccfg, rng, n_per_class: int, trust
         good, bad = trusted
         pos_m = np.zeros(chip.shape, bool)
         verge = np.zeros(chip.shape, bool)
-        by_width: dict[float, list] = {}
-        for c, hw in good:
-            by_width.setdefault(float(np.round(hw * 0.5) * 2), []).append(c)   # 2-unit bins
+        by_width: dict = {}
+        for c, hw in good:   # hw None: width unknown (hand-checked centerlines)
+            key = None if hw is None else float(np.round(hw * 0.5) * 2)   # 2-unit bins
+            by_width.setdefault(key, []).append(c)
         for hw, group in by_width.items():
             d = distance_to_roads(chip, group)
+            if hw is None:
+                pos_m |= d <= ccfg.positive_half_width
+                continue
             pos_m |= d <= max(ccfg.positive_half_width, hw - 2.0)
             verge |= (d > hw + 5.0) & (d <= hw + 15.0)
         others = distance_to_roads(chip, bad) if bad else np.full(chip.shape, np.inf)

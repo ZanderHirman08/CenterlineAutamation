@@ -76,6 +76,11 @@ which is an install, so they're only in Option B.
   finished output (and use a new work folder). The classifier retrains from
   that run's trusted lines, labelling their full measured pavement width as
   road and the verges as not-road.
+* **Training from your daily edits**: *1. Start of Day*, *2. End of Day* and
+  *3. Overnight* turn the roads you check by hand into training data and train
+  the classifier from them overnight, scoring each night's model on grids held
+  back from training. See [docs/daily_training.md](docs/daily_training.md).
+  Point *Align*'s *Trained classifier* at the result.
 * **Evaluate Against Checked Roads**: measures any number of road layers
   against roads you checked by hand (e.g. `Validated = 'Yes'`), by cover type
   (open, shadow, partial trees, canopy, intersection). Use it to compare runs

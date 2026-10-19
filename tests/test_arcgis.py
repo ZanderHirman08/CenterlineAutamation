@@ -30,7 +30,7 @@ def test_pyt_uses_only_arcgis_pro_packages():
     import ast
     allowed = {"__future__", "arcpy", "numpy", "scipy", "json", "logging", "os", "re", "time",
                "math", "dataclasses", "pathlib", "typing", "sys", "types",
-               "yaml"}  # yaml: CLI-only, lazy
+               "zlib", "yaml"}  # yaml: CLI-only, lazy
     tree = ast.parse(PYT.read_text())
     used = set()
     for node in ast.walk(tree):
@@ -488,3 +488,111 @@ def test_make_lidar_layers_flow(monkeypatch, tiled_scene, tmp_path):
     r2 = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out))
     assert r2["todo"] == [2]                      # grid 1 is skipped
     monkeypatch.setattr(fake_arcpy, "Describe", real_describe)
+
+
+def _tool(mod, cls_name):
+    tool = next(t for t in mod.Toolbox().tools if t.__name__ == cls_name)()
+    params = tool.getParameterInfo()
+    return tool, params, {x.name: x for x in params}
+
+
+def _edit(path, geoms=None, validated=None):
+    """Edit the road layer like a user would: move lines, set Validated (row order kept)."""
+    df = gpd.read_file(path)
+    for rid, g in (geoms or {}).items():
+        df.loc[df.RD_ID == rid, "geometry"] = g
+    for rid, v in (validated or {}).items():
+        df.loc[df.RD_ID == rid, "Validated"] = v
+    df.to_file(path)
+
+
+def test_training_day_cycle(toolbox, tiled_scene, tmp_path):
+    """Start of day / edit / end of day, twice, then overnight training and its use."""
+    import json
+    from shapely.geometry import LineString
+
+    x0, mid, y0 = synthetic.X0, synthetic.MID, synthetic.Y0
+    true = {"H1": LineString([(x0, mid), (x0 + 400, mid)]),
+            "H2": LineString([(x0 + 400, mid), (x0 + 900, mid)]),
+            "H3": LineString([(x0 + 900, mid), (x0 + 1600, mid)]),
+            "V1": LineString([(x0 + 400, y0), (x0 + 400, mid)]),
+            "C1": synthetic.true_roads()[2][0]}
+    roads = tmp_path / "federal.shp"
+    fed = synthetic.local_roads()
+    fed["Validated"] = "No"
+    fed.loc[fed.RD_ID == "H2", "geometry"] = true["H2"]     # this one is already right
+    fed.to_file(roads)
+    folder = tmp_path / "training"
+    folder.mkdir()
+
+    def day(cls, today, **extra):
+        tool, params, p = _tool(toolbox, cls)
+        p["roads"].value = str(roads)
+        p["training_folder"].value = str(folder)
+        for k, v in extra.items():
+            p[k].value = v
+        fake_arcpy.messages.clear()
+        mod_fn = {"StartOfDay": "snapshot", "EndOfDay": "collect"}[cls]
+        orig = getattr(toolbox, mod_fn)
+        setattr(toolbox, mod_fn, lambda *a, **k: orig(*a, today=today, **k))
+        try:
+            tool.execute(params, None)
+        finally:
+            setattr(toolbox, mod_fn, orig)
+        return "\n".join(fake_arcpy.messages)
+
+    # day 1: move four roads onto the pavement and check them
+    assert "6 new road(s)" in day("StartOfDay", "2026-10-19")
+    _edit(roads, {k: true[k] for k in ("H1", "V1", "H3", "C1")},
+          {k: "Yes" for k in ("H1", "V1", "H3", "C1")})
+    out = day("EndOfDay", "2026-10-19", out_fc=str(tmp_path / "train_roads.shp"))
+    assert "4 newly checked and moved, 0 newly checked and left" in out, out
+    t = gpd.read_file(tmp_path / "train_roads.shp")
+    assert sorted(t.ROAD_OID) == [1, 3, 4, 6] and t.CHANGED.all()
+    assert t.SHIFT_AVG.between(2.5, 8).all(), t.SHIFT_AVG.tolist()
+
+    # day 2: the morning snapshot keeps the true originals; check H2 without moving it,
+    # and un-check H1
+    assert "0 new road(s)" in day("StartOfDay", "2026-10-20")
+    _edit(roads, validated={"H2": "Yes", "H1": "No"})
+    out = day("EndOfDay", "2026-10-20")
+    assert "0 newly checked and moved, 1 newly checked and left" in out, out
+    assert "1 road(s) are no longer checked" in out
+    store = json.loads((folder / "training_roads.json").read_text())["roads"]
+    assert store["2"]["changed"] == 0 and store["2"]["shift_max"] < 0.5
+    assert store["6"]["day"] == "2026-10-19" and store["6"]["original_known"]
+
+    # overnight: train, test on the held-back grid, against the county layer too
+    tool, params, p = _tool(toolbox, "TrainOvernight")
+    p["imagery"].value = str(tiled_scene["tiles"])
+    p["training_folder"].value = str(folder)
+    p["grids"].value = str(tiled_scene["grids"])
+    p["grid_id_field"].value = "GRID_ID"
+    p["compare"].value = str(tiled_scene["roads"])
+    fake_arcpy.messages.clear()
+    res = toolbox.train(fake_arcpy, imagery=str(tiled_scene["tiles"]),
+                        training_folder=str(folder), grids_fc=str(tiled_scene["grids"]),
+                        grid_id_field="GRID_ID", bands=[1, 2, 3, 4],
+                        compare=[str(tiled_scene["roads"])], today="2026-10-20")
+    msgs = "\n".join(fake_arcpy.messages)
+    assert len(res["holdout"]) == 1, msgs
+    assert res["new"] < 1.0 and res["original"] > 2, res         # tool fixes the held-back roads
+    assert res["promoted"] and "local_roads.shp" in msgs
+    models = folder / "models"
+    assert (models / "road_classifier.json").exists()
+    assert (models / "road_classifier_2026-10-20.json").exists()
+
+    # the toolbox button runs the same thing; the second night compares with the current model
+    fake_arcpy.messages.clear()
+    tool.execute(params, None)
+    msgs = "\n".join(fake_arcpy.messages)
+    assert "Tool, current model" in msgs, msgs
+    hist = (models / "history.csv").read_text().splitlines()
+    assert len(hist) == 3 and hist[0].startswith("day,")
+
+    # the Align tool uses the trained model instead of training its own
+    out = run_tool(toolbox, tiled_scene, tmp_path / "align",
+                   classifier_file=str(models / "road_classifier.json"))
+    assert any("Using the trained classifier" in m for m in fake_arcpy.messages)
+    assert not (tmp_path / "align" / "work" / "road_classifier.json").exists()
+    assert error_to_truth(out.geometry)[0] < 1.0

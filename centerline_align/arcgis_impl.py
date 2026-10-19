@@ -292,7 +292,7 @@ def _safe(value) -> str:
 
 def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
         out_fc, bands, refine: RefineConfig, classifier: ClassifierConfig, fresh=False,
-        diagnostics=False, retrain_from=None, lidar_folder=None):
+        diagnostics=False, retrain_from=None, lidar_folder=None, classifier_file=None):
     msg = arcpy.AddMessage
     handler = _ArcHandler(arcpy)
     root = logging.getLogger("centerline_align")
@@ -301,14 +301,14 @@ def run(arcpy, *, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, wor
     try:
         return _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field,
                     work_folder, out_fc, bands, refine, classifier, fresh, diagnostics,
-                    retrain_from, lidar_folder)
+                    retrain_from, lidar_folder, classifier_file)
     finally:
         root.removeHandler(handler)
 
 
 def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, work_folder,
          out_fc, bands, rcfg, ccfg, fresh, diagnostics=False, retrain_from=None,
-         lidar_folder=None):
+         lidar_folder=None, classifier_file=None):
     os.makedirs(work_folder, exist_ok=True)
     grid_dir = os.path.join(work_folder, "grids")
     os.makedirs(grid_dir, exist_ok=True)
@@ -350,7 +350,16 @@ def _run(arcpy, msg, imagery, roads_fc, road_id_field, grids_fc, grid_id_field, 
                 os.remove(os.path.join(grid_dir, f))
         if os.path.exists(model_path):
             os.remove(model_path)
-    if os.path.exists(model_path):
+    if classifier_file:
+        clf = RoadClassifier.load(classifier_file)
+        msg(f"Using the trained classifier {classifier_file}"
+            + (f" (trained from {clf.trained_from})" if clf.trained_from else ""))
+        if clf.has_nir != reader.has_nir:
+            raise ValueError("The trained classifier was made with "
+                             f"{'4' if clf.has_nir else '3'} bands; set the same bands here.")
+        if clf.lidar and not lidar_folder:
+            raise ValueError("The trained classifier uses LiDAR: give the LiDAR folder.")
+    elif os.path.exists(model_path):
         clf = RoadClassifier.load(model_path)
         msg(f"Using saved classifier {model_path}")
         if clf.lidar and not lidar_folder:

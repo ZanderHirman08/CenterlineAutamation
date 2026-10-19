@@ -49,11 +49,18 @@ def ResetProgressor(*a, **k): pass
 
 
 class SpatialReference:
-    def __init__(self, crs):
+    def __init__(self, crs=None):
+        if crs is not None:
+            self.loadFromString(crs)
+
+    def loadFromString(self, crs):
         self._crs = rasterio.crs.CRS.from_user_input(crs)
         self.name = self._crs.to_string()
         self.type = "Geographic" if self._crs.is_geographic else "Projected"
         self.linearUnitName = self._crs.linear_units or "Unknown"
+
+    def exportToString(self):
+        return self._crs.to_wkt()
 
 
 class Extent:
@@ -223,6 +230,7 @@ def Describe(path):
 class _SearchCursor:
     def __init__(self, fc, fields, where_clause=None, spatial_reference=None):
         df = gpd.read_file(fc)
+        df["_oid"] = range(1, len(df) + 1)   # like ObjectIDs: unaffected by the filter
         if where_clause:  # simple "FIELD = 'value'" filters only
             m = re.match(r"\s*\"?(\w+)\"?\s*=\s*'?([^']*)'?\s*$", where_clause)
             if not m or m.group(1) not in df.columns:
@@ -233,9 +241,10 @@ class _SearchCursor:
         else:  # like arcpy: geometries carry the dataset's spatial reference
             spatial_reference = SpatialReference(df.crs)
         self.rows = []
-        for k, (_, r) in enumerate(df.iterrows(), 1):
+        for _, r in df.iterrows():
             self.rows.append(tuple(_wrap(r.geometry, spatial_reference) if f == "SHAPE@"
-                                   else k if f == "OID@" else r[f] for f in fields))
+                                   else int(r["_oid"]) if f == "OID@" else r[f]
+                                   for f in fields))
 
     def __enter__(self):
         return iter(self.rows)

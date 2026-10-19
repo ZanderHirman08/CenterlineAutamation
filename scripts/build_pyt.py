@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PKG = ROOT / "centerline_align"
 OUT = ROOT / "arcgis" / "CenterlineAlign.pyt"
 MODULES = ["config", "chip", "geom", "features", "classifier", "refine", "topology",
-           "engine", "evaluate", "arcgis_impl", "arcgis_toolbox"]
+           "engine", "evaluate", "arcgis_impl", "arcgis_training", "arcgis_toolbox"]
 
 HEADER = '''# -*- coding: utf-8 -*-
 """Centerline Alignment - ArcGIS Pro Python toolbox.
