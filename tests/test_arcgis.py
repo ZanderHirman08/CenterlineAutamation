@@ -432,7 +432,8 @@ def test_make_lidar_layers_flow(monkeypatch, tiled_scene, tmp_path):
     import types
     monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
     src = (ROOT / "arcgis" / "make_lidar_layers.py").read_text()
-    call = "make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN)"
+    call = ("make_lidar_layers(LAZ_FOLDER, GRIDS, IMAGERY, OUT_FOLDER, CELL, MARGIN, DRY_RUN, "
+            "CONVERT_LAZ,\n                  ZLAS_FOLDER)")
     assert src.rstrip().endswith(call)
     ns = {"__name__": "make_lidar_layers"}
     exec(compile(src.rstrip()[: -len(call)], "make_lidar_layers.py", "exec"), ns)
@@ -488,3 +489,54 @@ def test_make_lidar_layers_flow(monkeypatch, tiled_scene, tmp_path):
     r2 = make(str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]), str(out))
     assert r2["todo"] == [2]                      # grid 1 is skipped
     monkeypatch.setattr(fake_arcpy, "Describe", real_describe)
+
+
+def test_make_lidar_layers_converts_nearby_laz(monkeypatch, tiled_scene, tmp_path):
+    """CONVERT_LAZ: only .laz tiles near the grids are converted to .zlas, once."""
+    import types
+    import geopandas as gpd_
+    monkeypatch.setitem(sys.modules, "arcpy", fake_arcpy)
+    src = (ROOT / "arcgis" / "make_lidar_layers.py").read_text()
+    ns = {"__name__": "make_lidar_layers"}
+    exec(compile(src[: src.rindex("make_lidar_layers(LAZ_FOLDER")], "m.py", "exec"), ns)
+
+    # tile names around the synthetic grids, in CONUS Albers km, plus one far away
+    c = gpd_.read_file(tiled_scene["grids"]).to_crs(6350).geometry.union_all().centroid
+    e, n = int(c.x // 1000), int(c.y // 1000)
+    laz = tmp_path / "laz"
+    laz.mkdir()
+    near = [f"USGS_LPC_X_e{e + dx}n{n + dy}.laz" for dx in (0, 1) for dy in (0, 1)]
+    far = f"USGS_LPC_X_e{e + 50}n{n + 50}.laz"
+    for f in near + [far]:
+        (laz / f).write_bytes(b"")
+    converted = []
+
+    def convert(path, folder, **k):
+        assert k.get("compression") == "ZLAS"
+        converted.append(os.path.basename(path))
+        open(os.path.join(folder, os.path.basename(path)[:-4] + ".zlas"), "w").close()
+
+    monkeypatch.setattr(fake_arcpy, "conversion",
+                        types.SimpleNamespace(ConvertLas=convert), raising=False)
+    sr = fake_arcpy.SpatialReference(synthetic.CRS)
+    sr.type, sr.metersPerUnit = "Projected", 0.3048006096
+    monkeypatch.setattr(fake_arcpy, "Describe", lambda p: types.SimpleNamespace(spatialReference=sr))
+    zl = tmp_path / "zlas"
+    r = ns["make_lidar_layers"](str(laz), str(tiled_scene["grids"]), str(tiled_scene["tiles"]),
+                                str(tmp_path / "out"), dry_run=True, convert_laz=True,
+                                zlas_folder=str(zl))
+    assert r["todo"] == [1, 2] and not converted
+    assert sorted(ns["near_grids"]([str(laz / f) for f in near + [far]],
+                                   [(1, g) for g in _grid_geoms(fake_arcpy, tiled_scene)],
+                                   150.0)) == sorted(str(laz / f) for f in near)
+    assert ns["convert_to_zlas"]([str(laz / f) for f in near], str(zl)) == []
+    assert sorted(converted) == sorted(near)
+    converted.clear()
+    ns["convert_to_zlas"]([str(laz / f) for f in near], str(zl))
+    assert converted == []                      # already converted: skipped
+
+
+def _grid_geoms(arcpy_, scene):
+    sr = arcpy_.SpatialReference(synthetic.CRS)
+    with arcpy_.da.SearchCursor(str(scene["grids"]), ["SHAPE@"], spatial_reference=sr) as cur:
+        return [g for (g,) in cur]
