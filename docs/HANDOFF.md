@@ -1,5 +1,19 @@
 # Handoff: Centerline Alignment (REVAMP Phase 6)
 
+> **Status (2026-10-20): paused.** The editor validates on the latest GIO/Vexcel imagery
+> ("Latest 6", a WMTS web tile service: display only, no pixel access, licensed), but the
+> only imagery available as files is the GIO 2023-24 tiles. The two differ by about 2 ft
+> in places and much more in others (not a uniform shift), so a model trained on the tiles
+> can't be sub-foot against the imagery the work is judged on. Earlier validated lines were
+> also drawn on 10-12-year-old imagery. Resume if current imagery becomes available as
+> files (e.g. downloadable GIO 2026 leaf-off tiles), or if the 2023-24 tiles are accepted
+> as the reference: then re-check validated roads on that imagery and train only on those.
+> Results so far: first Glynn model 0.96 ft median / 52% within 1 ft vs county layer
+> 1.99 ft / 24% (validation blocks, labels on mismatched imagery). The model also proved
+> useful for QA: it found a "Yes" road never checked in Glynn and off-pavement lines in
+> McIntosh's submitted deliverable (routes 52, 328). McIntosh was dropped as training data
+> (mixed quality, edited over different imagery).
+
 Read `README.md` first. This file adds the background a new session needs.
 
 ## Who / what

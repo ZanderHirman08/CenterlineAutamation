@@ -1,5 +1,7 @@
 # Centerline Alignment: REVAMP Phase 6, Glynn County
 
+> **Paused (2026-10-20):** the imagery used for validation (latest GIO/Vexcel, a web tile service) is not available as files, and it does not line up with the downloadable 2023-24 GIO tiles the model trains on (offsets of 2 ft and more, varying by area). See [docs/HANDOFF.md](docs/HANDOFF.md) for what would let this resume.
+
 **Goal:** put GDOT road centerlines (`Roads_working`) on the centre of the pavement in
 the GIO imagery to **within a foot**, following the REVAMP Phase 6 manual.
 
