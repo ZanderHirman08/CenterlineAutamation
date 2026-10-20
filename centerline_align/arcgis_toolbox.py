@@ -272,8 +272,9 @@ class ExportTrainingChips:
     def getParameterInfo(self):
         truth = _param("truth", "Checked roads (truth)", "GPFeatureLayer")
         truth.filter.list = ["Polyline"]
-        where = _param("truth_where", "Only checked roads where (SQL)", "GPString",
-                       value="Validated = 'Yes'")
+        where = _param("truth_where", "Only checked roads where (SQL; leave empty for a "
+                       "finished county's deliverable, where every road is checked)",
+                       "GPString", required=False, value="Validated = 'Yes'")
         imagery = _param("imagery", "Imagery (raster, mosaic dataset, or folder of .tif tiles)",
                          ["GPRasterLayer", "DERasterDataset", "DEMosaicDataset", "DEFolder"])
         out = _param("out_folder", "Output folder for the chips", "DEFolder", direction="Output")

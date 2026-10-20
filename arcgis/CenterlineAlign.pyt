@@ -1049,7 +1049,6 @@ def _crossings(lines, tol: float, seg: float = 10.0) -> list:
     return out
 
 
-# what the keep/move model looks at for each refined line
 def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):
     """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts."""
     records, stations = [], []
@@ -2532,7 +2531,12 @@ def export_training_chips(arcpy, *, truth_fc, truth_where, imagery, bands, out_f
 
     truth_ext = [_ext(c) for _, c in truth]
     other_ext = [_ext(c) for _, c in other]
-    ends = np.array([p for _, c in truth for p in (c[0], c[-1])] + list(crossings))
+    # where the lines bend into a junction, the line is not a pavement centre: line ends,
+    # and T's and crossings in the middle of lines (a finished county's deliverable is
+    # dissolved into one line per route, so most of its junctions are mid-line)
+    junctions = find_junctions([c for _, parts in everything for c in parts])
+    ends = np.array([p for _, c in truth for p in (c[0], c[-1])] + list(crossings)
+                    + [tuple(j) for j in junctions])
     scored = [(o, trim_ends(c, end_trim)) for o, c in truth if o not in traced]
     scored = [(o, c) for o, c in scored if c is not None]
     scored_ext = [_ext(c) for _, c in scored]
@@ -2929,8 +2933,9 @@ class ExportTrainingChips:
     def getParameterInfo(self):
         truth = _param("truth", "Checked roads (truth)", "GPFeatureLayer")
         truth.filter.list = ["Polyline"]
-        where = _param("truth_where", "Only checked roads where (SQL)", "GPString",
-                       value="Validated = 'Yes'")
+        where = _param("truth_where", "Only checked roads where (SQL; leave empty for a "
+                       "finished county's deliverable, where every road is checked)",
+                       "GPString", required=False, value="Validated = 'Yes'")
         imagery = _param("imagery", "Imagery (raster, mosaic dataset, or folder of .tif tiles)",
                          ["GPRasterLayer", "DERasterDataset", "DEMosaicDataset", "DEFolder"])
         out = _param("out_folder", "Output folder for the chips", "DEFolder", direction="Output")

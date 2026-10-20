@@ -641,3 +641,39 @@ def test_finished_county_export_and_multi_county_training(toolbox, tiled_scene, 
     assert set(info["best"]["per_source"]) == set(info["sources"])
     per = tc.test(str(tmp_path / "other"), str(tmp_path / "model"))
     assert per["camden"]["points"] > 0
+
+
+def test_export_dissolved_deliverable(toolbox, tiled_scene, tmp_path):
+    """A finished county's deliverable: one line per route (no Validated field, empty
+    SQL), so junctions are mid-line - a crossing and a T. No loss is counted near them."""
+    import json
+    from centerline_align.chips import pixel_centres
+    roads = tmp_path / "deliverable.gpkg"
+    gpd.GeoDataFrame({"ROUTE_ID": ["R1", "R2", "R3"]},
+                     geometry=[g for g, _ in synthetic.true_roads()],
+                     crs=synthetic.CRS).to_file(roads)
+    tool, params, p = _tool(toolbox, "ExportTrainingChips")
+    p["truth"].value = str(roads)
+    p["truth_where"].value = None
+    p["imagery"].value = str(tiled_scene["tiles"])
+    p["out_folder"].value = str(tmp_path / "chips")
+    p["val_fraction"].value = 0.3
+    p["block"].value = 300.0
+    p["chip_px"].value = 128
+    fake_arcpy.messages.clear()
+    tool.execute(params, None)
+    man = json.loads((tmp_path / "chips" / "manifest.json").read_text())
+    assert man["roads"] == 3
+    junctions = [(synthetic.X0 + 400, synthetic.MID),      # crossing, mid-line on both
+                 (synthetic.X0 + 900, synthetic.MID)]      # the curve's T onto R1
+    near = 0
+    for f in (tmp_path / "chips").glob("shard_*.npz"):
+        sh = np.load(f)
+        for i in range(len(sh["mask"])):
+            X, Y = pixel_centres(sh["x0"][i], sh["y0"][i], 0.5, 128, 128)
+            on = sh["mask"][i] > 0
+            for jx, jy in junctions:
+                d = np.hypot(X - jx, Y - jy)
+                near += int((d < 60).any())
+                assert not (on & (d < 39.0)).any()
+    assert near > 0                                        # chips did reach the junctions

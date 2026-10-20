@@ -299,7 +299,6 @@ def _crossings(lines, tol: float, seg: float = 10.0) -> list:
     return out
 
 
-# what the keep/move model looks at for each refined line
 def refine_pieces(pmap: ProbabilityMap, pieces, rcfg, step: float, keep_stations=False):
     """Refine (src_id, coords) pieces. Returns (records, stations) as plain dicts."""
     records, stations = [], []
